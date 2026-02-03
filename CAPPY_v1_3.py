@@ -1380,6 +1380,125 @@ class ArchiveBrowser(tk.Tk):
 
 
 
+class LiveDashboard(ttk.Frame):
+    """
+    "Ubuntu System Monitor"-style dashboard:
+      - reads <data_dir>/status/cappy_status.json
+      - plots rolling history for: record rate, mean gated integral, mean peak
+    """
+    def __init__(self, master, data_dir_var: tk.StringVar):
+        super().__init__(master, padding=6)
+        self.data_dir_var = data_dir_var
+        self.status_path: Optional[Path] = None
+
+        self.t: list[float] = []
+        self.rate: list[float] = []
+        self.areaA: list[float] = []
+        self.peakA: list[float] = []
+        self.areaB: list[float] = []
+        self.peakB: list[float] = []
+        self._t0_wall: Optional[float] = None
+
+        self.fig = plt.Figure(figsize=(8.0, 6.2))
+        self.ax1 = self.fig.add_subplot(311)
+        self.ax2 = self.fig.add_subplot(312)
+        self.ax3 = self.fig.add_subplot(313)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.meta = tk.Text(self, height=6)
+        self.meta.pack(fill=tk.X, pady=(6, 0))
+        self.meta.configure(state=tk.DISABLED)
+
+        self.after(500, self._tick)
+
+    def _set_meta(self, s: str):
+        self.meta.configure(state=tk.NORMAL)
+        self.meta.delete("1.0", tk.END)
+        self.meta.insert(tk.END, s)
+        self.meta.configure(state=tk.DISABLED)
+
+    def _read_status(self) -> Optional[dict]:
+        data_dir = Path(self.data_dir_var.get()).expanduser()
+        p = data_dir / "status" / "cappy_status.json"
+        self.status_path = p
+        try:
+            if not p.exists():
+                return None
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _append_point(self, snap: dict):
+        now = time.time()
+        if self._t0_wall is None:
+            self._t0_wall = now
+        t = now - self._t0_wall
+
+        self.t.append(t)
+        self.rate.append(float(snap.get("rate_hz", 0.0)))
+        self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
+        self.peakA.append(float(snap.get("buffer_mean_peak_A", 0.0)))
+        self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
+        self.peakB.append(float(snap.get("buffer_mean_peak_B", 0.0)))
+
+        # Keep last 10 minutes
+        while self.t and (self.t[-1] - self.t[0]) > 600.0:
+            self.t.pop(0)
+            self.rate.pop(0)
+            self.areaA.pop(0)
+            self.peakA.pop(0)
+            self.areaB.pop(0)
+            self.peakB.pop(0)
+
+    def _redraw(self):
+        self.ax1.clear()
+        self.ax2.clear()
+        self.ax3.clear()
+
+        if not self.t:
+            self.ax1.set_title("Waiting for CAPPY status…")
+            self.canvas.draw()
+            return
+
+        self.ax1.plot(self.t, np.array(self.rate) / 1e3)
+        self.ax1.set_ylabel("Rate (kHz)")
+        self.ax1.grid(True, alpha=0.2)
+
+        self.ax2.plot(self.t, self.areaA, label="Area A (V·s)")
+        if any(abs(x) > 0 for x in self.areaB):
+            self.ax2.plot(self.t, self.areaB, label="Area B (V·s)")
+        self.ax2.set_ylabel("Mean gated integral")
+        self.ax2.grid(True, alpha=0.2)
+        self.ax2.legend(loc="best")
+
+        self.ax3.plot(self.t, self.peakA, label="Peak A (V)")
+        if any(abs(x) > 0 for x in self.peakB):
+            self.ax3.plot(self.t, self.peakB, label="Peak B (V)")
+        self.ax3.set_ylabel("Mean peak")
+        self.ax3.set_xlabel("Time (s)")
+        self.ax3.grid(True, alpha=0.2)
+        self.ax3.legend(loc="best")
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _tick(self):
+        snap = self._read_status()
+        if snap:
+            self._append_point(snap)
+            self._redraw()
+            self._set_meta(
+                f"State: {snap.get('state','?')}\n"
+                f"Session: {snap.get('session_id','')}\n"
+                f"Records: {snap.get('records','')}  Buffers: {snap.get('buffers','')}  Rate: {float(snap.get('rate_hz',0.0)):.3f} Hz\n"
+                f"Vpp A/B: {snap.get('vpp_A','?')} / {snap.get('vpp_B','?')}\n"
+                f"Status file: {self.status_path}"
+            )
+        self.after(1000, self._tick)
+
+
 class LauncherGUI(tk.Tk):
     """Simple launcher: Start Capture / Browse Archive / Open YAML."""
     def __init__(self, script_path: Path):
@@ -1561,4 +1680,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
