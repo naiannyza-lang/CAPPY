@@ -390,52 +390,53 @@ class StatusNotifier:
         self.cfg = cfg
         self.data_dir = data_dir
         self.notify = (cfg.get("notify", {}) or {})
-        self.hb_seconds = int(self.notify.get("heartbeat_seconds", 1))
-        self.email_seconds = int(self.notify.get("interval_minutes", 120)) * 60
+        self.hb_seconds = float(self.notify.get("heartbeat_seconds", 1.0))
+        self.email_seconds = float(self.notify.get("interval_minutes", 120)) * 60.0
         self._last_hb = 0.0
         self._last_email = 0.0
         self._lock = threading.Lock()
         self._latest: dict = {}
+        self._seq = 0
 
     def update(self, **kw) -> None:
         with self._lock:
             self._latest.update(kw)
+
+    def _snapshot(self):
+        self._seq += 1
+        self._latest["status_seq"] = self._seq
+        self._latest["status_unix"] = time.time()
+        return dict(self._latest)
+
+    def emit_now(self) -> None:
+        with self._lock:
+            snap = self._snapshot()
+        try:
+            _write_json_atomic(self.data_dir / "status" / "cappy_status.json", snap)
+        except Exception:
+            pass
 
     def maybe_emit(self) -> None:
         now = time.time()
         if now - self._last_hb >= self.hb_seconds:
             self._last_hb = now
             with self._lock:
-                snap = dict(self._latest)
+                snap = self._snapshot()
             try:
                 _write_json_atomic(self.data_dir / "status" / "cappy_status.json", snap)
-            except Exception as e:
+            except Exception:
                 pass
 
         if bool(self.notify.get("enabled", False)) and (now - self._last_email >= self.email_seconds):
             self._last_email = now
-            with self._lock:
-                snap = dict(self._latest)
-            prefix = str(self.notify.get("subject_prefix", "[CAPPY]")).strip() or "[CAPPY]"
-            subject = f"{prefix} status {snap.get('session_id','')}"
-            body = "\n".join(f"{k}: {v}" for k, v in sorted(snap.items()))
-            threading.Thread(target=_send_status_email, args=(self.cfg, subject, body), daemon=True).start()
-
-def channels_from_mask_expr(expr: str) -> int:
-    if not ATS_AVAILABLE or ats is None:
-        raise RuntimeError("atsapi not available.")
-    v = 0
-    for part in expr.split("|"):
-        part = part.strip()
-        if part:
-            v |= ats_const(part)
-    return v
-
-def infer_channel_count(mask: int) -> int:
-    if not ATS_AVAILABLE or ats is None:
-        raise RuntimeError("atsapi not available.")
-    # ats.channels exists in atsapi
-    return sum(1 for c in ats.channels if (c & mask == c))  # type: ignore[attr-defined]
+            try:
+                to_addr = str(self.notify.get("to_email", "")).strip()
+                if to_addr:
+                    with self._lock:
+                        snap = dict(self._latest)
+                    send_status_email(cfg=self.cfg, snap=snap)
+            except Exception:
+                pass
 
 class ParquetRollingWriter:
     def __init__(self, out_dir: Path, prefix: str, schema: pa.Schema, rollover_minutes: int):
@@ -1078,7 +1079,9 @@ def run_capture(cfg_path: Path) -> int:
     t0 = time.time()
     last = t0
     dashboard_every_buffers = int((cfg.get('notify', {}) or {}).get('dashboard_every_buffers', 1000))
+    gui_every_buffers = int((cfg.get('notify', {}) or {}).get('gui_every_buffers', 50))
     last_emit_buf = 0
+    last_gui_emit_buf = 0
     timeout_count = 0
     last_buffer_ns = time.time_ns()
     rt = cfg.get('runtime', {}) or {}
@@ -1210,10 +1213,28 @@ def run_capture(cfg_path: Path) -> int:
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA)),
                         buffer_mean_area_B=float(np.mean(areaB)), buffer_mean_peak_B=float(np.mean(peakB)),
                     )
+                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = buf_done
+                        try:
+                            temps = get_board_temperatures_c(board)
+                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
+                        except Exception:
+                            bt = None
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt)
+                        notifier.emit_now()
                 else:
                     notifier.update(
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA))
                     )
+                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = buf_done
+                        try:
+                            temps = get_board_temperatures_c(board)
+                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
+                        except Exception:
+                            bt = None
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt)
+                        notifier.emit_now()
             except Exception:
                 pass
 
@@ -1623,7 +1644,7 @@ class LiveDashboard(ttk.Frame):
         self._stream_window = 20000  # points shown in scrolling mode
 
         self._started_unix: Optional[float] = None
-        self._last_seen_unix: float = 0.0
+        self._last_seen_seq: int = 0
 
         # --- top stats ---
         stats = ttk.Frame(self)
@@ -1677,54 +1698,39 @@ class LiveDashboard(ttk.Frame):
             return None
 
     def _append_point(self, snap: dict):
-        su = snap.get("started_unix", None)
-        lcu = snap.get("last_capture_unix", None)
+        seq = snap.get("status_seq", None)
+        if seq is None:
+            return
+        try:
+            seq = int(seq)
+        except Exception:
+            return
+        if seq <= self._last_seen_seq:
+            return
+        self._last_seen_seq = seq
 
+        su = snap.get("started_unix", None)
+        tu = snap.get("status_unix", None)
         if su is not None:
             try:
                 self._started_unix = float(su)
             except Exception:
                 pass
-        if self._started_unix is None and lcu is not None:
+        if self._started_unix is None and tu is not None:
             try:
-                self._started_unix = float(lcu)
+                self._started_unix = float(tu)
             except Exception:
                 pass
-        if lcu is None or self._started_unix is None:
+        if self._started_unix is None or tu is None:
             return
 
-        try:
-            lcu_f = float(lcu)
-            t = lcu_f - float(self._started_unix)
-        except Exception:
-            return
-
-        if lcu_f <= self._last_seen_unix:
-            return
-        self._last_seen_unix = lcu_f
-
+        t = float(tu) - float(self._started_unix)
         self.t.append(t)
         self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
         self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
-        # Rolling waveform history comes from the live ring (one waveform per buffer)
-        wfA, wfB = self._read_ring_next()
-        if wfA is not None:
-            try:
-                # Append to scrolling stream and trim to window length
-                self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
-                if self._streamA.size > self._stream_window:
-                    self._streamA = self._streamA[-self._stream_window:]
-            except Exception:
-                pass
-        if wfB is not None:
-            try:
-                self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
-                if self._streamB.size > self._stream_window:
-                    self._streamB = self._streamB[-self._stream_window:]
-            except Exception:
-                pass
 
         while self.t and (self.t[-1] - self.t[0]) > 600.0:
+            self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
             self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
 
 
