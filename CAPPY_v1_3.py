@@ -270,7 +270,7 @@ class StatusNotifier:
         self.cfg = cfg
         self.data_dir = data_dir
         self.notify = (cfg.get("notify", {}) or {})
-        self.hb_seconds = int(self.notify.get("heartbeat_seconds", 60))
+        self.hb_seconds = int(self.notify.get("heartbeat_seconds", 1))
         self.email_seconds = int(self.notify.get("interval_minutes", 120)) * 60
         self._last_hb = 0.0
         self._last_email = 0.0
@@ -902,7 +902,7 @@ def run_capture(cfg_path: Path) -> int:
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
-    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB)
+    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), started_unix=time.time(), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB)
     notifier.maybe_emit()
 
     adma_flags = ats.ADMA_TRADITIONAL_MODE
@@ -919,6 +919,8 @@ def run_capture(cfg_path: Path) -> int:
     global_rec = 0
     t0 = time.time()
     last = t0
+    dashboard_every_buffers = int((cfg.get('notify', {}) or {}).get('dashboard_every_buffers', 1000))
+    last_emit_buf = 0
     timeout_count = 0
     last_buffer_ns = time.time_ns()
     rt = cfg.get('runtime', {}) or {}
@@ -1064,16 +1066,47 @@ def run_capture(cfg_path: Path) -> int:
             global_rec += rpb
 
             now = time.time()
-            if now - last >= 1.0:
+            if (now - last >= 1.0) or (dashboard_every_buffers > 0 and (buf_done - last_emit_buf) >= dashboard_every_buffers):
                 rate = global_rec / max(now - t0, 1e-9)
+                # status fields for GUI
+                last_capture_unix = time.time()
+                last_capture = time.strftime('%Y-%m-%d %H:%M:%S')
+                # board temperature (best-effort; may be unavailable depending on atsapi)
+                board_temp_c = None
+                try:
+                    # Some atsapi wrappers expose getBoardTemperature / getTemperature
+                    if hasattr(board, 'getBoardTemperature'):
+                        board_temp_c = float(board.getBoardTemperature())
+                    elif hasattr(board, 'getTemperature'):
+                        board_temp_c = float(board.getTemperature())
+                except Exception:
+                    board_temp_c = None
+
+                # latest waveform for GUI (downsampled). Uses last computed wfA_V/wfB_V if available.
+                latest_wf_A = None
+                latest_wf_B = None
+                try:
+                    if 'wfA_V' in locals():
+                        w = wfA_V
+                        step = max(1, int(len(w) // 1200))
+                        latest_wf_A = w[::step].astype(float).tolist()
+                    if 'wfB_V' in locals() and wfB_V is not None:
+                        w = wfB_V
+                        step = max(1, int(len(w) // 1200))
+                        latest_wf_B = w[::step].astype(float).tolist()
+                except Exception:
+                    latest_wf_A = None
+                    latest_wf_B = None
+
                 notifier.update(state="running", time=time.strftime("%Y-%m-%d %H:%M:%S"),
-                               buffers=buf_done, records=global_rec, rate_hz=rate,
+                               buffers=buf_done, records=global_rec, rate_hz=rate, last_capture=last_capture, last_capture_unix=last_capture_unix, board_temp_c=board_temp_c, latest_waveform_A=latest_wf_A, latest_waveform_B=latest_wf_B,
                                reduced_rows=getattr(archive, "_n_reduced", 0),
                                snips=getattr(archive, "_n_snips", 0),
                                last_buffer_ago_s=(time.time_ns()-last_buffer_ns)/1e9)
                 notifier.maybe_emit()
                 print(f"[CAPPY] buffers={buf_done} records={global_rec} rate={rate/1e3:.1f} kHz snips={archive._n_snips}")
                 last = now
+                last_emit_buf = buf_done
 
     finally:
         try:
@@ -1380,38 +1413,63 @@ class ArchiveBrowser(tk.Tk):
 
 
 
+
+
 class LiveDashboard(ttk.Frame):
     """
-    "Ubuntu System Monitor"-style dashboard:
-      - reads <data_dir>/status/cappy_status.json
-      - plots rolling history for: record rate, mean gated integral, mean peak
+    Dashboard optimized for capture monitoring:
+      - Top stats: rate, captures, started, last capture, mean peak, board temperature
+      - Plots: mean integral history + latest waveform
+    Colors:
+      - Channel A: integral RED, waveform BLUE
+      - Channel B (if enabled): PINK (dashed)
     """
     def __init__(self, master, data_dir_var: tk.StringVar):
         super().__init__(master, padding=6)
         self.data_dir_var = data_dir_var
         self.status_path: Optional[Path] = None
 
+        # rolling history (x in seconds since capture start, to-scale)
         self.t: list[float] = []
-        self.rate: list[float] = []
         self.areaA: list[float] = []
-        self.peakA: list[float] = []
         self.areaB: list[float] = []
-        self.peakB: list[float] = []
-        self._t0_wall: Optional[float] = None
 
-        self.fig = plt.Figure(figsize=(8.0, 6.2))
-        self.ax1 = self.fig.add_subplot(311)
-        self.ax2 = self.fig.add_subplot(312)
-        self.ax3 = self.fig.add_subplot(313)
+        self._started_unix: Optional[float] = None
+        self._last_seen_unix: float = 0.0
+
+        # --- top stats ---
+        stats = ttk.Frame(self)
+        stats.pack(fill=tk.X, pady=(0, 6))
+
+        def mkrow(label: str):
+            f = ttk.Frame(stats)
+            f.pack(side=tk.LEFT, padx=(0, 14))
+            ttk.Label(f, text=label).pack(anchor="w")
+            v = ttk.Label(f, text="—", font=("TkDefaultFont", 11, "bold"))
+            v.pack(anchor="w")
+            return v
+
+        self.lbl_rate = mkrow("Rate (Hz)")
+        self.lbl_caps = mkrow("Captures (buffers)")
+        self.lbl_started = mkrow("Started")
+        self.lbl_last = mkrow("Last capture")
+        self.lbl_peak = mkrow("Mean peak (V)")
+        self.lbl_temp = mkrow("Board temp (°C)")
+
+        # --- plots ---
+        self.fig = plt.Figure(figsize=(8.2, 6.2))
+
+        self.ax_int = self.fig.add_subplot(211)
+        self.ax_wf = self.fig.add_subplot(212)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.meta = tk.Text(self, height=6)
+        self.meta = tk.Text(self, height=3)
         self.meta.pack(fill=tk.X, pady=(6, 0))
         self.meta.configure(state=tk.DISABLED)
 
-        self.after(500, self._tick)
+        self.after(250, self._tick)
 
     def _set_meta(self, s: str):
         self.meta.configure(state=tk.NORMAL)
@@ -1431,55 +1489,76 @@ class LiveDashboard(ttk.Frame):
             return None
 
     def _append_point(self, snap: dict):
-        now = time.time()
-        if self._t0_wall is None:
-            self._t0_wall = now
-        t = now - self._t0_wall
+        su = snap.get("started_unix", None)
+        lcu = snap.get("last_capture_unix", None)
 
-        self.t.append(t)
-        self.rate.append(float(snap.get("rate_hz", 0.0)))
-        self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
-        self.peakA.append(float(snap.get("buffer_mean_peak_A", 0.0)))
-        self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
-        self.peakB.append(float(snap.get("buffer_mean_peak_B", 0.0)))
-
-        # Keep last 10 minutes
-        while self.t and (self.t[-1] - self.t[0]) > 600.0:
-            self.t.pop(0)
-            self.rate.pop(0)
-            self.areaA.pop(0)
-            self.peakA.pop(0)
-            self.areaB.pop(0)
-            self.peakB.pop(0)
-
-    def _redraw(self):
-        self.ax1.clear()
-        self.ax2.clear()
-        self.ax3.clear()
-
-        if not self.t:
-            self.ax1.set_title("Waiting for CAPPY status…")
-            self.canvas.draw()
+        if su is not None:
+            try:
+                self._started_unix = float(su)
+            except Exception:
+                pass
+        if self._started_unix is None and lcu is not None:
+            try:
+                self._started_unix = float(lcu)
+            except Exception:
+                pass
+        if lcu is None or self._started_unix is None:
             return
 
-        self.ax1.plot(self.t, np.array(self.rate) / 1e3)
-        self.ax1.set_ylabel("Rate (kHz)")
-        self.ax1.grid(True, alpha=0.2)
+        try:
+            lcu_f = float(lcu)
+            t = lcu_f - float(self._started_unix)
+        except Exception:
+            return
 
-        self.ax2.plot(self.t, self.areaA, label="Area A (V·s)")
-        if any(abs(x) > 0 for x in self.areaB):
-            self.ax2.plot(self.t, self.areaB, label="Area B (V·s)")
-        self.ax2.set_ylabel("Mean gated integral")
-        self.ax2.grid(True, alpha=0.2)
-        self.ax2.legend(loc="best")
+        if lcu_f <= self._last_seen_unix:
+            return
+        self._last_seen_unix = lcu_f
 
-        self.ax3.plot(self.t, self.peakA, label="Peak A (V)")
-        if any(abs(x) > 0 for x in self.peakB):
-            self.ax3.plot(self.t, self.peakB, label="Peak B (V)")
-        self.ax3.set_ylabel("Mean peak")
-        self.ax3.set_xlabel("Time (s)")
-        self.ax3.grid(True, alpha=0.2)
-        self.ax3.legend(loc="best")
+        self.t.append(t)
+        self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
+        self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
+
+        while self.t and (self.t[-1] - self.t[0]) > 600.0:
+            self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
+
+    def _redraw(self, snap: dict):
+        self.ax_int.clear()
+        self.ax_wf.clear()
+
+        if self.t:
+            # integral: A red, B pink dashed
+            self.ax_int.plot(self.t, self.areaA, color="red", label="Mean integral A (V·s)")
+            if any(abs(x) > 0 for x in self.areaB):
+                self.ax_int.plot(self.t, self.areaB, color="pink", linestyle="--", label="Mean integral B (V·s)")
+            self.ax_int.set_ylabel("Integral (V·s)")
+            self.ax_int.set_xlabel("Time (s)")
+            self.ax_int.grid(True, alpha=0.2)
+            self.ax_int.legend(loc="best")
+        else:
+            self.ax_int.set_title("Integral: waiting for data…")
+            self.ax_int.set_xlabel("Time (s)")
+            self.ax_int.set_ylabel("Integral (V·s)")
+            self.ax_int.grid(True, alpha=0.2)
+
+        # waveform: A blue, B pink dashed
+        wfA = snap.get("latest_waveform_A", None)
+        if isinstance(wfA, list) and len(wfA) > 1:
+            x = np.arange(len(wfA))
+            self.ax_wf.plot(x, wfA, color="blue", label="Waveform A (V)")
+            wfB = snap.get("latest_waveform_B", None)
+            if isinstance(wfB, list) and len(wfB) > 1:
+                xb = np.arange(len(wfB))
+                self.ax_wf.plot(xb, wfB, color="pink", linestyle="--", label="Waveform B (V)")
+            self.ax_wf.set_ylabel("V")
+            self.ax_wf.set_xlabel("Sample (downsampled)")
+            self.ax_wf.grid(True, alpha=0.2)
+            self.ax_wf.legend(loc="best")
+        else:
+            self.ax_wf.set_title("Waveform: waiting for latest waveform…")
+            self.ax_wf.set_xlabel("Sample")
+            self.ax_wf.set_ylabel("V")
+            self.ax_wf.grid(True, alpha=0.2)
 
         self.fig.tight_layout()
         self.canvas.draw()
@@ -1487,18 +1566,37 @@ class LiveDashboard(ttk.Frame):
     def _tick(self):
         snap = self._read_status()
         if snap:
+            # stats
+            try:
+                self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
+            except Exception:
+                self.lbl_rate.configure(text=str(snap.get("rate_hz", "—")))
+            self.lbl_caps.configure(text=str(snap.get("buffers", "—")))
+            self.lbl_started.configure(text=str(snap.get("started", "—")))
+            self.lbl_last.configure(text=str(snap.get("last_capture", snap.get("time", "—"))))
+
+            # mean peak stat (A [+ B])
+            pA = snap.get("buffer_mean_peak_A", None)
+            pB = snap.get("buffer_mean_peak_B", None)
+            try:
+                if pA is None:
+                    self.lbl_peak.configure(text="—")
+                else:
+                    if pB is not None and float(pB) != 0.0:
+                        self.lbl_peak.configure(text=f"A {float(pA):.6g}   B {float(pB):.6g}")
+                    else:
+                        self.lbl_peak.configure(text=f"{float(pA):.6g}")
+            except Exception:
+                self.lbl_peak.configure(text=str(pA))
+
+            bt = snap.get("board_temp_c", None)
+            self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
+
             self._append_point(snap)
-            self._redraw()
-            self._set_meta(
-                f"State: {snap.get('state','?')}\n"
-                f"Session: {snap.get('session_id','')}\n"
-                f"Records: {snap.get('records','')}  Buffers: {snap.get('buffers','')}  Rate: {float(snap.get('rate_hz',0.0)):.3f} Hz\n"
-                f"Vpp A/B: {snap.get('vpp_A','?')} / {snap.get('vpp_B','?')}\n"
-                f"Status file: {self.status_path}"
-            )
-        self.after(1000, self._tick)
+            self._redraw(snap)
 
-
+            self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
+        self.after(250, self._tick)
 class LauncherGUI(tk.Tk):
     """Simple launcher: Start Capture / Browse Archive / Open YAML."""
     def __init__(self, script_path: Path):
@@ -1680,5 +1778,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
