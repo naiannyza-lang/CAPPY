@@ -327,6 +327,15 @@ class ParquetRollingWriter:
         self._writer: Optional[pq.ParquetWriter] = None
         self._open_key: Optional[str] = None
 
+    def _hour_dir(self, ts_ns: int) -> Path:
+        dt = datetime.fromtimestamp(ts_ns / 1e9)
+        # waveforms/YYYY-MM-DD/HH
+        d = dt.strftime('%Y-%m-%d')
+        h = dt.strftime('%H')
+        p = self.out_dir / d / h
+        _ensure_dir(p)
+        return p
+
     def _minute_key(self, ts_ns: int) -> str:
         return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
 
@@ -403,24 +412,34 @@ class WaveBinSqliteStore:
         self._bin_key = None
         self._rows_since_commit = 0
 
+    def _hour_dir(self, ts_ns: int) -> Path:
+        dt = datetime.fromtimestamp(ts_ns / 1e9)
+        # waveforms/YYYY-MM-DD/HH
+        d = dt.strftime('%Y-%m-%d')
+        h = dt.strftime('%H')
+        p = self.out_dir / d / h
+        _ensure_dir(p)
+        return p
+
     def _minute_key(self, ts_ns: int) -> str:
         return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
 
-    def _open_bin(self, key: str):
-        path = self.out_dir / f"snips_{self.session_id}_{key}.bin"
+    def _open_bin(self, key: str, ts_ns: int):
+        base = self._hour_dir(ts_ns)
+        path = base / f"snips_{self.session_id}_{key}.bin"
         self._bin_fh = open(path, "ab", buffering=0)
         self._bin_key = key
 
     def _maybe_roll(self, ts_ns: int):
         key = self._minute_key(ts_ns)
         if self._bin_key is None:
-            self._open_bin(key)
+            self._open_bin(key, ts_ns)
             return
         t0 = datetime.strptime(self._bin_key, "%Y%m%d_%H%M")
         t1 = datetime.strptime(key, "%Y%m%d_%H%M")
         if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
             self.close_bin()
-            self._open_bin(key)
+            self._open_bin(key, ts_ns)
 
     def append(self, *, ts_ns: int, buffer_index: int, record_in_buffer: int, record_global: int,
                channels_mask: str, sample_rate_hz: float, wfA_V: np.ndarray, wfB_V: Optional[np.ndarray],
@@ -437,7 +456,10 @@ class WaveBinSqliteStore:
             n_channels = 2
         offset = self._bin_fh.tell()
         self._bin_fh.write(payload)
-        file_name = f"snips_{self.session_id}_{self._bin_key}.bin"
+        try:
+            file_name = str(Path(self._bin_fh.name).relative_to(self.out_dir))
+        except Exception:
+            file_name = str(Path(self._bin_fh.name).name)
         self.conn.execute(
             "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1074,6 +1096,9 @@ class ArchiveBrowser(tk.Tk):
         self.sessions = pd.DataFrame()
         self.snips = pd.DataFrame()
         self._snip_db_dir: Optional[Path] = None
+        self._snips_view = pd.DataFrame()
+        self._sel_date = None
+        self._sel_hour = None
         self._build()
         self._refresh()
 
@@ -1109,8 +1134,14 @@ class ArchiveBrowser(tk.Tk):
         self.slist.pack(fill=tk.BOTH, expand=True)
         self.slist.bind("<<ListboxSelect>>", self._on_session)
 
+        ttk.Label(left, text="Date / Hour").pack(anchor="w", pady=(8,0))
+        self.hlist = tk.Listbox(left, height=8, exportselection=False)
+        self.hlist.pack(fill=tk.X, expand=False)
+        self.hlist.bind("<<ListboxSelect>>", self._on_hour)
+        self.hlist.bind("<MouseWheel>", self._on_hour_wheel)
+
         ttk.Label(left, text="Waveform snippets (timestamped)").pack(anchor="w", pady=(8,0))
-        self.wlist = tk.Listbox(left)
+        self.wlist = tk.Listbox(left, exportselection=False)
         self.wlist.pack(fill=tk.BOTH, expand=True)
         self.wlist.bind("<<ListboxSelect>>", self._on_snip)
 
@@ -1183,6 +1214,92 @@ class ArchiveBrowser(tk.Tk):
             return None
         return str(self.sessions.iloc[sel[0]]["session_id"])
 
+
+    def _build_hour_index(self):
+        """Add _date/_hour columns to self.snips (local time)."""
+        if self.snips is None or self.snips.empty:
+            return
+        dt = pd.to_datetime(self.snips["timestamp_ns"], unit="ns")
+        self.snips = self.snips.copy()
+        self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
+        self.snips["_hour"] = dt.dt.strftime("%H")
+
+    def _populate_hours(self):
+        """Fill the date/hour listbox with counts, and select a sensible default."""
+        self.hlist.delete(0, tk.END)
+        if self.snips is None or self.snips.empty:
+            return
+        self._build_hour_index()
+
+        # Default date: newest date in the current snips view
+        if self._sel_date is None:
+            self._sel_date = str(self.snips["_date"].iloc[0])
+
+        sub = self.snips[self.snips["_date"] == self._sel_date]
+        counts = sub["_hour"].value_counts().sort_index()
+
+        # Show only hours that have data (cleaner than 00-23 full list)
+        hours = list(counts.index)
+        for hh in hours:
+            self.hlist.insert(tk.END, f"{hh}:00  ({int(counts[hh])})")
+
+        if self._sel_hour is None:
+            self._sel_hour = str(hours[0]) if hours else None
+
+        # select current hour row
+        if self._sel_hour is not None and self._sel_hour in hours:
+            idx = hours.index(self._sel_hour)
+            self.hlist.selection_clear(0, tk.END)
+            self.hlist.selection_set(idx)
+            self.hlist.see(idx)
+
+    def _apply_hour_filter(self):
+        """Render wlist using selected date/hour."""
+        self.wlist.delete(0, tk.END)
+        self._snips_view = pd.DataFrame()
+        if self.snips is None or self.snips.empty:
+            self.wlist.insert(tk.END, "(no saved waveforms)")
+            return
+        df = self.snips
+        if "_date" in df.columns and self._sel_date is not None:
+            df = df[df["_date"] == self._sel_date]
+        if "_hour" in df.columns and self._sel_hour is not None:
+            df = df[df["_hour"] == self._sel_hour]
+
+        self._snips_view = df.sort_values("timestamp_ns", ascending=False)
+
+        if self._snips_view.empty:
+            self.wlist.insert(tk.END, "(no saved waveforms in this hour)")
+            return
+
+        for _, r in self._snips_view.iterrows():
+            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
+            self.wlist.insert(tk.END, f"{int(r['id'])}  {ts.strftime('%Y-%m-%d %H:%M:%S')}  buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} g={int(r['record_global'])}")
+
+    def _on_hour(self, _=None):
+        if self.snips is None or self.snips.empty:
+            return
+        sel = self.hlist.curselection()
+        if not sel:
+            return
+        txt = self.hlist.get(sel[0])
+        # 'HH:00  (N)'
+        self._sel_hour = txt.split(":")[0].strip()
+        self._apply_hour_filter()
+
+    def _on_hour_wheel(self, evt):
+        # Mouse wheel scroll selects next/prev hour entry
+        if self.hlist.size() == 0:
+            return "break"
+        cur = self.hlist.curselection()
+        idx = int(cur[0]) if cur else 0
+        idx = max(0, min(self.hlist.size() - 1, idx + (-1 if evt.delta > 0 else 1)))
+        self.hlist.selection_clear(0, tk.END)
+        self.hlist.selection_set(idx)
+        self.hlist.see(idx)
+        self._on_hour()
+        return "break"
+
     def _on_session(self, _=None):
         sid = self._sel_sid()
         if not sid:
@@ -1211,18 +1328,56 @@ class ArchiveBrowser(tk.Tk):
         if self.snips.empty:
             self.wlist.insert(tk.END, "(no saved waveforms)")
             return
+        # Populate hour list and apply hour filter
+        self._populate_hours()
+        self._apply_hour_filter()
+        self._set_meta(f"Snips loaded: {len(self.snips):,}")
 
-        for _, r in self.snips.iterrows():
-            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
-            self.wlist.insert(tk.END, f"{int(r['id'])}  {ts.strftime('%Y-%m-%d %H:%M:%S')}  buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} g={int(r['record_global'])}")
+    def _on_snip(self, _=None):
+        if self.snips.empty or self._snip_db_dir is None:
+            return
+        sel = self.wlist.curselection()
+        if not sel:
+            return
+        snip_id = int(self.wlist.get(sel[0]).split()[0])
+        df = self._snips_view if (hasattr(self,'_snips_view') and not self._snips_view.empty) else self.snips
+        row = df[df["id"] == snip_id]
+        if row.empty:
+            return
+        r = row.iloc[0]
+        store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
+        try:
+            wa, wb = store.load_waveforms(r, self._snip_db_dir)
+        finally:
+            store.close()
+
+        sr = float(r["sample_rate_hz"])
+        tvec = np.arange(len(wa)) / sr
+
+        self.ax.clear()
+        self.ax.plot(tvec, wa, label="A")
+        if wb is not None:
+            self.ax.plot(tvec, wb, label="B")
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("Volts")
+        self.ax.legend(loc="best")
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
         self._set_meta(
-                f"State: {snap.get('state','?')}\n"
-                f"Session: {snap.get('session_id','')}\n"
-                f"Records: {snap.get('records','')}  Buffers: {snap.get('buffers','')}  Rate: {float(snap.get('rate_hz',0.0)):.3f} Hz\n"
-                f"Vpp A/B: {snap.get('vpp_A','?')} / {snap.get('vpp_B','?')}\n"
-                f"Status file: {self.status_path}"
-            )
-        self.after(1000, self._tick)
+            f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} global={int(r['record_global'])}\n"
+            f"area_A_Vs={float(r['area_A_Vs'])} peak_A_V={float(r['peak_A_V'])}\n"
+            f"samples={int(r['n_samples'])} channels={int(r['n_channels'])}"
+        )
+
+    def _set_meta(self, s: str):
+        self.meta.configure(state=tk.NORMAL)
+        self.meta.delete("1.0", tk.END)
+        self.meta.insert(tk.END, s)
+        self.meta.configure(state=tk.DISABLED)
+
 
 
 class LauncherGUI(tk.Tk):
@@ -1406,3 +1561,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
