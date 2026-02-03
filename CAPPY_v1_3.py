@@ -265,6 +265,115 @@ def _send_status_email(cfg: dict, subject: str, body: str) -> None:
     except Exception as e:
         print(f"[WARN] Failed to send status email: {e}")
 
+
+class LiveRingWriter:
+    """
+    Rolling on-disk ring buffer for live waveform display.
+
+    Why: You want EVERY buffer's waveform captured, but you only want to *render* at a stable UI cadence.
+    The capture process writes one downsampled waveform per buffer into a fixed-size ring file.
+    The GUI reads forward at its own pace (e.g., 10–30 fps) for smooth, consistent visualization.
+
+    File format (little-endian, fixed record size):
+      header: 32 bytes
+        - magic b'CPRING1\0' (8)
+        - version u32 (4)
+        - nslots u32 (4)
+        - npts u32 (4)   (fixed points per waveform)
+        - reserved u32 (4)
+        - write_seq u64 (8)  (monotonic sequence number)
+      record slot i:
+        - seq u64
+        - t_unix f64
+        - buf_idx u64
+        - chmask u32  (bit0=A, bit1=B)
+        - reserved u32
+        - wfA float32[npts]
+        - wfB float32[npts]  (NaN if disabled)
+    """
+    MAGIC = b"CPRING1\0"
+    VERSION = 1
+
+    def __init__(self, path: Path, nslots: int = 4096, npts: int = 1024):
+        self.path = path
+        self.nslots = int(nslots)
+        self.npts = int(npts)
+        self._lock = threading.Lock()
+        self._seq = 0
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._rec_bytes = (8 + 8 + 8 + 4 + 4) + (self.npts * 4) + (self.npts * 4)
+        self._hdr_bytes = 32
+        total = self._hdr_bytes + self.nslots * self._rec_bytes
+
+        # create/size file
+        if not path.exists() or path.stat().st_size != total:
+            with open(path, "wb") as f:
+                f.truncate(total)
+            self._write_header()
+
+        # open for random access writes
+        self._fh = open(path, "r+b", buffering=0)
+
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def _write_header(self):
+        # write initial header with seq=0
+        import struct
+        hdr = struct.pack("<8sIIIIQ", self.MAGIC, self.VERSION, self.nslots, self.npts, 0, 0)
+        with open(self.path, "r+b", buffering=0) as f:
+            f.seek(0)
+            f.write(hdr)
+
+    def write(self, wfA: np.ndarray, wfB: Optional[np.ndarray], buf_idx: int, chmask: int):
+        import struct
+        # Downsample / coerce to float32 length npts
+        def to_npts(w: np.ndarray) -> np.ndarray:
+            w = np.asarray(w, dtype=np.float32)
+            if w.size == self.npts:
+                return w
+            # simple decimation to npts
+            step = max(1, int(w.size // self.npts))
+            w2 = w[::step]
+            if w2.size > self.npts:
+                w2 = w2[: self.npts]
+            if w2.size < self.npts:
+                # pad with last value
+                pad = np.full((self.npts - w2.size,), w2[-1] if w2.size else 0.0, dtype=np.float32)
+                w2 = np.concatenate([w2, pad])
+            return w2
+
+        a = to_npts(wfA)
+        if wfB is None:
+            b = np.full((self.npts,), np.nan, dtype=np.float32)
+        else:
+            b = to_npts(wfB)
+
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
+            slot = (seq - 1) % self.nslots
+            off = self._hdr_bytes + slot * self._rec_bytes
+
+            t_unix = time.time()
+            rec_hdr = struct.pack("<QdQII", seq, t_unix, int(buf_idx), int(chmask), 0)
+
+            try:
+                self._fh.seek(off)
+                self._fh.write(rec_hdr)
+                self._fh.write(a.tobytes(order="C"))
+                self._fh.write(b.tobytes(order="C"))
+                # also update header write_seq for reader to know latest
+                self._fh.seek(24)  # write_seq offset in header
+                self._fh.write(struct.pack("<Q", seq))
+            except Exception:
+                pass
+
+
 class StatusNotifier:
     """Heartbeat file + periodic status email, non-blocking."""
     def __init__(self, cfg: dict, data_dir: Path):
@@ -734,6 +843,37 @@ def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
     return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
 
 
+def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
+    """
+    Read FPGA/ADC temperatures via AlazarGetParameter.
+
+    ATS-SDK documents GET_FPGA_TEMPERATURE (0x10000080) and GET_ADC_TEMPERATURE (0x10000104)
+    as 32-bit float values (encoded in a U32). Only supported by PCIe digitizers. citeturn0search0
+    """
+    import ctypes, struct
+    out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
+    # Parameter IDs from ATS-SDK docs
+    GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
+    GET_ADC_TEMPERATURE = getattr(ats, "GET_ADC_TEMPERATURE", 0x10000104)
+
+    def _get(param) -> Optional[float]:
+        try:
+            u32 = ctypes.c_uint32(0)
+            # board.handle is the underlying board handle in atsapi python wrapper
+            rc = ats.AlazarGetParameter(board.handle, 0, int(param), ctypes.byref(u32))
+            # success code in atsapi is often 512; treat non-zero as failure conservatively
+            if rc not in (0, 512):
+                return None
+            return struct.unpack("<f", struct.pack("<I", int(u32.value)))[0]
+        except Exception:
+            return None
+
+    out["fpga"] = _get(GET_FPGA_TEMPERATURE)
+    out["adc"] = _get(GET_ADC_TEMPERATURE)
+    return out
+
+
+
 def channels_mask_to_str(mask: int) -> str:
     parts = []
     if mask & ats.CHANNEL_A:
@@ -903,7 +1043,14 @@ def run_capture(cfg_path: Path) -> int:
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
-    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), started_unix=time.time(), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB)
+    # Live waveform ring (writes one downsampled waveform per buffer)
+    live_cfg = (cfg.get('live', {}) or {})
+    ring_nslots = int(live_cfg.get('ring_slots', 4096))
+    ring_npts = int(live_cfg.get('ring_points', 512))
+    ring_path = Path(str(storage.get('data_dir', 'dataFile'))) / 'status' / 'live_waveforms.ring'
+    ring = LiveRingWriter(ring_path, nslots=ring_nslots, npts=ring_npts)
+
+    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), started_unix=time.time(), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB, live_ring_path=str(ring_path))
     notifier.maybe_emit()
 
     adma_flags = ats.ADMA_TRADITIONAL_MODE
@@ -1060,6 +1207,19 @@ def run_capture(cfg_path: Path) -> int:
             except Exception:
                 pass
 
+            # Write EVERY buffer's representative waveform into the live ring for smooth GUI playback
+            try:
+                # Use record 0 as representative; convert to volts with correct per-channel Vpp
+                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
+                wfB_live = None
+                chmask_live = 1
+                if ch_count == 2:
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
+                    chmask_live = 3
+                ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
+            except Exception:
+                pass
+
             archive.append_reduced(red_rows, ts_ns)
             board.postAsyncBuffer(buf.addr, buf.size_bytes)
 
@@ -1112,6 +1272,10 @@ def run_capture(cfg_path: Path) -> int:
     finally:
         try:
             board.abortAsyncRead()
+        except Exception:
+            pass
+        try:
+            ring.close()
         except Exception:
             pass
         notifier.update(state='stopped', time=time.strftime('%Y-%m-%d %H:%M:%S'))
@@ -1393,7 +1557,7 @@ class ArchiveBrowser(ttk.Frame):
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Volts")
         self.ax.legend(loc="best")
-        self.fig.tight_layout()
+        # Avoid tight_layout on every frame for speed
         self.canvas.draw()
 
         ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
@@ -1427,6 +1591,13 @@ class LiveDashboard(ttk.Frame):
         super().__init__(master, padding=6)
         self.data_dir_var = data_dir_var
         self.status_path: Optional[Path] = None
+        self.ring_path: Optional[Path] = None
+        self._ring_npts = 1024
+        self._ring_rec_bytes = None
+        self._ring_hdr_bytes = 32
+        self._ring_last_seq = 0
+        self._ring_play_seq = 0
+        self._ring_nslots = 0
 
         # rolling history (x in seconds since capture start, to-scale)
         self.t: list[float] = []
@@ -1436,7 +1607,7 @@ class LiveDashboard(ttk.Frame):
         # rolling waveform history (store last N downsampled waveforms)
         self._wfA_hist: list[np.ndarray] = []
         self._wfB_hist: list[np.ndarray] = []
-        self._wf_hist_max = 50
+        self._wf_hist_max = 30
 
         self._started_unix: Optional[float] = None
         self._last_seen_unix: float = 0.0
@@ -1473,7 +1644,7 @@ class LiveDashboard(ttk.Frame):
         self.meta.pack(fill=tk.X, pady=(6, 0))
         self.meta.configure(state=tk.DISABLED)
 
-        self.after(250, self._tick)
+        self.after(100, self._tick)
 
     def _set_meta(self, s: str):
         self.meta.configure(state=tk.NORMAL)
@@ -1522,26 +1693,87 @@ class LiveDashboard(ttk.Frame):
         self.t.append(t)
         self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
         self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
-
-        # Rolling waveform history (append once per new status point when waveform is present)
-        try:
-            wfA = snap.get("latest_waveform_A", None)
-            wfB = snap.get("latest_waveform_B", None)
-            if isinstance(wfA, list) and len(wfA) > 1:
-                a = np.asarray(wfA, dtype=float)
-                self._wfA_hist.append(a)
-                if len(self._wfA_hist) > self._wf_hist_max:
-                    self._wfA_hist.pop(0)
-            if isinstance(wfB, list) and len(wfB) > 1:
-                b = np.asarray(wfB, dtype=float)
-                self._wfB_hist.append(b)
-                if len(self._wfB_hist) > self._wf_hist_max:
-                    self._wfB_hist.pop(0)
-        except Exception:
-            pass
+        # Rolling waveform history comes from the live ring (one waveform per buffer)
+        wfA, wfB = self._read_ring_next()
+        if wfA is not None:
+            self._wfA_hist.append(wfA.astype(float, copy=False))
+            if len(self._wfA_hist) > self._wf_hist_max:
+                self._wfA_hist.pop(0)
+        if wfB is not None:
+            self._wfB_hist.append(wfB.astype(float, copy=False))
+            if len(self._wfB_hist) > self._wf_hist_max:
+                self._wfB_hist.pop(0)
 
         while self.t and (self.t[-1] - self.t[0]) > 600.0:
             self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
+
+
+    def _open_ring_from_status(self, snap: dict):
+        rp = snap.get("live_ring_path", None)
+        if not rp:
+            return
+        p = Path(str(rp)).expanduser()
+        if self.ring_path != p:
+            self.ring_path = p
+            # reset playback on ring change
+            self._ring_last_seq = 0
+            self._ring_play_seq = 0
+            self._wfA_hist.clear()
+            self._wfB_hist.clear()
+
+    def _read_ring_next(self):
+        """
+        Read the next available waveform record from the live ring.
+        Returns (wfA, wfB) as numpy arrays or (None, None) if nothing new.
+        """
+        if self.ring_path is None:
+            return None, None
+
+        try:
+            import struct
+            with open(self.ring_path, "rb", buffering=0) as f:
+                hdr = f.read(32)
+                if len(hdr) != 32:
+                    return None, None
+                magic, ver, nslots, npts, _rsv, write_seq = struct.unpack("<8sIIIIQ", hdr)
+                if magic != LiveRingWriter.MAGIC:
+                    return None, None
+                self._ring_nslots = int(nslots)
+                self._ring_npts = int(npts)
+                rec_bytes = (8 + 8 + 8 + 4 + 4) + (self._ring_npts * 4) + (self._ring_npts * 4)
+                self._ring_rec_bytes = rec_bytes
+                self._ring_last_seq = int(write_seq)
+
+                # initialize play seq to most recent history window on first open
+                if self._ring_play_seq == 0 and self._ring_last_seq > 0:
+                    # start just behind the head so the plot fills quickly
+                    self._ring_play_seq = max(1, self._ring_last_seq - 50)
+
+                if self._ring_play_seq >= self._ring_last_seq:
+                    return None, None
+
+                # read next record
+                self._ring_play_seq += 1
+                seq = self._ring_play_seq
+                slot = (seq - 1) % self._ring_nslots
+                off = self._ring_hdr_bytes + slot * rec_bytes
+                f.seek(off)
+                rec_hdr = f.read(8 + 8 + 8 + 4 + 4)
+                if len(rec_hdr) != (8 + 8 + 8 + 4 + 4):
+                    return None, None
+                r_seq, t_unix, buf_idx, chmask, _r = struct.unpack("<QdQII", rec_hdr)
+                if int(r_seq) != int(seq):
+                    # slot not yet written / overwritten; jump to last
+                    self._ring_play_seq = self._ring_last_seq
+                    return None, None
+
+                wfA = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
+                wfB = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
+                if (chmask & 2) == 0:
+                    wfB = None
+                return wfA, wfB
+        except Exception:
+            return None, None
 
     def _redraw(self, snap: dict):
         self.ax_int.clear()
@@ -1564,20 +1796,24 @@ class LiveDashboard(ttk.Frame):
 
         # waveform: rolling overlay (every waveform), A blue, B pink dashed
         if self._wfA_hist:
-            # plot older waveforms fainter for a rolling visual
             x = np.arange(len(self._wfA_hist[-1]))
             n = len(self._wfA_hist)
+            # vertical stacking offset to prevent traces from drawing on top of each other
+            try:
+                span = float(np.nanpercentile(np.abs(self._wfA_hist[-1]), 99))
+                offset = max(1e-6, 2.2 * span)
+            except Exception:
+                offset = 1.0
             for i, w in enumerate(self._wfA_hist):
-                alpha = 0.15 + 0.85 * (i + 1) / n
-                self.ax_wf.plot(x, w, color="blue", alpha=alpha)
-            # Channel B if enabled
+                alpha = 0.2 + 0.8 * (i + 1) / n
+                self.ax_wf.plot(x, w + i * offset, color="blue", alpha=alpha)
             if self._wfB_hist:
                 xb = np.arange(len(self._wfB_hist[-1]))
                 nb = len(self._wfB_hist)
                 for i, w in enumerate(self._wfB_hist):
-                    alpha = 0.15 + 0.85 * (i + 1) / nb
-                    self.ax_wf.plot(xb, w, color="pink", linestyle="--", alpha=alpha)
-            self.ax_wf.set_ylabel("V")
+                    alpha = 0.2 + 0.8 * (i + 1) / nb
+                    self.ax_wf.plot(xb, w + i * offset, color="pink", linestyle="--", alpha=alpha)
+            self.ax_wf.set_ylabel("V + offset")
             self.ax_wf.set_xlabel("Sample (downsampled)")
             self.ax_wf.grid(True, alpha=0.2)
         else:
@@ -1585,7 +1821,7 @@ class LiveDashboard(ttk.Frame):
             self.ax_wf.set_xlabel("Sample")
             self.ax_wf.set_ylabel("V")
             self.ax_wf.grid(True, alpha=0.2)
-        self.fig.tight_layout()
+        # Avoid tight_layout on every frame for speed
         self.canvas.draw()
 
     def _tick(self):
@@ -1617,11 +1853,29 @@ class LiveDashboard(ttk.Frame):
             bt = snap.get("board_temp_c", None)
             self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
 
+            self._open_ring_from_status(snap)
             self._append_point(snap)
+            # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
+            try:
+                max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
+            except Exception:
+                max_wf = 20
+            for _ in range(max_wf):
+                wfA, wfB = self._read_ring_next()
+                if wfA is None and wfB is None:
+                    break
+                if wfA is not None:
+                    self._wfA_hist.append(wfA.astype(float, copy=False))
+                    if len(self._wfA_hist) > self._wf_hist_max:
+                        self._wfA_hist.pop(0)
+                if wfB is not None:
+                    self._wfB_hist.append(wfB.astype(float, copy=False))
+                    if len(self._wfB_hist) > self._wf_hist_max:
+                        self._wfB_hist.pop(0)
             self._redraw(snap)
 
             self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
-        self.after(250, self._tick)
+        self.after(100, self._tick)
 
 class _ProcLogPump:
     """
