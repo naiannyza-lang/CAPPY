@@ -587,14 +587,37 @@ class CappyArchive:
         print(f"[CAPPY] Finalized session {self.session_id} reduced={self._n_reduced} snips={self._n_snips}")
 
 def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int, vpp: float):
-    baseline = raw[:, b0:b1].mean(axis=1, dtype=np.float32)
-    gate_sum = raw[:, g0:g1].sum(axis=1, dtype=np.uint64).astype(np.float64)
-    sum_counts = gate_sum - baseline.astype(np.float64) * float(g1 - g0)
-    scale = vpp / 65535.0
-    area = (sum_counts * scale) * (1.0 / sr_hz)
-    peak = (raw[:, g0:g1].max(axis=1).astype(np.float32) - baseline).astype(np.float64) * scale
-    baseline_V = (baseline.astype(np.float64) * scale) - (vpp * 0.5)
-    return area, peak, baseline_V
+    """
+    Reduce raw uint16 waveforms into baseline (V), peak (V) and gated integral (V·s).
+
+    This version converts ADC codes -> volts using the configured input range (Vpp),
+    then does baseline subtraction in volts, then integrates (sum * dt).
+    """
+    if raw.dtype != np.uint16:
+        raw = raw.astype(np.uint16, copy=False)
+
+    n = int(raw.shape[1])
+    b0 = max(0, min(int(b0), n))
+    b1 = max(0, min(int(b1), n))
+    g0 = max(0, min(int(g0), n))
+    g1 = max(0, min(int(g1), n))
+
+    if b1 <= b0:
+        b0, b1 = 0, min(1, n)
+    if g1 <= g0:
+        g0, g1 = 0, min(1, n)
+
+    V = _codes_to_volts_u16(raw, vpp=vpp)  # float32 volts
+    baseline_V = V[:, b0:b1].mean(axis=1, dtype=np.float32).astype(np.float64)
+
+    gate = V[:, g0:g1].astype(np.float64, copy=False)
+    gate_bs = gate - baseline_V[:, None]
+
+    dt = 1.0 / float(sr_hz)
+    area = gate_bs.sum(axis=1) * dt
+    peak = gate_bs.max(axis=1)
+    return area.astype(np.float64), peak.astype(np.float64), baseline_V.astype(np.float64)
+
 
 @dataclass
 class WfPolicy:
@@ -636,6 +659,58 @@ def load_config(path: Path) -> Dict[str, Any]:
         raise ValueError("YAML must be a dict.")
     return cfg
 
+
+def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
+    """
+    Convert Alazar-style range strings like 'PM_1_V' or 'PM_200_MV' to full-scale Vpp.
+
+    NOTE: integration and plotted volts must use the actual ADC full-scale range, otherwise
+    integrals/peaks will be numerically wrong.
+    """
+    rn = (range_name or "").strip().upper()
+    rn = rn.replace("INPUT_RANGE_", "")
+    if rn.startswith("PM_") and rn.endswith("_MV"):
+        try:
+            mv = float(rn[3:-3])
+            return 2.0 * (mv / 1000.0)
+        except Exception:
+            return float(default_vpp)
+    if rn.startswith("PM_") and rn.endswith("_V"):
+        try:
+            v = float(rn[3:-2])
+            return 2.0 * v
+        except Exception:
+            return float(default_vpp)
+
+    COMMON = {
+        "PM_20_MV": 0.04,
+        "PM_40_MV": 0.08,
+        "PM_50_MV": 0.10,
+        "PM_80_MV": 0.16,
+        "PM_100_MV": 0.20,
+        "PM_200_MV": 0.40,
+        "PM_400_MV": 0.80,
+        "PM_500_MV": 1.00,
+        "PM_800_MV": 1.60,
+        "PM_1_V": 2.00,
+        "PM_2_V": 4.00,
+        "PM_4_V": 8.00,
+        "PM_5_V": 10.00,
+        "PM_8_V": 16.00,
+        "PM_10_V": 20.00,
+        "PM_20_V": 40.00,
+        "PM_40_V": 80.00,
+    }
+    return float(COMMON.get(rn, default_vpp))
+
+def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
+    """
+    Map uint16 ADC codes to volts for a bipolar input range (mid-scale = 0 V).
+    Uses 65536 codes for correct LSB size.
+    """
+    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
+
+
 def channels_mask_to_str(mask: int) -> str:
     parts = []
     if mask & ats.CHANNEL_A:
@@ -644,7 +719,7 @@ def channels_mask_to_str(mask: int) -> str:
         parts.append("CHANNEL_B")
     return "|".join(parts) if parts else "0"
 
-def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float]:
+def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, float]:
     c = cfg.get("clock", {}) or {}
     sr_hz = float(c.get("sample_rate_msps", 250.0)) * 1e6
     source = ats_const(str(c.get("source", "INTERNAL_CLOCK")))
@@ -668,7 +743,10 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float]:
     else:
         board.setCaptureClock(source, ats.SAMPLE_RATE_USER_DEF, edge, int(sr_hz))
 
-    vpp = 4.0
+    # Default Vpp fallback (only used if range parsing fails)
+    vpp_default = 4.0
+    vpp_A = vpp_default
+    vpp_B = vpp_default
 
     ch_cfg = cfg.get("channels", {}) or {}
     for nm, mask in [("A", ats.CHANNEL_A), ("B", ats.CHANNEL_B)]:
@@ -678,7 +756,12 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float]:
             if not coupling_name.endswith('_COUPLING'):
                 coupling_name = coupling_name + '_COUPLING'
             coupling = ats_const(coupling_name)
-            rng = ats_const("INPUT_RANGE_", str(cc.get("range", "PM_1_V")))
+            rng_name = str(cc.get('range', 'PM_1_V'))
+            rng = ats_const('INPUT_RANGE_', rng_name)
+            if nm == 'A':
+                vpp_A = _range_name_to_vpp(rng_name, default_vpp=vpp_default)
+            elif nm == 'B':
+                vpp_B = _range_name_to_vpp(rng_name, default_vpp=vpp_default)
             imp = ats_const("IMPEDANCE_", str(cc.get("impedance", "50_OHM")))
             board.inputControlEx(mask, coupling, rng, imp)
 
@@ -715,7 +798,7 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float]:
         print(f"[CAPPY] noise_test enabled -> using trigger.timeout_ms={timeout_ms} for auto-trigger noise captures")
     board.setTriggerTimeOut(timeout_ms)
 
-    return sr_hz, vpp
+    return sr_hz, float(vpp_A), float(vpp_B)
 
 def _should_stop() -> bool:
     if STOP_REQUESTED:
@@ -768,7 +851,7 @@ def run_capture(cfg_path: Path) -> int:
     store_volts = bool(waves.get("store_volts", True))
 
     board = ats.Board(systemId=2, boardId=1)
-    sr_hz, vpp = configure_board(board, cfg)
+    sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
     ch_count = infer_channel_count(ch_mask)
@@ -797,7 +880,7 @@ def run_capture(cfg_path: Path) -> int:
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
-    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb)
+    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB)
     notifier.maybe_emit()
 
     adma_flags = ats.ADMA_TRADITIONAL_MODE
@@ -893,8 +976,8 @@ def run_capture(cfg_path: Path) -> int:
             if ch_count == 2:
                 A = raw[0::2].reshape(rpb, spr)
                 B = raw[1::2].reshape(rpb, spr)
-                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vpp)
-                areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vpp)
+                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
+                areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB)
                 for r in range(rpb):
                     rec_g = global_rec + r
                     red_rows.append(dict(
@@ -906,8 +989,8 @@ def run_capture(cfg_path: Path) -> int:
                         area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]), baseline_B_V=float(baseB[r]),
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
-                        wfA_V = vpp * (A[r].astype(np.float32) / 65535.0 - 0.5) if store_volts else A[r].astype(np.float32)
-                        wfB_V = vpp * (B[r].astype(np.float32) / 65535.0 - 0.5) if store_volts else B[r].astype(np.float32)
+                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
+                        wfB_V = _codes_to_volts_u16(B[r], vpp=vppB) if store_volts else B[r].astype(np.float32)
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -917,7 +1000,7 @@ def run_capture(cfg_path: Path) -> int:
                         )
             else:
                 A = raw.reshape(rpb, spr)
-                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vpp)
+                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
                 for r in range(rpb):
                     rec_g = global_rec + r
                     red_rows.append(dict(
@@ -929,7 +1012,7 @@ def run_capture(cfg_path: Path) -> int:
                         area_B_Vs=0.0, peak_B_V=0.0, baseline_B_V=0.0,
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
-                        wfA_V = vpp * (A[r].astype(np.float32) / 65535.0 - 0.5) if store_volts else A[r].astype(np.float32)
+                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -937,6 +1020,20 @@ def run_capture(cfg_path: Path) -> int:
                             area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
                             area_B_Vs=0.0, peak_B_V=0.0,
                         )
+
+            # Per-buffer summaries for live GUI plotting
+            try:
+                if ch_count == 2:
+                    notifier.update(
+                        buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA)),
+                        buffer_mean_area_B=float(np.mean(areaB)), buffer_mean_peak_B=float(np.mean(peakB)),
+                    )
+                else:
+                    notifier.update(
+                        buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA))
+                    )
+            except Exception:
+                pass
 
             archive.append_reduced(red_rows, ts_ns)
             board.postAsyncBuffer(buf.addr, buf.size_bytes)
@@ -1118,51 +1215,15 @@ class ArchiveBrowser(tk.Tk):
         for _, r in self.snips.iterrows():
             ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
             self.wlist.insert(tk.END, f"{int(r['id'])}  {ts.strftime('%Y-%m-%d %H:%M:%S')}  buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} g={int(r['record_global'])}")
-        self._set_meta(f"Snips loaded: {len(self.snips):,}")
-
-    def _on_snip(self, _=None):
-        if self.snips.empty or self._snip_db_dir is None:
-            return
-        sel = self.wlist.curselection()
-        if not sel:
-            return
-        snip_id = int(self.wlist.get(sel[0]).split()[0])
-        row = self.snips[self.snips["id"] == snip_id]
-        if row.empty:
-            return
-        r = row.iloc[0]
-        store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
-        try:
-            wa, wb = store.load_waveforms(r, self._snip_db_dir)
-        finally:
-            store.close()
-
-        sr = float(r["sample_rate_hz"])
-        tvec = np.arange(len(wa)) / sr
-
-        self.ax.clear()
-        self.ax.plot(tvec, wa, label="A")
-        if wb is not None:
-            self.ax.plot(tvec, wb, label="B")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Volts")
-        self.ax.legend(loc="best")
-        self.fig.tight_layout()
-        self.canvas.draw()
-
-        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
         self._set_meta(
-            f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} global={int(r['record_global'])}\n"
-            f"area_A_Vs={float(r['area_A_Vs'])} peak_A_V={float(r['peak_A_V'])}\n"
-            f"samples={int(r['n_samples'])} channels={int(r['n_channels'])}"
-        )
+                f"State: {snap.get('state','?')}\n"
+                f"Session: {snap.get('session_id','')}\n"
+                f"Records: {snap.get('records','')}  Buffers: {snap.get('buffers','')}  Rate: {float(snap.get('rate_hz',0.0)):.3f} Hz\n"
+                f"Vpp A/B: {snap.get('vpp_A','?')} / {snap.get('vpp_B','?')}\n"
+                f"Status file: {self.status_path}"
+            )
+        self.after(1000, self._tick)
 
-    def _set_meta(self, s: str):
-        self.meta.configure(state=tk.NORMAL)
-        self.meta.delete("1.0", tk.END)
-        self.meta.insert(tk.END, s)
-        self.meta.configure(state=tk.DISABLED)
 
 class LauncherGUI(tk.Tk):
     """Simple launcher: Start Capture / Browse Archive / Open YAML."""
@@ -1206,8 +1267,15 @@ class LauncherGUI(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="State: idle")
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
-        logbox = ttk.LabelFrame(self, text="Log", padding=6)
-        logbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        # Tabs (Overview + Log)
+        tabs = ttk.Notebook(self)
+        tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self.dashboard = LiveDashboard(tabs, self.var_data_dir)
+        tabs.add(self.dashboard, text="Overview")
+
+        logbox = ttk.Frame(tabs, padding=6)
+        tabs.add(logbox, text="Log")
         self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED)
         self.log.pack(fill=tk.BOTH, expand=True)
 
