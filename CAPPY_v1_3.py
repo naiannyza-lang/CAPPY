@@ -1617,7 +1617,10 @@ class LiveDashboard(ttk.Frame):
         # rolling waveform history (store last N downsampled waveforms)
         self._wfA_hist: list[np.ndarray] = []
         self._wfB_hist: list[np.ndarray] = []
-        self._wf_hist_max = 30
+        # rolling stream buffers for true scrolling (concatenate each buffer waveform)
+        self._streamA = np.empty((0,), dtype=np.float32)
+        self._streamB = np.empty((0,), dtype=np.float32)
+        self._stream_window = 20000  # points shown in scrolling mode
 
         self._started_unix: Optional[float] = None
         self._last_seen_unix: float = 0.0
@@ -1706,13 +1709,20 @@ class LiveDashboard(ttk.Frame):
         # Rolling waveform history comes from the live ring (one waveform per buffer)
         wfA, wfB = self._read_ring_next()
         if wfA is not None:
-            self._wfA_hist.append(wfA.astype(float, copy=False))
-            if len(self._wfA_hist) > self._wf_hist_max:
-                self._wfA_hist.pop(0)
+            try:
+                # Append to scrolling stream and trim to window length
+                self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
+                if self._streamA.size > self._stream_window:
+                    self._streamA = self._streamA[-self._stream_window:]
+            except Exception:
+                pass
         if wfB is not None:
-            self._wfB_hist.append(wfB.astype(float, copy=False))
-            if len(self._wfB_hist) > self._wf_hist_max:
-                self._wfB_hist.pop(0)
+            try:
+                self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
+                if self._streamB.size > self._stream_window:
+                    self._streamB = self._streamB[-self._stream_window:]
+            except Exception:
+                pass
 
         while self.t and (self.t[-1] - self.t[0]) > 600.0:
             self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
@@ -1730,6 +1740,8 @@ class LiveDashboard(ttk.Frame):
             self._ring_play_seq = 0
             self._wfA_hist.clear()
             self._wfB_hist.clear()
+            self._streamA = np.empty((0,), dtype=np.float32)
+            self._streamB = np.empty((0,), dtype=np.float32)
 
     def _read_ring_next(self):
         """
@@ -1804,31 +1816,19 @@ class LiveDashboard(ttk.Frame):
             self.ax_int.set_ylabel("Integral (V·s)")
             self.ax_int.grid(True, alpha=0.2)
 
-        # waveform: rolling overlay (every waveform), A blue, B pink dashed
-        if self._wfA_hist:
-            x = np.arange(len(self._wfA_hist[-1]))
-            n = len(self._wfA_hist)
-            # vertical stacking offset to prevent traces from drawing on top of each other
-            try:
-                span = float(np.nanpercentile(np.abs(self._wfA_hist[-1]), 99))
-                offset = max(1e-6, 2.2 * span)
-            except Exception:
-                offset = 1.0
-            for i, w in enumerate(self._wfA_hist):
-                alpha = 0.2 + 0.8 * (i + 1) / n
-                self.ax_wf.plot(x, w + i * offset, color="blue", alpha=alpha)
-            if self._wfB_hist:
-                xb = np.arange(len(self._wfB_hist[-1]))
-                nb = len(self._wfB_hist)
-                for i, w in enumerate(self._wfB_hist):
-                    alpha = 0.2 + 0.8 * (i + 1) / nb
-                    self.ax_wf.plot(xb, w + i * offset, color="pink", linestyle="--", alpha=alpha)
-            self.ax_wf.set_ylabel("V + offset")
-            self.ax_wf.set_xlabel("Sample (downsampled)")
+        # waveform: TRUE scrolling (concatenate every buffer waveform into a rolling strip chart)
+        if self._streamA.size > 1:
+            x = np.arange(self._streamA.size)
+            self.ax_wf.plot(x, self._streamA, color="blue")
+            if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+                xb = np.arange(self._streamB.size)
+                self.ax_wf.plot(xb, self._streamB, color="pink", linestyle="--")
+            self.ax_wf.set_ylabel("V")
+            self.ax_wf.set_xlabel("Rolling samples (concatenated)")
             self.ax_wf.grid(True, alpha=0.2)
         else:
             self.ax_wf.set_title("Waveform: waiting for waveforms…")
-            self.ax_wf.set_xlabel("Sample")
+            self.ax_wf.set_xlabel("Rolling samples")
             self.ax_wf.set_ylabel("V")
             self.ax_wf.grid(True, alpha=0.2)
         # Avoid tight_layout on every frame for speed
@@ -1859,6 +1859,13 @@ class LiveDashboard(ttk.Frame):
                         self.lbl_peak.configure(text=f"{float(pA):.6g}")
             except Exception:
                 self.lbl_peak.configure(text=str(pA))
+
+            try:
+                live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
+                if 'stream_window_points' in live_cfg:
+                    self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
+            except Exception:
+                pass
 
             bt = snap.get("board_temp_c", None)
             self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
