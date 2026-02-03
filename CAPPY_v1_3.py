@@ -1929,13 +1929,19 @@ class LiveDashboard(ttk.Frame):
                 if wfA is None and wfB is None:
                     break
                 if wfA is not None:
-                    self._wfA_hist.append(wfA.astype(float, copy=False))
-                    if len(self._wfA_hist) > self._wf_hist_max:
-                        self._wfA_hist.pop(0)
+                    try:
+                        self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
+                        if self._streamA.size > self._stream_window:
+                            self._streamA = self._streamA[-self._stream_window:]
+                    except Exception:
+                        pass
                 if wfB is not None:
-                    self._wfB_hist.append(wfB.astype(float, copy=False))
-                    if len(self._wfB_hist) > self._wf_hist_max:
-                        self._wfB_hist.pop(0)
+                    try:
+                        self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
+                        if self._streamB.size > self._stream_window:
+                            self._streamB = self._streamB[-self._stream_window:]
+                    except Exception:
+                        pass
             self._redraw(snap)
 
             self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
