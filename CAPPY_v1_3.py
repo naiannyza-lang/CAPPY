@@ -8,6 +8,7 @@ import sys
 import time
 import signal
 import threading
+import queue
 import json
 import os
 import smtplib
@@ -1119,11 +1120,9 @@ def run_capture(cfg_path: Path) -> int:
 
     return 0
 
-class ArchiveBrowser(tk.Tk):
-    def __init__(self, data_dir: Path):
-        super().__init__()
-        self.title("CAPPY v1.3 Archive Browser")
-        self.geometry("1250x740")
+class ArchiveBrowser(ttk.Frame):
+    def __init__(self, data_dir: Path, master=None):
+        super().__init__(master)
         self.data_dir = data_dir
         self.captures = data_dir / "captures"
         self.sessions = pd.DataFrame()
@@ -1434,6 +1433,11 @@ class LiveDashboard(ttk.Frame):
         self.areaA: list[float] = []
         self.areaB: list[float] = []
 
+        # rolling waveform history (store last N downsampled waveforms)
+        self._wfA_hist: list[np.ndarray] = []
+        self._wfB_hist: list[np.ndarray] = []
+        self._wf_hist_max = 50
+
         self._started_unix: Optional[float] = None
         self._last_seen_unix: float = 0.0
 
@@ -1445,7 +1449,7 @@ class LiveDashboard(ttk.Frame):
             f = ttk.Frame(stats)
             f.pack(side=tk.LEFT, padx=(0, 14))
             ttk.Label(f, text=label).pack(anchor="w")
-            v = ttk.Label(f, text="—", font=("TkDefaultFont", 11, "bold"))
+            v = ttk.Label(f, text="—")
             v.pack(anchor="w")
             return v
 
@@ -1519,6 +1523,23 @@ class LiveDashboard(ttk.Frame):
         self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
         self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
 
+        # Rolling waveform history (append once per new status point when waveform is present)
+        try:
+            wfA = snap.get("latest_waveform_A", None)
+            wfB = snap.get("latest_waveform_B", None)
+            if isinstance(wfA, list) and len(wfA) > 1:
+                a = np.asarray(wfA, dtype=float)
+                self._wfA_hist.append(a)
+                if len(self._wfA_hist) > self._wf_hist_max:
+                    self._wfA_hist.pop(0)
+            if isinstance(wfB, list) and len(wfB) > 1:
+                b = np.asarray(wfB, dtype=float)
+                self._wfB_hist.append(b)
+                if len(self._wfB_hist) > self._wf_hist_max:
+                    self._wfB_hist.pop(0)
+        except Exception:
+            pass
+
         while self.t and (self.t[-1] - self.t[0]) > 600.0:
             self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
 
@@ -1541,25 +1562,29 @@ class LiveDashboard(ttk.Frame):
             self.ax_int.set_ylabel("Integral (V·s)")
             self.ax_int.grid(True, alpha=0.2)
 
-        # waveform: A blue, B pink dashed
-        wfA = snap.get("latest_waveform_A", None)
-        if isinstance(wfA, list) and len(wfA) > 1:
-            x = np.arange(len(wfA))
-            self.ax_wf.plot(x, wfA, color="blue", label="Waveform A (V)")
-            wfB = snap.get("latest_waveform_B", None)
-            if isinstance(wfB, list) and len(wfB) > 1:
-                xb = np.arange(len(wfB))
-                self.ax_wf.plot(xb, wfB, color="pink", linestyle="--", label="Waveform B (V)")
+        # waveform: rolling overlay (every waveform), A blue, B pink dashed
+        if self._wfA_hist:
+            # plot older waveforms fainter for a rolling visual
+            x = np.arange(len(self._wfA_hist[-1]))
+            n = len(self._wfA_hist)
+            for i, w in enumerate(self._wfA_hist):
+                alpha = 0.15 + 0.85 * (i + 1) / n
+                self.ax_wf.plot(x, w, color="blue", alpha=alpha)
+            # Channel B if enabled
+            if self._wfB_hist:
+                xb = np.arange(len(self._wfB_hist[-1]))
+                nb = len(self._wfB_hist)
+                for i, w in enumerate(self._wfB_hist):
+                    alpha = 0.15 + 0.85 * (i + 1) / nb
+                    self.ax_wf.plot(xb, w, color="pink", linestyle="--", alpha=alpha)
             self.ax_wf.set_ylabel("V")
             self.ax_wf.set_xlabel("Sample (downsampled)")
             self.ax_wf.grid(True, alpha=0.2)
-            self.ax_wf.legend(loc="best")
         else:
-            self.ax_wf.set_title("Waveform: waiting for latest waveform…")
+            self.ax_wf.set_title("Waveform: waiting for waveforms…")
             self.ax_wf.set_xlabel("Sample")
             self.ax_wf.set_ylabel("V")
             self.ax_wf.grid(True, alpha=0.2)
-
         self.fig.tight_layout()
         self.canvas.draw()
 
@@ -1597,14 +1622,55 @@ class LiveDashboard(ttk.Frame):
 
             self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
         self.after(250, self._tick)
+
+class _ProcLogPump:
+    """
+    Reads a subprocess' stdout in a background thread and pushes lines into a Queue.
+    Prevents Tkinter freezes from blocking readline().
+    """
+    def __init__(self, proc):
+        self.proc = proc
+        self.q: "queue.Queue[str]" = queue.Queue()
+        self._stop_evt = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
+        try:
+            f = self.proc.stdout
+            if f is None:
+                return
+            for line in f:
+                if self._stop_evt.is_set():
+                    break
+                self.q.put(line.rstrip("\n"))
+        except Exception as e:
+            try:
+                self.q.put(f"[GUI] log pump error: {e}")
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def drain(self, max_lines: int = 200):
+        out = []
+        for _ in range(max_lines):
+            try:
+                out.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+
 class LauncherGUI(tk.Tk):
     """Simple launcher: Start Capture / Browse Archive / Open YAML."""
     def __init__(self, script_path: Path):
         super().__init__()
-        self.title("CAPPY v1.3 Launcher")
-        self.geometry("1000x650")
         self.script_path = script_path
         self.proc = None
+        self.pump = None
+        self._kill_after_id = None
 
         self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
         self.var_data_dir = tk.StringVar(value="dataFile")
@@ -1651,7 +1717,8 @@ class LauncherGUI(tk.Tk):
         self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED)
         self.log.pack(fill=tk.BOTH, expand=True)
 
-        self.after(200, self._poll)
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.after(100, self._poll)
 
     def _append(self, s: str):
         self.log.configure(state=tk.NORMAL)
@@ -1681,7 +1748,13 @@ class LauncherGUI(tk.Tk):
             messagebox.showerror("Error", str(e))
 
     def _browse(self):
-        ArchiveBrowser(Path(self.var_data_dir.get())).mainloop()
+        try:
+            win = tk.Toplevel(self)
+            win.title('CAPPY Archive')
+            app = ArchiveBrowser(Path(self.var_data_dir.get()), master=win)
+            app.pack(fill=tk.BOTH, expand=True)
+        except Exception as e:
+            messagebox.showerror('CAPPY', str(e))
 
     def _toggle(self):
         if self.proc is None:
@@ -1691,12 +1764,32 @@ class LauncherGUI(tk.Tk):
 
     def _start(self):
         import subprocess
-        cmd = [sys.executable, str(self.script_path), "capture", "--config", self.var_config.get()]
+        if self.proc is not None:
+            return
+        cfg_path = Path(self.var_config.get()).expanduser()
+        if not cfg_path.exists():
+            messagebox.showerror("Missing", f"Config not found:\n{cfg_path}")
+            return
+
+        cmd = [sys.executable, str(self.script_path), "capture", "--config", str(cfg_path)]
         self._append("RUN: " + " ".join(cmd))
-        self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-            cwd=str(self.script_path.parent)
-        )
+
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=str(self.script_path.parent),
+            )
+            self.pump = _ProcLogPump(self.proc)
+        except Exception as e:
+            self.proc = None
+            self.pump = None
+            messagebox.showerror("CAPPY", f"Failed to start capture:\n{e}")
+            return
+
         self.lbl.config(text="State: capturing")
         self.btn.config(text="Stop Capture")
 
@@ -1704,39 +1797,70 @@ class LauncherGUI(tk.Tk):
         if self.proc is None:
             return
         try:
-            self.proc.terminate()
-            self._append("[GUI] sent terminate")
+            try:
+                self.proc.send_signal(signal.SIGINT)
+                self._append("[GUI] sent SIGINT")
+            except Exception:
+                self.proc.terminate()
+                self._append("[GUI] sent terminate")
         except Exception as e:
-            self._append("[GUI] terminate failed: " + str(e))
+            self._append("[GUI] stop failed: " + str(e))
+
+        if self._kill_after_id is None:
+            self._kill_after_id = self.after(2500, self._kill_if_running)
+
+    def _kill_if_running(self):
+        self._kill_after_id = None
+        if self.proc is None:
+            return
+        try:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self._append("[GUI] forced kill")
+        except Exception as e:
+            self._append("[GUI] kill failed: " + str(e))
+
+    def _on_close(self):
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self._stop()
+                self.after(600, self.destroy)
+                return
+        except Exception:
+            pass
+        self.destroy()
+
 
     def _poll(self):
-        if self.proc is not None and self.proc.stdout is not None:
-            try:
-                # non-blocking-ish: read what is available
-                line = self.proc.stdout.readline()
-                if line:
-                    self._append(line.rstrip())
-            except Exception:
-                pass
+        if self.pump is not None:
+            for ln in self.pump.drain(max_lines=400):
+                self._append(ln)
+
+        if self.proc is not None:
             rc = self.proc.poll()
             if rc is not None:
-                # drain
                 try:
-                    rest = self.proc.stdout.read()
-                    if rest:
-                        for ln in rest.splitlines():
+                    if self.pump is not None:
+                        for ln in self.pump.drain(max_lines=10000):
                             self._append(ln)
+                        self.pump.stop()
                 except Exception:
                     pass
                 self._append(f"[GUI] DAQ exited rc={rc}")
                 self.proc = None
+                self.pump = None
                 self.lbl.config(text="State: idle")
                 self.btn.config(text="Start Capture")
-        self.after(200, self._poll)
+
+        self.after(100, self._poll)
+
 
 def run_browse(data_dir: Path) -> int:
-    app = ArchiveBrowser(data_dir)
-    app.mainloop()
+    root = tk.Tk()
+    root.title('CAPPY Archive')
+    app = ArchiveBrowser(data_dir, master=root)
+    app.pack(fill=tk.BOTH, expand=True)
+    root.mainloop()
     return 0
 
 def main() -> int:
