@@ -893,6 +893,47 @@ def channels_mask_to_str(mask: int) -> str:
         parts.append("CHANNEL_B")
     return "|".join(parts) if parts else "0"
 
+
+def channels_from_mask_expr(expr: str) -> int:
+    """
+    Parse channel selection expression into a bitmask.
+      - 'A' -> 1, 'B' -> 2, 'AB'/'A|B'/'A,B' -> 3
+      - integer strings like '1', '2', '3', '0x3' are accepted as-is
+    Defaults to 1 if empty/invalid.
+    """
+    if expr is None:
+        return 1
+    e = str(expr).strip().upper()
+    if not e:
+        return 1
+    # numeric
+    try:
+        if e.startswith("0X"):
+            return int(e, 16)
+        if e.isdigit():
+            return int(e, 10)
+    except Exception:
+        pass
+    # symbolic
+    e = e.replace(" ", "").replace("+", "|").replace(",", "|")
+    if e in ("A",):
+        return 1
+    if e in ("B",):
+        return 2
+    if e in ("AB", "A|B", "B|A"):
+        return 3
+    # any includes
+    mask = 0
+    if "A" in e:
+        mask |= 1
+    if "B" in e:
+        mask |= 2
+    return mask if mask else 1
+
+def infer_channel_count_from_mask(mask: int) -> int:
+    mask = int(mask)
+    return 2 if (mask & 3) == 3 else 1
+
 def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, float]:
     c = cfg.get("clock", {}) or {}
     sr_hz = float(c.get("sample_rate_msps", 250.0)) * 1e6
@@ -1028,7 +1069,7 @@ def run_capture(cfg_path: Path) -> int:
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
-    ch_count = infer_channel_count(ch_mask)
+    ch_count = infer_channel_count_from_mask(ch_mask)
 
     _, bps = board.getChannelInfo()
     bytesPerSample = (bps.value + 7) // 8
