@@ -1,61 +1,78 @@
 # ----------------------------
-# CAPPY v20 config.yaml
+# CAPPY v21 config.yaml
 # ----------------------------
 
+device:
+  # ATS-SDK system + board identifiers (1-based in most setups)
+  system_id: 1
+  board_id: 1
+
 storage:
-  # Base output directory (GUI Browse points here)
   data_dir: "dataFile"
 
 acq:
-  # Channels: A=1, B=2, A|B=3
-  channels_mask: "A|B"
+  channels_mask: "A|B"      # "A", "B", "A|B", "3", "0x3"
+  data_layout: "auto"       # auto | interleaved | blocked
 
-  # Dual-channel packing:
-  #   auto        = detect blocked vs interleaved each buffer (recommended)
-  #   blocked     = AAAA...BBBB...
-  #   interleaved = A0,B0,A1,B1,...
-  data_layout: "auto"
-
-  # Typical acquisition settings (edit to match your run)
+  # Buffer structure
   samples_per_record: 256
   records_per_buffer: 128
-  sample_rate_hz: 500000000  # 500 MS/s example
-  record_length_seconds: 1.0e-6  # optional; used mainly for display
+
+clock:
+  # Use ONE of these:
+  sample_rate_hz: 500000000     # preferred: Hz
+  # sample_rate_msps: 500       # alternative: MSPS
+
+  # Clocking (ATS-SDK constants as strings)
+  source: "INTERNAL_CLOCK"
+  edge: "CLOCK_EDGE_RISING"
 
 channels:
   A:
     input_range_vpp: 0.4
     coupling: "DC"
+    impedance: "IMPEDANCE_50_OHM"
   B:
     input_range_vpp: 0.4
     coupling: "DC"
+    impedance: "IMPEDANCE_50_OHM"
+
+trigger:
+  # Trigger operation
+  operation: "TRIG_ENGINE_OP_J"
+  engine1: "TRIG_ENGINE_J"
+  engine2: "TRIG_ENGINE_K"
+
+  # Primary engine J
+  sourceJ: "TRIG_EXTERNAL"            # or "TRIG_CHAN_A", "TRIG_CHAN_B"
+  slopeJ: "TRIGGER_SLOPE_POSITIVE"    # or "TRIGGER_SLOPE_NEGATIVE"
+  levelJ: 128                         # 0-255 (board-specific meaning)
+
+  # Optional secondary engine K (usually disabled)
+  sourceK: "TRIG_DISABLE"
+  slopeK: "TRIGGER_SLOPE_POSITIVE"
+  levelK: 128
+
+  # External trigger conditioning
+  ext_coupling: "DC_COUPLING"         # or "AC_COUPLING"
+  ext_range: "ETR_5V"                 # board-supported ETR ranges
+
+  # Delay + timeout (IMPORTANT)
+  delay_samples: 0
+  timeout_ms: 1000                    # set >0 so you don’t hang forever waiting for trigger
 
 integrate:
-  # Integration window in samples (edit as needed)
+  # Integration window in samples
   start_sample: 0
   end_sample: 256
 
 notify:
-  # Heartbeat status file cadence (seconds)
   heartbeat_seconds: 1.0
-
-  # Fast GUI/stat flush cadence (buffers)
-  # This is what makes mean integral / stats update more often.
-  gui_every_buffers: 10
-
-  # Leave this if you still want the older “dashboard summary” behavior
+  gui_every_buffers: 10               # faster mean integral/stats updates
   dashboard_every_buffers: 1000
 
-  # Email settings (optional)
-  enabled: false
-  to_email: "naiannyza@gmail.com"
-  interval_minutes: 120
-
 live:
-  # Ring buffer storage for waveforms (written EVERY buffer)
   ring_slots: 8192
   ring_points: 512
-
-  # GUI consumption / scrolling behavior
   max_waveforms_per_tick: 400
   stream_window_points: 50000
