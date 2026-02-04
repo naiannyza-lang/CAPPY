@@ -894,6 +894,36 @@ def channels_mask_to_str(mask: int) -> str:
     return "|".join(parts) if parts else "0"
 
 
+
+def _auto_detect_layout(raw_1d: np.ndarray, spr: int) -> str:
+    """
+    Heuristic to guess dual-channel buffer layout ('interleaved' vs 'blocked') for a single record.
+    Chooses the layout with smoother per-channel traces (lower total variation).
+    """
+    try:
+        v = raw_1d
+        if v.size != spr * 2 or spr < 4:
+            return "interleaved"
+        rb = v.reshape(1, spr * 2)
+        # candidate 1: interleaved
+        Ai = rb[:, 0::2].ravel().astype(np.float32, copy=False)
+        Bi = rb[:, 1::2].ravel().astype(np.float32, copy=False)
+        # candidate 2: blocked
+        Ab = rb[:, :spr].ravel().astype(np.float32, copy=False)
+        Bb = rb[:, spr:].ravel().astype(np.float32, copy=False)
+
+        def tv(x):
+            dx = np.diff(x)
+            return float(np.sum(np.abs(dx)))
+
+        score_i = tv(Ai) + tv(Bi)
+        score_b = tv(Ab) + tv(Bb)
+
+        # If one layout produces a big mid-record discontinuity, it usually has higher TV.
+        return "blocked" if score_b < score_i else "interleaved"
+    except Exception:
+        return "interleaved"
+
 def channels_from_mask_expr(expr: str) -> int:
     """
     Parse channel selection expression into a bitmask.
@@ -1071,7 +1101,7 @@ def run_capture(cfg_path: Path) -> int:
     ch_mask = channels_from_mask_expr(ch_expr)
     ch_count = infer_channel_count_from_mask(ch_mask)
     data_layout = str((cfg.get('acq', {}) or {}).get('data_layout', 'interleaved')).strip().lower()
-    if data_layout not in ('interleaved','blocked'):
+    if data_layout not in ('interleaved','blocked','auto'):
         data_layout = 'interleaved'
 
     _, bps = board.getChannelInfo()
