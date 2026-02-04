@@ -966,7 +966,15 @@ def infer_channel_count_from_mask(mask: int) -> int:
 
 def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, float]:
     c = cfg.get("clock", {}) or {}
-    sr_hz = float(c.get("sample_rate_msps", 250.0)) * 1e6
+    # Sample rate can be specified as either Hz or MSPS.
+    # Prefer explicit Hz if provided.
+    if "sample_rate_hz" in c:
+        sr_hz = float(c.get("sample_rate_hz"))
+    else:
+        sr_hz = float(c.get("sample_rate_msps", 250.0)) * 1e6
+    if sr_hz <= 0:
+        raise ValueError(f"Invalid sample rate: {sr_hz}")
+
     source = ats_const(str(c.get("source", "INTERNAL_CLOCK")))
     edge = ats_const(str(c.get("edge", "CLOCK_EDGE_RISING")))
 
@@ -1095,7 +1103,10 @@ def run_capture(cfg_path: Path) -> int:
     )
     store_volts = bool(waves.get("store_volts", True))
 
-    board = ats.Board(systemId=2, boardId=1)
+    dev = (cfg.get('device', {}) or {})
+    system_id = int(dev.get('system_id', 1))
+    board_id = int(dev.get('board_id', 1))
+    board = ats.Board(systemId=system_id, boardId=board_id)
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
