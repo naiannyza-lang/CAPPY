@@ -1070,6 +1070,9 @@ def run_capture(cfg_path: Path) -> int:
 
     ch_mask = channels_from_mask_expr(ch_expr)
     ch_count = infer_channel_count_from_mask(ch_mask)
+    data_layout = str((cfg.get('acq', {}) or {}).get('data_layout', 'interleaved')).strip().lower()
+    if data_layout not in ('interleaved','blocked'):
+        data_layout = 'interleaved'
 
     _, bps = board.getChannelInfo()
     bytesPerSample = (bps.value + 7) // 8
@@ -1200,8 +1203,16 @@ def run_capture(cfg_path: Path) -> int:
             red_rows: List[Dict[str, Any]] = []
 
             if ch_count == 2:
-                A = raw[0::2].reshape(rpb, spr)
-                B = raw[1::2].reshape(rpb, spr)
+                # ATS boards can return dual-channel data as sample-interleaved (A0,B0,A1,B1,...) or
+                # channel-blocked (all A samples, then all B samples). Choose via cfg['acq']['data_layout'].
+                rb = raw.reshape(rpb, spr * 2)
+                if data_layout == 'blocked':
+                    A = rb[:, :spr]
+                    B = rb[:, spr:]
+                else:
+                    A = rb[:, 0::2]
+                    B = rb[:, 1::2]
+
                 areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
                 areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB)
                 for r in range(rpb):
