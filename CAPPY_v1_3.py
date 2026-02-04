@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -337,15 +336,25 @@ class LiveRingWriter:
             w = np.asarray(w, dtype=np.float32)
             if w.size == self.npts:
                 return w
-            # simple decimation to npts
+            if w.size < 2:
+                return np.zeros((self.npts,), dtype=np.float32)
+
+            if w.size < self.npts:
+                # Upsample by linear interpolation to avoid flat padded tails
+                x_old = np.linspace(0.0, 1.0, num=w.size, dtype=np.float32)
+                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
+                return np.interp(x_new, x_old, w).astype(np.float32, copy=False)
+
+            # Downsample by decimation then trim
             step = max(1, int(w.size // self.npts))
             w2 = w[::step]
             if w2.size > self.npts:
                 w2 = w2[: self.npts]
-            if w2.size < self.npts:
-                # pad with last value
-                pad = np.full((self.npts - w2.size,), w2[-1] if w2.size else 0.0, dtype=np.float32)
-                w2 = np.concatenate([w2, pad])
+            elif w2.size < self.npts:
+                # If decimation undershot (rare), interpolate to exact length
+                x_old = np.linspace(0.0, 1.0, num=w2.size, dtype=np.float32)
+                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
+                w2 = np.interp(x_new, x_old, w2).astype(np.float32, copy=False)
             return w2
 
         a = to_npts(wfA)
@@ -381,52 +390,53 @@ class StatusNotifier:
         self.cfg = cfg
         self.data_dir = data_dir
         self.notify = (cfg.get("notify", {}) or {})
-        self.hb_seconds = int(self.notify.get("heartbeat_seconds", 1))
-        self.email_seconds = int(self.notify.get("interval_minutes", 120)) * 60
+        self.hb_seconds = float(self.notify.get("heartbeat_seconds", 1.0))
+        self.email_seconds = float(self.notify.get("interval_minutes", 120)) * 60.0
         self._last_hb = 0.0
         self._last_email = 0.0
         self._lock = threading.Lock()
         self._latest: dict = {}
+        self._seq = 0
 
     def update(self, **kw) -> None:
         with self._lock:
             self._latest.update(kw)
+
+    def _snapshot(self):
+        self._seq += 1
+        self._latest["status_seq"] = self._seq
+        self._latest["status_unix"] = time.time()
+        return dict(self._latest)
+
+    def emit_now(self) -> None:
+        with self._lock:
+            snap = self._snapshot()
+        try:
+            _write_json_atomic(self.data_dir / "status" / "cappy_status.json", snap)
+        except Exception:
+            pass
 
     def maybe_emit(self) -> None:
         now = time.time()
         if now - self._last_hb >= self.hb_seconds:
             self._last_hb = now
             with self._lock:
-                snap = dict(self._latest)
+                snap = self._snapshot()
             try:
                 _write_json_atomic(self.data_dir / "status" / "cappy_status.json", snap)
-            except Exception as e:
+            except Exception:
                 pass
 
         if bool(self.notify.get("enabled", False)) and (now - self._last_email >= self.email_seconds):
             self._last_email = now
-            with self._lock:
-                snap = dict(self._latest)
-            prefix = str(self.notify.get("subject_prefix", "[CAPPY]")).strip() or "[CAPPY]"
-            subject = f"{prefix} status {snap.get('session_id','')}"
-            body = "\n".join(f"{k}: {v}" for k, v in sorted(snap.items()))
-            threading.Thread(target=_send_status_email, args=(self.cfg, subject, body), daemon=True).start()
-
-def channels_from_mask_expr(expr: str) -> int:
-    if not ATS_AVAILABLE or ats is None:
-        raise RuntimeError("atsapi not available.")
-    v = 0
-    for part in expr.split("|"):
-        part = part.strip()
-        if part:
-            v |= ats_const(part)
-    return v
-
-def infer_channel_count(mask: int) -> int:
-    if not ATS_AVAILABLE or ats is None:
-        raise RuntimeError("atsapi not available.")
-    # ats.channels exists in atsapi
-    return sum(1 for c in ats.channels if (c & mask == c))  # type: ignore[attr-defined]
+            try:
+                to_addr = str(self.notify.get("to_email", "")).strip()
+                if to_addr:
+                    with self._lock:
+                        snap = dict(self._latest)
+                    send_status_email(cfg=self.cfg, snap=snap)
+            except Exception:
+                pass
 
 class ParquetRollingWriter:
     def __init__(self, out_dir: Path, prefix: str, schema: pa.Schema, rollover_minutes: int):
@@ -883,6 +893,47 @@ def channels_mask_to_str(mask: int) -> str:
         parts.append("CHANNEL_B")
     return "|".join(parts) if parts else "0"
 
+
+def channels_from_mask_expr(expr: str) -> int:
+    """
+    Parse channel selection expression into a bitmask.
+      - 'A' -> 1, 'B' -> 2, 'AB'/'A|B'/'A,B' -> 3
+      - integer strings like '1', '2', '3', '0x3' are accepted as-is
+    Defaults to 1 if empty/invalid.
+    """
+    if expr is None:
+        return 1
+    e = str(expr).strip().upper()
+    if not e:
+        return 1
+    # numeric
+    try:
+        if e.startswith("0X"):
+            return int(e, 16)
+        if e.isdigit():
+            return int(e, 10)
+    except Exception:
+        pass
+    # symbolic
+    e = e.replace(" ", "").replace("+", "|").replace(",", "|")
+    if e in ("A",):
+        return 1
+    if e in ("B",):
+        return 2
+    if e in ("AB", "A|B", "B|A"):
+        return 3
+    # any includes
+    mask = 0
+    if "A" in e:
+        mask |= 1
+    if "B" in e:
+        mask |= 2
+    return mask if mask else 1
+
+def infer_channel_count_from_mask(mask: int) -> int:
+    mask = int(mask)
+    return 2 if (mask & 3) == 3 else 1
+
 def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, float]:
     c = cfg.get("clock", {}) or {}
     sr_hz = float(c.get("sample_rate_msps", 250.0)) * 1e6
@@ -1018,7 +1069,7 @@ def run_capture(cfg_path: Path) -> int:
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
-    ch_count = infer_channel_count(ch_mask)
+    ch_count = infer_channel_count_from_mask(ch_mask)
 
     _, bps = board.getChannelInfo()
     bytesPerSample = (bps.value + 7) // 8
@@ -1044,7 +1095,6 @@ def run_capture(cfg_path: Path) -> int:
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
-    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), started_unix=time.time(), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB)
     # Live waveform ring (writes one downsampled waveform per buffer)
     live_cfg = (cfg.get('live', {}) or {})
     ring_nslots = int(live_cfg.get('ring_slots', 4096))
@@ -1070,7 +1120,9 @@ def run_capture(cfg_path: Path) -> int:
     t0 = time.time()
     last = t0
     dashboard_every_buffers = int((cfg.get('notify', {}) or {}).get('dashboard_every_buffers', 1000))
+    gui_every_buffers = int((cfg.get('notify', {}) or {}).get('gui_every_buffers', 50))
     last_emit_buf = 0
+    last_gui_emit_buf = 0
     timeout_count = 0
     last_buffer_ns = time.time_ns()
     rt = cfg.get('runtime', {}) or {}
@@ -1202,10 +1254,28 @@ def run_capture(cfg_path: Path) -> int:
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA)),
                         buffer_mean_area_B=float(np.mean(areaB)), buffer_mean_peak_B=float(np.mean(peakB)),
                     )
+                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = buf_done
+                        try:
+                            temps = get_board_temperatures_c(board)
+                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
+                        except Exception:
+                            bt = None
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt)
+                        notifier.emit_now()
                 else:
                     notifier.update(
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA))
                     )
+                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = buf_done
+                        try:
+                            temps = get_board_temperatures_c(board)
+                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
+                        except Exception:
+                            bt = None
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt)
+                        notifier.emit_now()
             except Exception:
                 pass
 
@@ -1559,7 +1629,6 @@ class ArchiveBrowser(ttk.Frame):
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Volts")
         self.ax.legend(loc="best")
-        self.fig.tight_layout()
         # Avoid tight_layout on every frame for speed
         self.canvas.draw()
 
@@ -1610,11 +1679,13 @@ class LiveDashboard(ttk.Frame):
         # rolling waveform history (store last N downsampled waveforms)
         self._wfA_hist: list[np.ndarray] = []
         self._wfB_hist: list[np.ndarray] = []
-        self._wf_hist_max = 50
-        self._wf_hist_max = 30
+        # rolling stream buffers for true scrolling (concatenate each buffer waveform)
+        self._streamA = np.empty((0,), dtype=np.float32)
+        self._streamB = np.empty((0,), dtype=np.float32)
+        self._stream_window = 20000  # points shown in scrolling mode
 
         self._started_unix: Optional[float] = None
-        self._last_seen_unix: float = 0.0
+        self._last_seen_seq: int = 0
 
         # --- top stats ---
         stats = ttk.Frame(self)
@@ -1648,7 +1719,6 @@ class LiveDashboard(ttk.Frame):
         self.meta.pack(fill=tk.X, pady=(6, 0))
         self.meta.configure(state=tk.DISABLED)
 
-        self.after(250, self._tick)
         self.after(100, self._tick)
 
     def _set_meta(self, s: str):
@@ -1669,64 +1739,39 @@ class LiveDashboard(ttk.Frame):
             return None
 
     def _append_point(self, snap: dict):
-        su = snap.get("started_unix", None)
-        lcu = snap.get("last_capture_unix", None)
+        seq = snap.get("status_seq", None)
+        if seq is None:
+            return
+        try:
+            seq = int(seq)
+        except Exception:
+            return
+        if seq <= self._last_seen_seq:
+            return
+        self._last_seen_seq = seq
 
+        su = snap.get("started_unix", None)
+        tu = snap.get("status_unix", None)
         if su is not None:
             try:
                 self._started_unix = float(su)
             except Exception:
                 pass
-        if self._started_unix is None and lcu is not None:
+        if self._started_unix is None and tu is not None:
             try:
-                self._started_unix = float(lcu)
+                self._started_unix = float(tu)
             except Exception:
                 pass
-        if lcu is None or self._started_unix is None:
+        if self._started_unix is None or tu is None:
             return
 
-        try:
-            lcu_f = float(lcu)
-            t = lcu_f - float(self._started_unix)
-        except Exception:
-            return
-
-        if lcu_f <= self._last_seen_unix:
-            return
-        self._last_seen_unix = lcu_f
-
+        t = float(tu) - float(self._started_unix)
         self.t.append(t)
         self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
         self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
 
-        # Rolling waveform history (append once per new status point when waveform is present)
-        try:
-            wfA = snap.get("latest_waveform_A", None)
-            wfB = snap.get("latest_waveform_B", None)
-            if isinstance(wfA, list) and len(wfA) > 1:
-                a = np.asarray(wfA, dtype=float)
-                self._wfA_hist.append(a)
-                if len(self._wfA_hist) > self._wf_hist_max:
-                    self._wfA_hist.pop(0)
-            if isinstance(wfB, list) and len(wfB) > 1:
-                b = np.asarray(wfB, dtype=float)
-                self._wfB_hist.append(b)
-                if len(self._wfB_hist) > self._wf_hist_max:
-                    self._wfB_hist.pop(0)
-        except Exception:
-            pass
-        # Rolling waveform history comes from the live ring (one waveform per buffer)
-        wfA, wfB = self._read_ring_next()
-        if wfA is not None:
-            self._wfA_hist.append(wfA.astype(float, copy=False))
-            if len(self._wfA_hist) > self._wf_hist_max:
-                self._wfA_hist.pop(0)
-        if wfB is not None:
-            self._wfB_hist.append(wfB.astype(float, copy=False))
-            if len(self._wfB_hist) > self._wf_hist_max:
-                self._wfB_hist.pop(0)
-
         while self.t and (self.t[-1] - self.t[0]) > 600.0:
+            self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
             self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
 
 
@@ -1742,6 +1787,8 @@ class LiveDashboard(ttk.Frame):
             self._ring_play_seq = 0
             self._wfA_hist.clear()
             self._wfB_hist.clear()
+            self._streamA = np.empty((0,), dtype=np.float32)
+            self._streamB = np.empty((0,), dtype=np.float32)
 
     def _read_ring_next(self):
         """
@@ -1816,38 +1863,21 @@ class LiveDashboard(ttk.Frame):
             self.ax_int.set_ylabel("Integral (V·s)")
             self.ax_int.grid(True, alpha=0.2)
 
-        # waveform: rolling overlay (every waveform), A blue, B pink dashed
-        if self._wfA_hist:
-            # plot older waveforms fainter for a rolling visual
-            x = np.arange(len(self._wfA_hist[-1]))
-            n = len(self._wfA_hist)
-            # vertical stacking offset to prevent traces from drawing on top of each other
-            try:
-                span = float(np.nanpercentile(np.abs(self._wfA_hist[-1]), 99))
-                offset = max(1e-6, 2.2 * span)
-            except Exception:
-                offset = 1.0
-            for i, w in enumerate(self._wfA_hist):
-                alpha = 0.15 + 0.85 * (i + 1) / n
-                self.ax_wf.plot(x, w, color="blue", alpha=alpha)
-            # Channel B if enabled
-                alpha = 0.2 + 0.8 * (i + 1) / n
-                self.ax_wf.plot(x, w + i * offset, color="blue", alpha=alpha)
-            if self._wfB_hist:
-                xb = np.arange(len(self._wfB_hist[-1]))
-                nb = len(self._wfB_hist)
-                for i, w in enumerate(self._wfB_hist):
-                    alpha = 0.15 + 0.85 * (i + 1) / nb
-                    self.ax_wf.plot(xb, w, color="pink", linestyle="--", alpha=alpha)
-            self.ax_wf.set_ylabel("V + offset")
-            self.ax_wf.set_xlabel("Sample (downsampled)")
+        # waveform: TRUE scrolling (concatenate every buffer waveform into a rolling strip chart)
+        if self._streamA.size > 1:
+            x = np.arange(self._streamA.size)
+            self.ax_wf.plot(x, self._streamA, color="blue")
+            if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+                xb = np.arange(self._streamB.size)
+                self.ax_wf.plot(xb, self._streamB, color="pink", linestyle="--")
+            self.ax_wf.set_ylabel("V")
+            self.ax_wf.set_xlabel("Rolling samples (concatenated)")
             self.ax_wf.grid(True, alpha=0.2)
         else:
             self.ax_wf.set_title("Waveform: waiting for waveforms…")
-            self.ax_wf.set_xlabel("Sample")
+            self.ax_wf.set_xlabel("Rolling samples")
             self.ax_wf.set_ylabel("V")
             self.ax_wf.grid(True, alpha=0.2)
-        self.fig.tight_layout()
         # Avoid tight_layout on every frame for speed
         self.canvas.draw()
 
@@ -1877,6 +1907,13 @@ class LiveDashboard(ttk.Frame):
             except Exception:
                 self.lbl_peak.configure(text=str(pA))
 
+            try:
+                live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
+                if 'stream_window_points' in live_cfg:
+                    self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
+            except Exception:
+                pass
+
             bt = snap.get("board_temp_c", None)
             self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
 
@@ -1892,17 +1929,22 @@ class LiveDashboard(ttk.Frame):
                 if wfA is None and wfB is None:
                     break
                 if wfA is not None:
-                    self._wfA_hist.append(wfA.astype(float, copy=False))
-                    if len(self._wfA_hist) > self._wf_hist_max:
-                        self._wfA_hist.pop(0)
+                    try:
+                        self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
+                        if self._streamA.size > self._stream_window:
+                            self._streamA = self._streamA[-self._stream_window:]
+                    except Exception:
+                        pass
                 if wfB is not None:
-                    self._wfB_hist.append(wfB.astype(float, copy=False))
-                    if len(self._wfB_hist) > self._wf_hist_max:
-                        self._wfB_hist.pop(0)
+                    try:
+                        self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
+                        if self._streamB.size > self._stream_window:
+                            self._streamB = self._streamB[-self._stream_window:]
+                    except Exception:
+                        pass
             self._redraw(snap)
 
             self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
-        self.after(250, self._tick)
         self.after(100, self._tick)
 
 class _ProcLogPump:
