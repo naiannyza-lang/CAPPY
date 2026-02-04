@@ -1742,6 +1742,8 @@ class LiveDashboard(ttk.Frame):
         data_dir = Path(self.data_dir_var.get()).expanduser()
         p = data_dir / "status" / "cappy_status.json"
         self.status_path = p
+        # Always derive ring path from data_dir for live plotting (no reliance on status fields)
+        self.ring_path = data_dir / "status" / "live_waveforms.ring"
         try:
             if not p.exists():
                 return None
@@ -1787,19 +1789,11 @@ class LiveDashboard(ttk.Frame):
 
 
     def _open_ring_from_status(self, snap: dict):
-        rp = snap.get("live_ring_path", None)
-        if not rp:
+        # ring_path is derived from data_dir; just reset if file disappears
+        if self.ring_path is None:
             return
-        p = Path(str(rp)).expanduser()
-        if self.ring_path != p:
-            self.ring_path = p
-            # reset playback on ring change
-            self._ring_last_seq = 0
-            self._ring_play_seq = 0
-            self._wfA_hist.clear()
-            self._wfB_hist.clear()
-            self._streamA = np.empty((0,), dtype=np.float32)
-            self._streamB = np.empty((0,), dtype=np.float32)
+        if not self.ring_path.exists():
+            return
 
     def _read_ring_next(self):
         """
@@ -1929,16 +1923,23 @@ class LiveDashboard(ttk.Frame):
             self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
 
             self._open_ring_from_status(snap)
-            self._append_point(snap)
-            # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
+
+            # Always drain waveforms from the ring for live plotting, even if status_seq updates are slow.
+            # This decouples waveform live view from the heartbeat/status file cadence.
             try:
-                max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
+                live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
+                max_wf = int(live_cfg.get('max_waveforms_per_tick', 200))
+                if 'stream_window_points' in live_cfg:
+                    self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
             except Exception:
-                max_wf = 20
+                max_wf = 200
+
+            drained = False
             for _ in range(max_wf):
                 wfA, wfB = self._read_ring_next()
                 if wfA is None and wfB is None:
                     break
+                drained = True
                 if wfA is not None:
                     try:
                         self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
@@ -1953,9 +1954,22 @@ class LiveDashboard(ttk.Frame):
                             self._streamB = self._streamB[-self._stream_window:]
                     except Exception:
                         pass
+
+            # Integral / stats series still use status_seq to avoid duplicating points
+            self._append_point(snap)
+
+            # Redraw if we drained new waveforms, or periodically via the tick cadence
             self._redraw(snap)
 
-            self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
+            try:
+                ring_info = ""
+                if self.ring_path is not None and self.ring_path.exists():
+                    ring_info = f"    Ring: {self.ring_path} (last={getattr(self, '_ring_last_seq', 0)} play={getattr(self, '_ring_play_seq', 0)})"
+                else:
+                    ring_info = "    Ring: (missing)"
+            except Exception:
+                ring_info = ""
+            self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}{ring_info}")
         self.after(100, self._tick)
 
 class _ProcLogPump:
