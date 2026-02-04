@@ -1,82 +1,61 @@
-# =========================
-# CAPPY v1.3 Configuration
-# Proton beam default: 250 MS/s
-# Use *samples* where possible
-# =========================
-clock:
-  source: INTERNAL_CLOCK
-  sample_rate_msps: 250.0
-  edge: CLOCK_EDGE_RISING
+# ----------------------------
+# CAPPY v20 config.yaml
+# ----------------------------
+
+storage:
+  # Base output directory (GUI Browse points here)
+  data_dir: "dataFile"
+
+acq:
+  # Channels: A=1, B=2, A|B=3
+  channels_mask: "A|B"
+
+  # Dual-channel packing:
+  #   auto        = detect blocked vs interleaved each buffer (recommended)
+  #   blocked     = AAAA...BBBB...
+  #   interleaved = A0,B0,A1,B1,...
+  data_layout: "auto"
+
+  # Typical acquisition settings (edit to match your run)
+  samples_per_record: 256
+  records_per_buffer: 128
+  sample_rate_hz: 500000000  # 500 MS/s example
+  record_length_seconds: 1.0e-6  # optional; used mainly for display
+
 channels:
   A:
-    coupling: DC
-    range: PM_1_V
-    impedance: 50_OHM
-trigger:
-  operation: TRIG_ENGINE_OP_J
-  engine1: TRIG_ENGINE_J
-  engine2: TRIG_ENGINE_K
-  sourceJ: TRIG_EXTERNAL
-  slopeJ: TRIGGER_SLOPE_POSITIVE
-  levelJ: 128
-  sourceK: TRIG_DISABLE
-  slopeK: TRIGGER_SLOPE_POSITIVE
-  levelK: 128
-  ext_coupling: DC_COUPLING
-  ext_range: ETR_5V
-  delay_samples: 0
-  timeout_ms: 0
-  external_startcapture: false
-timing:
-  bunch_spacing_samples: 424
-acquisition:
-  channels_mask: CHANNEL_A
-  pre_trigger_samples: 0
-  post_trigger_samples: 256
-  records_per_buffer: 128
-  buffers_allocated: 16
-  buffers_per_acquisition: 0
-  wait_timeout_ms: 250
-integration:
-  baseline_window_samples:
-  - 0
-  - 64
-  integral_window_samples:
-  - 64
-  - 128
-waveforms:
-  enable: true
-  full_record: true
-  mode: every_n
-  every_n: 20000
-  threshold_integral_Vs: 0.0
-  threshold_peak_V: 0.0
-  max_waveforms_per_sec: 50
-  store_volts: true
-storage:
-  data_dir: dataFile
-  session_tag: ''
-  rollover_minutes: 60
-  session_rotate_hours: 24
-  flush_every_records: 200000
-  sqlite_commit_every_snips: 2000
-runtime:
-  noise_test: true
-  autotrigger_timeout_ms: 10
-  rearm_if_no_trigger_s: 300
-  rearm_cooldown_s: 30
-  max_rearms_per_hour: 12
+    input_range_vpp: 0.4
+    coupling: "DC"
+  B:
+    input_range_vpp: 0.4
+    coupling: "DC"
+
+integrate:
+  # Integration window in samples (edit as needed)
+  start_sample: 0
+  end_sample: 256
+
 notify:
-  enabled: true
-  interval_minutes: 1
-  heartbeat_seconds: 60
-  subject_prefix: '[CAPPY]'
-  method: stmp
-  to: 'naiannyza@gmail.com'
-  from: 'naiannyza@gmail.com'
-  sendmail_path: /usr/sbin/sendmail
-  smtp_host: 'stmp.gmail.com'
-  smtp_port: 587
-  smtp_user: 'naiannyza@gmail.com'
-  smtp_password_env: 'CAPPY'
-  smtp_starttls: true
+  # Heartbeat status file cadence (seconds)
+  heartbeat_seconds: 1.0
+
+  # Fast GUI/stat flush cadence (buffers)
+  # This is what makes mean integral / stats update more often.
+  gui_every_buffers: 10
+
+  # Leave this if you still want the older “dashboard summary” behavior
+  dashboard_every_buffers: 1000
+
+  # Email settings (optional)
+  enabled: false
+  to_email: "naiannyza@gmail.com"
+  interval_minutes: 120
+
+live:
+  # Ring buffer storage for waveforms (written EVERY buffer)
+  ring_slots: 8192
+  ring_points: 512
+
+  # GUI consumption / scrolling behavior
+  max_waveforms_per_tick: 400
+  stream_window_points: 50000
