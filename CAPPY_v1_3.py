@@ -125,8 +125,9 @@ storage:
   session_tag: ""
   rollover_minutes: 60
   session_rotate_hours: 24
-  flush_every_records: 200000
-  sqlite_commit_every_snips: 2000
+  flush_every_records: 20000
+  flush_every_seconds: 10
+  sqlite_commit_every_snips: 200
 
 notify:
   enabled: false
@@ -135,7 +136,7 @@ notify:
   method: "sendmail"
   sendmail_path: "/usr/sbin/sendmail"
   subject_prefix: "[CAPPY]"
-  heartbeat_seconds: 60
+  heartbeat_seconds: 5
   interval_minutes: 120
 
 runtime:
@@ -439,48 +440,66 @@ class StatusNotifier:
                 pass
 
 class ParquetRollingWriter:
-    def __init__(self, out_dir: Path, prefix: str, schema: pa.Schema, rollover_minutes: int):
-        self.out_dir = out_dir
+    """
+    Parquet writer that rolls files by time and stores them in an hourly hierarchy.
+
+    Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/<HH:00>/):
+      - reduced/<prefix>_<YYYYMMDD_HHMM>.parquet
+    """
+    def __init__(self, day_dir: Path, prefix: str, schema: pa.Schema, rollover_minutes: int):
+        self.day_dir = day_dir
         self.prefix = prefix
         self.schema = schema
         self.rollover_minutes = max(1, int(rollover_minutes))
-        _ensure_dir(out_dir)
+        _ensure_dir(day_dir)
         self._writer: Optional[pq.ParquetWriter] = None
-        self._open_key: Optional[str] = None
+        self._open_key: Optional[str] = None  # YYYYMMDD_HHMM
+        self._open_hour: Optional[str] = None  # HH:00
 
-    def _hour_dir(self, ts_ns: int) -> Path:
+    def _hour_dir(self, ts_ns: int) -> Tuple[str, Path]:
         dt = datetime.fromtimestamp(ts_ns / 1e9)
-        # waveforms/YYYY-MM-DD/HH
-        d = dt.strftime('%Y-%m-%d')
-        h = dt.strftime('%H')
-        p = self.out_dir / d / h
+        hour = dt.strftime("%H:00")
+        p = self.day_dir / hour / "reduced"
         _ensure_dir(p)
-        return p
+        return hour, p
 
     def _minute_key(self, ts_ns: int) -> str:
         return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
 
-    def _open_new(self, key: str) -> None:
-        path = self.out_dir / f"{self.prefix}_{key}.parquet"
+    def _open_new(self, ts_ns: int, key: str) -> None:
+        hour, base = self._hour_dir(ts_ns)
+        path = base / f"{self.prefix}_{key}.parquet"
         self._writer = pq.ParquetWriter(path, self.schema, compression="snappy", use_dictionary=True)
         self._open_key = key
+        self._open_hour = hour
 
     def _maybe_roll(self, ts_ns: int) -> None:
         key = self._minute_key(ts_ns)
-        if self._open_key is None:
-            self._open_new(key)
+        hour, _ = self._hour_dir(ts_ns)
+
+        if self._open_key is None or self._writer is None or self._open_hour is None:
+            self._open_new(ts_ns, key)
             return
+
+        # roll if hour changed
+        if hour != self._open_hour:
+            self.close()
+            self._open_new(ts_ns, key)
+            return
+
+        # roll if minutes exceeded rollover window
         t0 = datetime.strptime(self._open_key, "%Y%m%d_%H%M")
         t1 = datetime.strptime(key, "%Y%m%d_%H%M")
         if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
             self.close()
-            self._open_new(key)
+            self._open_new(ts_ns, key)
 
     def write_rows(self, rows: List[Dict[str, Any]], ts_ns: int) -> int:
         if not rows:
             return 0
         self._maybe_roll(ts_ns)
         assert self._writer is not None
+
         df = pd.DataFrame(rows)
         for name in self.schema.names:
             if name not in df.columns:
@@ -492,17 +511,35 @@ class ParquetRollingWriter:
 
     def close(self) -> None:
         if self._writer is not None:
-            self._writer.close()
-            self._writer = None
+            try:
+                self._writer.close()
+            finally:
+                self._writer = None
+                self._open_key = None
+                self._open_hour = None
+
 
 class WaveBinSqliteStore:
-    def __init__(self, out_dir: Path, session_id: str, rollover_minutes: int, commit_every: int):
-        self.out_dir = out_dir
+    """
+    Store waveform snippets as:
+      - raw float32 data appended to time-rolled .bin files inside hourly folders
+      - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset
+
+    Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/):
+      - index/snips_<session>.sqlite
+      - <HH:00>/waveforms/snips_<session>_<YYYYMMDD_HHMM>.bin
+    """
+    def __init__(self, day_dir: Path, session_id: str, rollover_minutes: int, commit_every: int):
+        self.day_dir = day_dir
         self.session_id = session_id
         self.rollover_minutes = max(1, int(rollover_minutes))
         self.commit_every = max(1, int(commit_every))
-        _ensure_dir(out_dir)
-        self.db_path = out_dir / f"snips_{session_id}.sqlite"
+        _ensure_dir(day_dir)
+
+        idx_dir = day_dir / "index"
+        _ensure_dir(idx_dir)
+        self.db_path = idx_dir / f"snips_{session_id}.sqlite"
+
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
@@ -529,44 +566,56 @@ class WaveBinSqliteStore:
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_snips_session_time ON snips(session_id, timestamp_ns);")
         self.conn.commit()
+
         self._bin_fh = None
         self._bin_key = None
+        self._bin_hour = None
         self._rows_since_commit = 0
 
-    def _hour_dir(self, ts_ns: int) -> Path:
+    def _hour_dir(self, ts_ns: int) -> Tuple[str, Path]:
         dt = datetime.fromtimestamp(ts_ns / 1e9)
-        # waveforms/YYYY-MM-DD/HH
-        d = dt.strftime('%Y-%m-%d')
-        h = dt.strftime('%H')
-        p = self.out_dir / d / h
+        hour = dt.strftime("%H:00")
+        p = self.day_dir / hour / "waveforms"
         _ensure_dir(p)
-        return p
+        return hour, p
 
     def _minute_key(self, ts_ns: int) -> str:
         return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
 
-    def _open_bin(self, key: str, ts_ns: int):
-        base = self._hour_dir(ts_ns)
+    def _open_bin(self, ts_ns: int, key: str):
+        hour, base = self._hour_dir(ts_ns)
         path = base / f"snips_{self.session_id}_{key}.bin"
         self._bin_fh = open(path, "ab", buffering=0)
         self._bin_key = key
+        self._bin_hour = hour
 
     def _maybe_roll(self, ts_ns: int):
         key = self._minute_key(ts_ns)
-        if self._bin_key is None:
-            self._open_bin(key, ts_ns)
+        hour, _ = self._hour_dir(ts_ns)
+
+        if self._bin_key is None or self._bin_fh is None or self._bin_hour is None:
+            self._open_bin(ts_ns, key)
             return
+
+        # roll on hour boundary
+        if hour != self._bin_hour:
+            self.close_bin()
+            self._open_bin(ts_ns, key)
+            return
+
+        # roll on rollover window
         t0 = datetime.strptime(self._bin_key, "%Y%m%d_%H%M")
         t1 = datetime.strptime(key, "%Y%m%d_%H%M")
         if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
             self.close_bin()
-            self._open_bin(key, ts_ns)
+            self._open_bin(ts_ns, key)
 
     def append(self, *, ts_ns: int, buffer_index: int, record_in_buffer: int, record_global: int,
                channels_mask: str, sample_rate_hz: float, wfA_V: np.ndarray, wfB_V: Optional[np.ndarray],
                area_A_Vs: float, peak_A_V: float, area_B_Vs: float, peak_B_V: float):
         self._maybe_roll(ts_ns)
         assert self._bin_fh is not None and self._bin_key is not None
+
         wfA = wfA_V.astype(np.float32, copy=False)
         if wfB_V is None:
             payload = wfA.tobytes(order="C")
@@ -575,12 +624,15 @@ class WaveBinSqliteStore:
             wfB = wfB_V.astype(np.float32, copy=False)
             payload = wfA.tobytes(order="C") + wfB.tobytes(order="C")
             n_channels = 2
+
         offset = self._bin_fh.tell()
         self._bin_fh.write(payload)
+
         try:
-            file_name = str(Path(self._bin_fh.name).relative_to(self.out_dir))
+            file_name = str(Path(self._bin_fh.name).relative_to(self.day_dir))
         except Exception:
             file_name = str(Path(self._bin_fh.name).name)
+
         self.conn.execute(
             "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -601,6 +653,7 @@ class WaveBinSqliteStore:
             finally:
                 self._bin_fh = None
                 self._bin_key = None
+                self._bin_hour = None
 
     def close(self):
         try:
@@ -618,8 +671,8 @@ class WaveBinSqliteStore:
         except Exception:
             pass
 
-    def load_waveforms(self, row: pd.Series, base_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        bin_path = base_dir / str(row["file"])
+    def load_waveforms(self, row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        bin_path = day_dir / str(row["file"])
         offset = int(row["offset_bytes"])
         nbytes = int(row["nbytes"])
         n_samples = int(row["n_samples"])
@@ -632,14 +685,18 @@ class WaveBinSqliteStore:
             return arr[:n_samples], arr[n_samples:2*n_samples]
         return arr[:n_samples], None
 
+
 class CappyArchive:
+
     def __init__(self, data_dir: Path, rollover_minutes: int, flush_every_records: int,
-                 session_rotate_hours: float, sqlite_commit_every_snips: int):
+                 session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0):
         self.data_dir = data_dir
         self.captures = data_dir / "captures"
         _ensure_dir(self.captures)
         self.rollover_minutes = int(rollover_minutes)
         self.flush_every_records = int(flush_every_records)
+        self.flush_every_seconds = float(flush_every_seconds or 0.0)
+        self._last_flush_unix = 0.0
         self.session_rotate_hours = float(session_rotate_hours or 0.0)
         self.sqlite_commit_every_snips = int(sqlite_commit_every_snips)
         self.session_id = ""
@@ -659,15 +716,23 @@ class CappyArchive:
             sid = f"{sid}_{tag}"
         self.session_id = sid
         self.session_start_ns = time.time_ns()
-        day = date.today().strftime("%Y-%m-%d")
-        self.day_dir = self.captures / day
-        red_dir = self.day_dir / "reduced"
-        wf_dir = self.day_dir / "waveforms"
-        _ensure_dir(red_dir)
-        _ensure_dir(wf_dir)
-        self.reduced_writer = ParquetRollingWriter(red_dir, f"reduced_{sid}", REDUCED_SCHEMA, self.rollover_minutes)
-        self.wave_store = WaveBinSqliteStore(wf_dir, sid, self.rollover_minutes, self.sqlite_commit_every_snips)
-        _atomic_write_text(self.day_dir / f"session_{sid}.txt", f"CAPPY v1.3 session {sid}\nchannels={channels_mask}\n")
+
+        # Hierarchical capture layout:
+        # captures/YYYY/YYYY-MM/YYYY-MM-DD/HH:00/{reduced,waveforms}/...
+        now = datetime.now()
+        year = now.strftime("%Y")
+        ym = now.strftime("%Y-%m")
+        ymd = now.strftime("%Y-%m-%d")
+        self.day_dir = self.captures / year / ym / ymd
+        _ensure_dir(self.day_dir)
+
+        idx_dir = self.day_dir / "index"
+        _ensure_dir(idx_dir)
+
+        self.reduced_writer = ParquetRollingWriter(self.day_dir, f"reduced_{sid}", REDUCED_SCHEMA, self.rollover_minutes)
+        self.wave_store = WaveBinSqliteStore(self.day_dir, sid, self.rollover_minutes, self.sqlite_commit_every_snips)
+
+        _atomic_write_text(idx_dir / f"session_{sid}.txt", f"CAPPY v1.3 session {sid}\nchannels={channels_mask}\n")
         print(f"[CAPPY] Started session {sid} in {self.day_dir}")
         return sid
 
@@ -686,6 +751,11 @@ class CappyArchive:
             return
         self._reduced_buf.extend(rows)
         self._touch(ts)
+        now = time.time()
+        if self.flush_every_seconds > 0 and (now - self._last_flush_unix) >= self.flush_every_seconds:
+            self._last_flush_unix = now
+            self.flush_reduced(ts)
+            return
         if len(self._reduced_buf) >= self.flush_every_records:
             self.flush_reduced(ts)
 
@@ -1092,6 +1162,7 @@ def run_capture(cfg_path: Path) -> int:
         flush_every_records=int(storage.get("flush_every_records", 200000)),
         session_rotate_hours=float(storage.get("session_rotate_hours", 0) or 0),
         sqlite_commit_every_snips=int(storage.get("sqlite_commit_every_snips", 2000)),
+        flush_every_seconds=float(storage.get("flush_every_seconds", 10.0) or 0.0),
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
@@ -1390,6 +1461,11 @@ class ArchiveBrowser(ttk.Frame):
         ttk.Entry(filt, textvariable=self.var_end, width=12).pack(side=tk.LEFT)
         ttk.Button(filt, text="Refresh", command=self._refresh).pack(side=tk.LEFT, padx=(12,0))
 
+        self.var_search = tk.StringVar(value="")
+        ttk.Label(filt, text="Search:").pack(side=tk.LEFT, padx=(16,4))
+        ttk.Entry(filt, textvariable=self.var_search, width=18).pack(side=tk.LEFT)
+        ttk.Button(filt, text="Apply", command=self._apply_search).pack(side=tk.LEFT, padx=(6,0))
+
         pan = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
         pan.pack(fill=tk.BOTH, expand=True, pady=(8,0))
         left = ttk.Frame(pan, padding=6)
@@ -1429,13 +1505,29 @@ class ArchiveBrowser(ttk.Frame):
             self.var_dir.set(p)
             self._refresh()
 
+    def _iter_day_dirs(self):
+        """Yield all YYYY-MM-DD directories under captures/YYYY/YYYY-MM/"""
+        if not self.captures.exists():
+            return
+        for ydir in sorted(self.captures.iterdir()):
+            if not ydir.is_dir():
+                continue
+            for mdir in sorted(ydir.iterdir()):
+                if not mdir.is_dir():
+                    continue
+                for ddir in sorted(mdir.iterdir()):
+                    if not ddir.is_dir():
+                        continue
+                    # day folder should be YYYY-MM-DD
+                    try:
+                        _ = datetime.strptime(ddir.name, "%Y-%m-%d").date()
+                    except ValueError:
+                        continue
+                    yield ddir
+
     def _list_sessions(self, sd: Optional[date], ed: Optional[date]) -> pd.DataFrame:
         rows = []
-        if not self.captures.exists():
-            return pd.DataFrame(columns=SESSION_INDEX_SCHEMA.names)
-        for ddir in sorted(self.captures.iterdir()):
-            if not ddir.is_dir():
-                continue
+        for ddir in self._iter_day_dirs() or []:
             try:
                 d = datetime.strptime(ddir.name, "%Y-%m-%d").date()
             except ValueError:
@@ -1459,6 +1551,8 @@ class ArchiveBrowser(ttk.Frame):
             sd = _parse_date(self.var_start.get().strip()) if self.var_start.get().strip() else None
             ed = _parse_date(self.var_end.get().strip()) if self.var_end.get().strip() else None
             self.sessions = self._list_sessions(sd, ed)
+            self.sessions_all = self.sessions.copy()
+            self._sessions_view = self.sessions.copy().reset_index(drop=True)
         except Exception as ex:
             messagebox.showerror("Error", str(ex))
             self.sessions = pd.DataFrame()
@@ -1470,9 +1564,14 @@ class ArchiveBrowser(ttk.Frame):
             self.slist.insert(tk.END, "(no sessions)")
             return
 
-        for _, r in self.sessions.iterrows():
+        self._sessions_view = getattr(self, '_sessions_view', self.sessions).reset_index(drop=True)
+        for _, r in self._sessions_view.iterrows():
             t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
             self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
+
+        # If a session is already selected and snips are loaded, re-apply snip filter.
+        if getattr(self, 'snips', pd.DataFrame()).empty is False:
+            self._apply_hour_filter()
 
     def _sel_sid(self) -> Optional[str]:
         if self.sessions.empty:
@@ -1480,7 +1579,8 @@ class ArchiveBrowser(ttk.Frame):
         sel = self.slist.curselection()
         if not sel:
             return None
-        return str(self.sessions.iloc[sel[0]]["session_id"])
+        view = getattr(self, '_sessions_view', self.sessions)
+        return str(view.iloc[sel[0]]["session_id"])
 
 
     def _build_hour_index(self):
@@ -1534,6 +1634,24 @@ class ArchiveBrowser(ttk.Frame):
         if "_hour" in df.columns and self._sel_hour is not None:
             df = df[df["_hour"] == self._sel_hour]
 
+        # Optional snip-level search. Supports:
+        #   id:123, buf:10, g:50000, rec:7  (exact match)
+        #   otherwise substring match on the rendered list line
+        q = (getattr(self, "var_search", tk.StringVar(value="")).get() or "").strip()
+        if q:
+            ql = q.lower()
+            try:
+                if ql.startswith("id:"):
+                    df = df[df["id"] == int(ql.split(":", 1)[1])]
+                elif ql.startswith("buf:"):
+                    df = df[df["buffer_index"] == int(ql.split(":", 1)[1])]
+                elif ql.startswith(("g:", "global:")):
+                    df = df[df["record_global"] == int(ql.split(":", 1)[1])]
+                elif ql.startswith("rec:"):
+                    df = df[df["record_in_buffer"] == int(ql.split(":", 1)[1])]
+            except Exception:
+                pass
+
         self._snips_view = df.sort_values("timestamp_ns", ascending=False)
 
         if self._snips_view.empty:
@@ -1575,11 +1693,9 @@ class ArchiveBrowser(ttk.Frame):
         self.snips = pd.DataFrame()
         self._snip_db_dir = None
 
-        for ddir in self.captures.iterdir():
-            if not ddir.is_dir():
-                continue
-            wf_dir = ddir / "waveforms"
-            db = wf_dir / f"snips_{sid}.sqlite"
+        for ddir in self._iter_day_dirs() or []:
+            idx_dir = ddir / "index"
+            db = idx_dir / f"snips_{sid}.sqlite"
             if db.exists():
                 conn = sqlite3.connect(db)
                 self.snips = pd.read_sql_query(
@@ -1589,7 +1705,7 @@ class ArchiveBrowser(ttk.Frame):
                     params=(sid,),
                 )
                 conn.close()
-                self._snip_db_dir = wf_dir
+                self._snip_db_dir = ddir
                 break
 
         self.wlist.delete(0, tk.END)
