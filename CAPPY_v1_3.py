@@ -1138,8 +1138,30 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
     }
 
     if int(source) == int(getattr(ats, "INTERNAL_CLOCK", source)) and sr_hz in RATE_MAP and hasattr(ats, RATE_MAP[sr_hz]):
-        board.setCaptureClock(source, getattr(ats, RATE_MAP[sr_hz]), edge, 0)
+        # Prefer an exact built-in rate constant; if the board doesn't support it, fall back.
+        try:
+            board.setCaptureClock(source, getattr(ats, RATE_MAP[sr_hz]), edge, 0)
+        except Exception as ex:
+            msg = str(ex)
+            if "ApiFailed" in msg or "ApiInvalid" in msg:
+                fallbacks = [500e6, 250e6, 200e6, 180e6, 160e6, 125e6, 100e6, 50e6, 20e6, 10e6, 5e6, 2e6, 1e6]
+                ok = False
+                for hz in fallbacks:
+                    if hz in RATE_MAP and hz != sr_hz and hasattr(ats, RATE_MAP[hz]):
+                        try:
+                            board.setCaptureClock(source, getattr(ats, RATE_MAP[hz]), edge, 0)
+                            sr_hz = float(hz)
+                            ok = True
+                            print(f"[CAPPY] sample rate not supported; fell back to {int(hz)} Hz")
+                            break
+                        except Exception:
+                            continue
+                if not ok:
+                    raise
+            else:
+                raise
     else:
+        # User-defined rate (or external clock); pass the rate in Hz.
         board.setCaptureClock(source, ats.SAMPLE_RATE_USER_DEF, edge, int(sr_hz))
 
     # Default Vpp fallback (only used if range parsing fails)
@@ -1354,7 +1376,11 @@ def run_capture(cfg_path: Path) -> int:
             try:
                 board.waitAsyncBufferComplete(buf.addr, wait_timeout_ms)
             except Exception as ex:
-                if "ApiWaitTimeout" in str(ex):
+                s_ex = str(ex)
+                if ("ApiWaitCanceled" in s_ex) or ("ApiWaitCancelled" in s_ex):
+                    # Normal stop path after AbortAsyncRead / SIGINT
+                    break
+                if "ApiWaitTimeout" in s_ex:
                     timeout_count += 1
                     ago_s = (time.time_ns() - last_buffer_ns) / 1e9
                     notifier.update(state="waiting_for_trigger", time=time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2414,16 +2440,18 @@ class _ProcLogPump:
 
 
 class LauncherGUI(tk.Tk):
-    """Dual-board launcher: run two capture processes and show side-by-side dashboards + archives."""
+    """Dual-board launcher: single-window split view; 'Arm Both' runs a single dual-board capture process for near-synchronous arming."""
     def __init__(self, script_path: Path):
         super().__init__()
         self.script_path = script_path
 
-        # Two capture subprocesses (board A/B)
+        # Capture subprocesses
         self.procA = None
         self.procB = None
+        self.procDual = None  # dual-board capture process
         self.pumpA = None
         self.pumpB = None
+        self.pumpDual = None
         self._kill_after_id = None
 
         # Apply dark mode theme
@@ -2452,6 +2480,8 @@ class LauncherGUI(tk.Tk):
         # Auto-create default configs if missing (B is a copy of A with system_id=1 if possible)
         self._ensure_default_configs()
 
+        self._refresh_yaml_lists()
+
         # --- top config bar ---
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
@@ -2460,21 +2490,25 @@ class LauncherGUI(tk.Tk):
         rowA = ttk.Frame(top)
         rowA.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(rowA, text="Board A (ATS-9352) YAML:").pack(side=tk.LEFT)
-        ttk.Entry(rowA, textvariable=self.var_configA, width=44).pack(side=tk.LEFT, padx=(6, 8))
+        self.cb_cfgA = ttk.Combobox(rowA, textvariable=self.var_configA, values=getattr(self,'_yaml_choices',[]), width=41)
+        self.cb_cfgA.pack(side=tk.LEFT, padx=(6, 8))
         ttk.Button(rowA, text="Browse…", command=lambda: self._pick_yaml(self.var_configA)).pack(side=tk.LEFT)
 
         ttk.Label(rowA, text="Data dir:").pack(side=tk.LEFT, padx=(14, 4))
-        ttk.Entry(rowA, textvariable=self.var_data_dirA, width=22).pack(side=tk.LEFT)
+        self.cb_dirA = ttk.Combobox(rowA, textvariable=self.var_data_dirA, values=self._list_data_dirs(), width=19)
+        self.cb_dirA.pack(side=tk.LEFT)
 
         # Row 2: Board B
         rowB = ttk.Frame(top)
         rowB.pack(fill=tk.X)
         ttk.Label(rowB, text="Board B (ATS-9462) YAML:").pack(side=tk.LEFT)
-        ttk.Entry(rowB, textvariable=self.var_configB, width=44).pack(side=tk.LEFT, padx=(6, 8))
+        self.cb_cfgB = ttk.Combobox(rowB, textvariable=self.var_configB, values=getattr(self,'_yaml_choices',[]), width=41)
+        self.cb_cfgB.pack(side=tk.LEFT, padx=(6, 8))
         ttk.Button(rowB, text="Browse…", command=lambda: self._pick_yaml(self.var_configB)).pack(side=tk.LEFT)
 
         ttk.Label(rowB, text="Data dir:").pack(side=tk.LEFT, padx=(14, 4))
-        ttk.Entry(rowB, textvariable=self.var_data_dirB, width=22).pack(side=tk.LEFT)
+        self.cb_dirB = ttk.Combobox(rowB, textvariable=self.var_data_dirB, values=self._list_data_dirs(), width=19)
+        self.cb_dirB.pack(side=tk.LEFT)
 
         # --- control bar ---
         ctrl = ttk.Frame(self, padding=8)
@@ -2491,6 +2525,7 @@ class LauncherGUI(tk.Tk):
         self.btn_armBoth.pack(side=tk.LEFT, padx=(14, 0))
 
         ttk.Button(ctrl, text="Stop All", command=self._stop_all).pack(side=tk.LEFT, padx=(14, 0))
+        ttk.Button(ctrl, text="Open Archive", command=self._open_archive_popup).pack(side=tk.LEFT, padx=(6,0))
 
         self.lbl = ttk.Label(ctrl, text="State: idle")
         self.lbl.pack(side=tk.LEFT, padx=(16, 0))
@@ -2517,27 +2552,10 @@ class LauncherGUI(tk.Tk):
         pan.add(left, weight=1)
         pan.add(right, weight=1)
 
-        # Archive (split-screen browsers)
-        arch = ttk.Frame(tabs, padding=0)
+        # Archive (use Open Archive button)
+        arch = ttk.Frame(tabs, padding=12)
         tabs.add(arch, text="Archive")
-
-        apan = ttk.Panedwindow(arch, orient=tk.HORIZONTAL)
-        apan.pack(fill=tk.BOTH, expand=True)
-
-        aleft = ttk.Labelframe(apan, text="Archive A", padding=6)
-        aright = ttk.Labelframe(apan, text="Archive B", padding=6)
-
-        self.archiveA = ArchiveBrowser(Path(self.var_data_dirA.get()), master=aleft)
-        self.archiveA.pack(fill=tk.BOTH, expand=True)
-        self.archiveB = ArchiveBrowser(Path(self.var_data_dirB.get()), master=aright)
-        self.archiveB.pack(fill=tk.BOTH, expand=True)
-
-        # Update archive roots when data-dir vars change
-        self.var_data_dirA.trace_add("write", lambda *_: self._reset_archive("A"))
-        self.var_data_dirB.trace_add("write", lambda *_: self._reset_archive("B"))
-
-        apan.add(aleft, weight=1)
-        apan.add(aright, weight=1)
+        ttk.Label(arch, text="Use 'Open Archive' to browse sessions.").pack(anchor='w')
 
         # Log (combined)
         logbox = ttk.Frame(tabs, padding=6)
@@ -2618,6 +2636,24 @@ class LauncherGUI(tk.Tk):
         except Exception as e:
             self._append(f"[GUI] archive reset {which} failed: {e}")
 
+    def _open_archive_popup(self):
+        win = tk.Toplevel(self)
+        win.title("CAPPY Archive")
+        win.geometry("1200x700")
+        pan = ttk.Panedwindow(win, orient=tk.HORIZONTAL)
+        pan.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        left = ttk.Labelframe(pan, text="Archive A", padding=6)
+        right = ttk.Labelframe(pan, text="Archive B", padding=6)
+        pan.add(left, weight=1)
+        pan.add(right, weight=1)
+
+        archA = ArchiveBrowser(Path(self.var_data_dirA.get()), master=left)
+        archA.pack(fill=tk.BOTH, expand=True)
+        archB = ArchiveBrowser(Path(self.var_data_dirB.get()), master=right)
+        archB.pack(fill=tk.BOTH, expand=True)
+
+
     # ---------------- capture control ----------------
     def _toggle(self, which: str):
         if which == "A":
@@ -2632,18 +2668,38 @@ class LauncherGUI(tk.Tk):
                 self._stop("B")
 
     def _arm_both(self):
-        # Arm both "as simultaneously as we can" from a single-threaded GUI.
-        # Start A then B immediately (order doesn't materially matter for external trigger cases).
-        if self.procA is None:
-            okA = self._start("A", quiet=True)
-        else:
-            okA = True
-        if self.procB is None:
-            okB = self._start("B", quiet=True)
-        else:
-            okB = True
-        if okA and okB:
-            self._append("[GUI] Arm Both: started A + B")
+        # Prefer single-process dual capture for near-synchronous arming
+        if self.procDual is not None:
+            self._append("[GUI] Dual capture already running.")
+            self._update_state_label()
+            return
+
+        cfgA = Path(self.var_configA.get()).expanduser()
+        cfgB = Path(self.var_configB.get()).expanduser()
+        if not cfgA.exists() or not cfgB.exists():
+            messagebox.showerror("Missing", f"Config not found:\n{cfgA}\n{cfgB}")
+            return
+
+        cmd = [sys.executable, str(self.script_path), "capture-dual",
+               "--configA", str(cfgA), "--configB", str(cfgB)]
+        self._append("RUN[DUAL]: " + " ".join(cmd))
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=str(self.script_path.parent),
+            )
+            self.procDual = proc
+            self.pumpDual = _ProcLogPump(proc)
+            self._append("[GUI] Arm Both: started dual capture (A+B).")
+        except Exception as e:
+            messagebox.showerror("CAPPY", f"Failed to start dual capture:\n{e}")
+            self.procDual = None
+            self.pumpDual = None
+        self._update_buttons()
         self._update_state_label()
 
     def _start(self, which: str, quiet: bool=False) -> bool:
@@ -2707,6 +2763,13 @@ class LauncherGUI(tk.Tk):
             self._kill_after_id = self.after(2500, self._kill_if_running)
 
     def _stop_all(self):
+        # Stop dual capture if running
+        if getattr(self, 'procDual', None) is not None:
+            try:
+                self.procDual.send_signal(signal.SIGINT)
+                self._append('[GUI] sent SIGINT to DUAL')
+            except Exception:
+                pass
         self._stop("A")
         self._stop("B")
 
@@ -2784,6 +2847,307 @@ class LauncherGUI(tk.Tk):
         self.destroy()
 
 
+def run_capture_dual(cfgA_path: Path, cfgB_path: Path) -> int:
+    """
+    Dual-board capture in a *single process*:
+      - Open + configure both boards
+      - Arm both (beforeAsyncRead + post buffers)
+      - startCapture() for both, then service DMA for each until stop
+
+    This avoids the "two subprocess" skew and keeps teardown robust (ApiWaitCanceled treated as clean stop).
+    """
+    if not ATS_AVAILABLE or ats is None:
+        print("[CAPPY] atsapi not available on this machine.")
+        return 2
+
+    cfgA = load_config(cfgA_path)
+    cfgB = load_config(cfgB_path)
+
+    def _mk_state(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        acq = cfg.get("acquisition", {}) or {}
+        timing = cfg.get("timing", {}) or {}
+        integ = cfg.get("integration", {}) or {}
+        waves = cfg.get("waveforms", {}) or {}
+        storage = cfg.get("storage", {}) or {}
+        trig = cfg.get("trigger", {}) or {}
+
+        pre = int(acq.get("pre_trigger_samples", 0))
+        post = int(acq.get("post_trigger_samples", 256))
+        spr = pre + post
+        rpb = int(acq.get("records_per_buffer", 128))
+        bufN = int(acq.get("buffers_allocated", 16))
+        bpa = int(acq.get("buffers_per_acquisition", 0))
+        wait_timeout_ms = int(acq.get("wait_timeout_ms", 1000))
+        ch_expr = str(acq.get("channels_mask", "CHANNEL_A"))
+        bunch_spacing = int(timing.get("bunch_spacing_samples", spr))
+
+        b0, b1 = map(int, integ.get("baseline_window_samples", [0, min(64, spr)]))
+        g0, g1 = map(int, integ.get("integral_window_samples", [min(64, spr), min(128, spr)]))
+
+        wf_enable = bool(waves.get("enable", True))
+        wf = WfPolicy(
+            mode=str(waves.get("mode", "every_n")),
+            every_n=int(waves.get("every_n", 20000)),
+            thr_area=float(waves.get("threshold_integral_Vs", 0.0)),
+            thr_peak=float(waves.get("threshold_peak_V", 0.0)),
+            max_per_sec=int(waves.get("max_waveforms_per_sec", 50)),
+        )
+        store_volts = bool(waves.get("store_volts", True))
+
+        if spr > bunch_spacing:
+            raise ValueError("samples_per_record must be <= bunch_spacing_samples")
+
+        # storage paths
+        data_dir = Path(str(storage.get("data_dir", "dataFile")))
+
+        return dict(
+            cfg=cfg, acq=acq, timing=timing, integ=integ, waves=waves, storage=storage, trig=trig,
+            pre=pre, post=post, spr=spr, rpb=rpb, bufN=bufN, bpa=bpa, wait_timeout_ms=wait_timeout_ms,
+            ch_expr=ch_expr, bunch_spacing=bunch_spacing,
+            b0=b0, b1=b1, g0=g0, g1=g1,
+            wf_enable=wf_enable, wf=wf, store_volts=store_volts,
+            data_dir=data_dir
+        )
+
+    SA = _mk_state(cfgA)
+    SB = _mk_state(cfgB)
+
+    # Open boards from YAML if present; default to (systemId, boardId) = (0,1) and (1,1)
+    def _open_board(cfg: Dict[str, Any], default_sys: int) -> Any:
+        bcfg = (cfg.get("board", {}) or {})
+        system_id = int(bcfg.get("system_id", default_sys))
+        board_id = int(bcfg.get("board_id", 1))
+        return ats.Board(systemId=system_id, boardId=board_id)
+
+    boardA = _open_board(cfgA, 0)
+    boardB = _open_board(cfgB, 1)
+
+    # Configure both boards; if a rate isn't supported, configure_board already raises -> handled by fallback inside configure_board.
+    srA_hz, vppA_A, vppA_B = configure_board(boardA, cfgA)
+    srB_hz, vppB_A, vppB_B = configure_board(boardB, cfgB)
+
+    def _alloc_dma(board, spr, rpb, ch_expr):
+        ch_mask = channels_from_mask_expr(ch_expr)
+        ch_count = infer_channel_count_from_mask(ch_mask)
+        _, bps = board.getChannelInfo()
+        bytesPerSample = (bps.value + 7) // 8
+        sample_type = ctypes.c_uint8 if bytesPerSample == 1 else ctypes.c_uint16
+        bytesPerBuffer = bytesPerSample * spr * rpb * ch_count
+        bufs = [ats.DMABuffer(board.handle, sample_type, bytesPerBuffer) for _ in range(int(max(2, ch_count)) * 0 + int(0) or 0)]
+        # (above line is a no-op; kept to avoid linter issues)
+        bufs = [ats.DMABuffer(board.handle, sample_type, bytesPerBuffer) for _ in range(int(ch_count*0) or int(0) or 0)]  # overwritten below
+        return ch_mask, ch_count, bytesPerSample, sample_type, bytesPerBuffer
+
+    # Allocate buffers per board
+    def _setup(board, S, sr_hz, vppA, vppB):
+        ch_mask = channels_from_mask_expr(S["ch_expr"])
+        ch_count = infer_channel_count_from_mask(ch_mask)
+        _, bps = board.getChannelInfo()
+        bytesPerSample = (bps.value + 7) // 8
+        sample_type = ctypes.c_uint8 if bytesPerSample == 1 else ctypes.c_uint16
+        bytesPerBuffer = bytesPerSample * S["spr"] * S["rpb"] * ch_count
+        buffers = [ats.DMABuffer(board.handle, sample_type, bytesPerBuffer) for _ in range(S["bufN"])]
+        board.setRecordSize(S["pre"], S["post"])
+        # recordsPerAcq
+        if S["bpa"] <= 0:
+            recordsPerAcq = 0
+            buf_target = 2**31 - 1
+        else:
+            recordsPerAcq = S["rpb"] * S["bpa"]
+            buf_target = S["bpa"]
+        # archive
+        storage = S["storage"] or {}
+        archive = CappyArchive(
+            data_dir=Path(str(storage.get("data_dir", "dataFile"))),
+            rollover_minutes=int(storage.get("rollover_minutes", 60)),
+            flush_every_records=int(storage.get("flush_every_records", 200000)),
+            session_rotate_hours=float(storage.get("session_rotate_hours", 0) or 0),
+            sqlite_commit_every_snips=int(storage.get("sqlite_commit_every_snips", 2000)),
+            flush_every_seconds=float(storage.get("flush_every_seconds", 10.0) or 0.0),
+        )
+        sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=S["ch_expr"])
+        notifier = StatusNotifier(S["cfg"], Path(str(storage.get('data_dir', 'dataFile'))))
+
+        # Live ring (separate per board)
+        live_cfg = (S["cfg"].get('live', {}) or {})
+        ring_nslots = int(live_cfg.get('ring_slots', 4096))
+        ring_npts = int(live_cfg.get('ring_points', 512))
+        ring_path = Path(str(storage.get('data_dir', 'dataFile'))) / 'status' / 'live_waveforms.ring'
+        ring = LiveRingWriter(ring_path, nslots=ring_nslots, npts=ring_npts)
+
+        notifier.update(session_id=sid, state='running',
+                        started=datetime.now(tz=_LOCAL_TZ()).isoformat(),
+                        started_utc=datetime.utcnow().replace(tzinfo=_UTC_TZ()).isoformat(),
+                        started_unix=time.time(),
+                        data_dir=str(storage.get('data_dir','dataFile')),
+                        channels_mask=S["ch_expr"], sample_rate_hz=sr_hz,
+                        samples_per_record=S["spr"], records_per_buffer=S["rpb"],
+                        vpp_A=vppA, vpp_B=vppB,
+                        live_ring_path=str(ring_path))
+        notifier.maybe_emit()
+
+        adma_flags = ats.ADMA_TRADITIONAL_MODE
+        trig = S["trig"] or {}
+        if bool(trig.get("external_startcapture", False)):
+            adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
+
+        board.beforeAsyncRead(ch_mask, -S["pre"], S["spr"], S["rpb"], recordsPerAcq, adma_flags)
+        for b in buffers:
+            board.postAsyncBuffer(b.addr, b.size_bytes)
+
+        return dict(
+            board=board, S=S, sr_hz=sr_hz, vppA=vppA, vppB=vppB,
+            ch_mask=ch_mask, ch_count=ch_count,
+            buffers=buffers, buf_target=buf_target,
+            archive=archive, sid=sid, notifier=notifier, ring=ring,
+            adma_flags=adma_flags, recordsPerAcq=recordsPerAcq,
+            buf_done=0, global_rec=0, timeout_count=0, last_buffer_ns=time.time_ns(),
+        )
+
+    stA = _setup(boardA, SA, srA_hz, vppA_A, vppA_B)
+    stB = _setup(boardB, SB, srB_hz, vppB_A, vppB_B)
+
+    print(f"[CAPPY] Dual capture armed. A_session={stA['sid']} B_session={stB['sid']}")
+    # Arm both before waiting for trigger
+    boardA.startCapture()
+    boardB.startCapture()
+
+    def _service_one(st: Dict[str, Any]) -> bool:
+        # returns False when should stop this board
+        if st["buf_done"] >= st["buf_target"]:
+            return False
+        buf = st["buffers"][st["buf_done"] % len(st["buffers"])]
+        try:
+            st["board"].waitAsyncBufferComplete(buf.addr, int(st["S"]["wait_timeout_ms"]))
+        except Exception as ex:
+            s = str(ex)
+            if ("ApiWaitCanceled" in s) or ("ApiWaitCancelled" in s):
+                return False
+            if "ApiWaitTimeout" in s:
+                st["timeout_count"] += 1
+                ago_s = (time.time_ns() - st["last_buffer_ns"]) / 1e9
+                st["notifier"].update(state="waiting_for_trigger", time=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                     timeouts=st["timeout_count"], last_buffer_ago_s=ago_s,
+                                     buffers=st["buf_done"], records=st["global_rec"],
+                                     reduced_rows=getattr(st["archive"], "_n_reduced", 0),
+                                     snips=getattr(st["archive"], "_n_snips", 0))
+                st["notifier"].maybe_emit()
+                return True
+            raise
+        st["timeout_count"] = 0
+        st["last_buffer_ns"] = time.time_ns()
+        ts_ns = st["last_buffer_ns"]
+
+        if st["archive"].should_rotate():
+            st["archive"].finalize(st["S"]["ch_expr"])
+            st["sid"] = st["archive"].start(tag=str((st["S"]["storage"] or {}).get("session_tag","")).strip(),
+                                            channels_mask=st["S"]["ch_expr"])
+
+        raw = buf.buffer
+        if raw.dtype != np.uint16:
+            raw = raw.astype(np.uint16, copy=False)
+
+        spr = st["S"]["spr"]
+        rpb = st["S"]["rpb"]
+        b0,b1,g0,g1 = st["S"]["b0"], st["S"]["b1"], st["S"]["g0"], st["S"]["g1"]
+
+        red_rows: List[Dict[str, Any]] = []
+        if st["ch_count"] == 2:
+            A = raw[0::2].reshape(rpb, spr)
+            B = raw[1::2].reshape(rpb, spr)
+            areaA, peakA, baseA = reduce_u16(A, st["sr_hz"], b0, b1, g0, g1, st["vppA"])
+            areaB, peakB, baseB = reduce_u16(B, st["sr_hz"], b0, b1, g0, g1, st["vppB"])
+            for r in range(rpb):
+                rec_g = st["global_rec"] + r
+                red_rows.append(dict(
+                    session_id=st["sid"], buffer_index=st["buf_done"], record_in_buffer=r, record_global=rec_g,
+                    timestamp_ns=int(ts_ns), sample_rate_hz=float(st["sr_hz"]),
+                    samples_per_record=spr, records_per_buffer=rpb,
+                    channels_mask=st["S"]["ch_expr"], bunch_spacing_samples=int(st["S"]["bunch_spacing"]),
+                    area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
+                    area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]), baseline_B_V=float(baseB[r]),
+                ))
+                if st["S"]["wf_enable"] and st["S"]["wf"].want(rec_g, float(areaA[r]), float(peakA[r])):
+                    wfA_V = _codes_to_volts_u16(A[r], vpp=st["vppA"]) if st["S"]["store_volts"] else A[r].astype(np.float32)
+                    wfB_V = _codes_to_volts_u16(B[r], vpp=st["vppB"]) if st["S"]["store_volts"] else B[r].astype(np.float32)
+                    st["archive"].append_snip(
+                        ts_ns=ts_ns, buffer_index=st["buf_done"], record_in_buffer=r, record_global=rec_g,
+                        channels_mask=st["S"]["ch_expr"], sample_rate_hz=float(st["sr_hz"]),
+                        wfA_V=wfA_V, wfB_V=wfB_V,
+                        area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
+                        area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]),
+                    )
+        else:
+            A = raw.reshape(rpb, spr)
+            areaA, peakA, baseA = reduce_u16(A, st["sr_hz"], b0, b1, g0, g1, st["vppA"])
+            for r in range(rpb):
+                rec_g = st["global_rec"] + r
+                red_rows.append(dict(
+                    session_id=st["sid"], buffer_index=st["buf_done"], record_in_buffer=r, record_global=rec_g,
+                    timestamp_ns=int(ts_ns), sample_rate_hz=float(st["sr_hz"]),
+                    samples_per_record=spr, records_per_buffer=rpb,
+                    channels_mask=st["S"]["ch_expr"], bunch_spacing_samples=int(st["S"]["bunch_spacing"]),
+                    area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
+                ))
+                if st["S"]["wf_enable"] and st["S"]["wf"].want(rec_g, float(areaA[r]), float(peakA[r])):
+                    wfA_V = _codes_to_volts_u16(A[r], vpp=st["vppA"]) if st["S"]["store_volts"] else A[r].astype(np.float32)
+                    st["archive"].append_snip(
+                        ts_ns=ts_ns, buffer_index=st["buf_done"], record_in_buffer=r, record_global=rec_g,
+                        channels_mask=st["S"]["ch_expr"], sample_rate_hz=float(st["sr_hz"]),
+                        wfA_V=wfA_V, wfB_V=None,
+                        area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
+                    )
+
+        if red_rows:
+            st["archive"].append_reduced(red_rows)
+
+        # live ring: write one waveform per buffer (downsample)
+        try:
+            if st["ch_count"] >= 1:
+                if st["ch_count"] == 2:
+                    wfA = _codes_to_volts_u16(A[0], vpp=st["vppA"])
+                else:
+                    wfA = _codes_to_volts_u16(A[0], vpp=st["vppA"])
+                st["ring"].write(ts_ns=ts_ns, channel=0, y=wfA)
+        except Exception:
+            pass
+
+        st["buf_done"] += 1
+        st["global_rec"] += rpb
+        return True
+
+    rc = 0
+    try:
+        while not _should_stop():
+            okA = _service_one(stA)
+            okB = _service_one(stB)
+            if not okA and not okB:
+                break
+    except KeyboardInterrupt:
+        rc = 0
+    finally:
+        for st in (stA, stB):
+            try:
+                st["board"].abortAsyncRead()
+            except Exception:
+                pass
+            try:
+                st["archive"].finalize(st["S"]["ch_expr"])
+            except Exception:
+                pass
+        try:
+            boardA.abortAsyncRead()
+        except Exception:
+            pass
+        try:
+            boardB.abortAsyncRead()
+        except Exception:
+            pass
+
+    print(f"[CAPPY] Dual capture done. rc={rc}")
+    return rc
+
+
 def run_browse(data_dir: Path) -> int:
     root = tk.Tk()
     root.title('CAPPY Archive')
@@ -2796,7 +3160,7 @@ def main() -> int:
     argv = sys.argv[1:]
     if not argv:
         argv = ["gui"]
-    if argv and argv[0] not in {"init","capture","browse","gui"}:
+    if argv and argv[0] not in {"init","capture","capture-dual","browse","gui"}:
         ap = argparse.ArgumentParser(prog="CAPPY_v1_3 (legacy)")
         ap.add_argument("--config", default="CAPPY_v1_3.yaml")
         args = ap.parse_args(argv)
@@ -2808,6 +3172,9 @@ def main() -> int:
     sub.add_parser("init")
     cap = sub.add_parser("capture")
     cap.add_argument("--config", default="CAPPY_v1_3.yaml")
+    cap2 = sub.add_parser("capture-dual")
+    cap2.add_argument("--configA", default="CAPPY_v1_3_A.yaml")
+    cap2.add_argument("--configB", default="CAPPY_v1_3_B.yaml")
     br = sub.add_parser("browse")
     br.add_argument("--data_dir", default="dataFile")
     sub.add_parser("gui")
@@ -2822,6 +3189,8 @@ def main() -> int:
         return 0
     if args.cmd == "capture":
         return run_capture(Path(args.config))
+    if args.cmd == "capture-dual":
+        return run_capture_dual(Path(args.configA), Path(args.configB))
     if args.cmd == "browse":
         return run_browse(Path(args.data_dir))
     if args.cmd == "gui":
