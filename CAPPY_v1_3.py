@@ -48,6 +48,105 @@ plt.style.use('dark_background')
 NEON_PINK = "#FF00EE"
 NEON_GREEN = "#26FF00"
 
+
+# --- UI theme helpers ---------------------------------------------------------
+DARK_BG = "#1e1e1e"
+DARK_PANEL = "#2d2d2d"
+DARK_WIDGET = "#3a3a3a"
+DARK_WIDGET_ACTIVE = "#444444"
+FG_MAIN = "#ffffff"
+FG_MUTED = "#cfcfcf"
+
+def apply_dark_ttk_theme(root: tk.Misc) -> ttk.Style:
+    """Apply a consistent dark theme and reduce the bright/white focus outlines."""
+    try:
+        root.configure(bg=DARK_BG)
+    except Exception:
+        pass
+
+    try:
+        root.option_add("*Font", ("Segoe UI", 10))
+    except Exception:
+        pass
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    style.configure(".", background=DARK_BG, foreground=FG_MAIN, fieldbackground=DARK_WIDGET)
+
+    style.configure("TFrame", background=DARK_BG)
+    style.configure("TLabelframe", background=DARK_BG, foreground=FG_MAIN)
+    style.configure("TLabelframe.Label", background=DARK_BG, foreground=FG_MAIN)
+
+    style.configure("TLabel", background=DARK_BG, foreground=FG_MAIN)
+    style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"), foreground=FG_MAIN, background=DARK_BG)
+    style.configure("Muted.TLabel", foreground=FG_MUTED, background=DARK_BG)
+
+    style.configure(
+        "TButton",
+        background=DARK_WIDGET,
+        foreground=FG_MAIN,
+        padding=(10, 6),
+        borderwidth=0,
+        focusthickness=0,
+        focuscolor=DARK_BG,
+    )
+    style.map("TButton", background=[("active", DARK_WIDGET_ACTIVE), ("pressed", "#333333")])
+
+    style.configure(
+        "TEntry",
+        fieldbackground=DARK_WIDGET,
+        background=DARK_WIDGET,
+        foreground=FG_MAIN,
+        insertcolor=FG_MAIN,
+        borderwidth=0,
+        relief="flat",
+    )
+
+    style.configure(
+        "TCombobox",
+        fieldbackground=DARK_WIDGET,
+        background=DARK_WIDGET,
+        foreground=FG_MAIN,
+        borderwidth=0,
+        relief="flat",
+    )
+
+    style.configure("TNotebook", background=DARK_BG, borderwidth=0)
+    style.configure(
+        "TNotebook.Tab",
+        background=DARK_WIDGET,
+        foreground=FG_MAIN,
+        padding=(14, 8),
+        borderwidth=0,
+        focusthickness=0,
+        focuscolor=DARK_BG,
+    )
+    style.map("TNotebook.Tab", background=[("selected", DARK_WIDGET_ACTIVE), ("active", DARK_WIDGET_ACTIVE)])
+
+    style.configure("Treeview", background=DARK_PANEL, fieldbackground=DARK_PANEL, foreground=FG_MAIN, borderwidth=0)
+    style.map("Treeview", background=[("selected", "#555555")], foreground=[("selected", FG_MAIN)])
+
+    return style
+
+def _autoscale_y(ax, y: np.ndarray, pad_frac: float = 0.08) -> None:
+    """Fast y autoscale with padding."""
+    if y.size < 2:
+        return
+    y_min = float(np.nanmin(y))
+    y_max = float(np.nanmax(y))
+    if not (np.isfinite(y_min) and np.isfinite(y_max)):
+        return
+    if y_min == y_max:
+        pad = 1.0 if y_min == 0 else abs(y_min) * 0.1
+        ax.set_ylim(y_min - pad, y_max + pad)
+        return
+    pad = (y_max - y_min) * float(pad_frac)
+    ax.set_ylim(y_min - pad, y_max + pad)
+
 ATS_AVAILABLE = False
 ats = None
 try:
@@ -798,6 +897,52 @@ class WaveBinSqliteStore:
             return arr[:n_samples], arr[n_samples:2*n_samples]
         return arr[:n_samples], None
 
+
+
+def load_waveforms_from_row(row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Load waveform snippet payload(s) from the archive, without creating/modifying any SQLite DBs.
+
+    This mirrors WaveBinSqliteStore.load_waveforms but is safe for read-only browsing.
+    """
+    n_samples = int(row.get("n_samples", 0))
+
+    # Prefer channel-separated fields when present and non-null
+    fileA = row.get("file_A", None)
+    offA = row.get("offset_A", None)
+    nbytesA = row.get("nbytes_A", None)
+
+    if isinstance(fileA, str) and fileA and pd.notna(offA) and pd.notna(nbytesA):
+        binA = day_dir / str(fileA)
+        with open(binA, "rb") as fh:
+            fh.seek(int(offA))
+            payloadA = fh.read(int(nbytesA))
+        a = np.frombuffer(payloadA, dtype=np.float32)[:n_samples]
+
+        fileB = row.get("file_B", None)
+        offB = row.get("offset_B", None)
+        nbytesB = row.get("nbytes_B", None)
+        if isinstance(fileB, str) and fileB and pd.notna(offB) and pd.notna(nbytesB):
+            binB = day_dir / str(fileB)
+            with open(binB, "rb") as fh:
+                fh.seek(int(offB))
+                payloadB = fh.read(int(nbytesB))
+            b = np.frombuffer(payloadB, dtype=np.float32)[:n_samples]
+            return a, b
+        return a, None
+
+    # Legacy fallback
+    bin_path = day_dir / str(row.get("file", ""))
+    offset = int(row.get("offset_bytes", 0))
+    nbytes = int(row.get("nbytes", 0))
+    n_channels = int(row.get("n_channels", 1))
+    with open(bin_path, "rb") as fh:
+        fh.seek(offset)
+        payload = fh.read(nbytes)
+    arr = np.frombuffer(payload, dtype=np.float32)
+    if n_channels == 2:
+        return arr[:n_samples], arr[n_samples:2*n_samples]
+    return arr[:n_samples], None
 
 class CappyArchive:
 
@@ -1926,11 +2071,7 @@ class ArchiveBrowser(ttk.Frame):
             return
         r = row.iloc[0]
 
-        store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
-        try:
-            wa, wb = store.load_waveforms(r, self._snip_db_dir)
-        finally:
-            store.close()
+        wa, wb = load_waveforms_from_row(r, self._snip_db_dir)
 
         sr = float(r.get("sample_rate_hz", np.nan))
         if not np.isfinite(sr) or sr <= 0:
@@ -2085,10 +2226,54 @@ class LiveDashboard(ttk.Frame):
         self.ax_int = self.fig.add_subplot(313)
         self.ax_int.set_facecolor('#2d2d2d')
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.meta = tk.Text(self, height=3, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
+        # Pre-create line artists for smooth updates (avoid clearing axes each tick)
+        (self.line_wfA,) = self.ax_wfA.plot([], [], color=NEON_PINK, linewidth=1.0)
+        (self.line_wfB,) = self.ax_wfB.plot([], [], color=NEON_GREEN, linewidth=1.0)
+        (self.line_intA,) = self.ax_int.plot([], [], color=NEON_PINK, linewidth=1.5, label="Mean integral A (V·s)")
+        (self.line_intB,) = self.ax_int.plot([], [], color=NEON_GREEN, linewidth=1.5, linestyle="--", label="Mean integral B (V·s)")
+
+        # Static axis styling (one-time)
+        for ax in (self.ax_wfA, self.ax_wfB, self.ax_int):
+            ax.tick_params(colors='white')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['bottom'].set_color('white')
+            ax.grid(True, alpha=0.12, color='white')
+
+        self.ax_wfA.spines['left'].set_color(NEON_PINK)
+        self.ax_wfB.spines['left'].set_color(NEON_GREEN)
+        self.ax_int.spines['left'].set_color('white')
+
+        self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
+        self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
+        self.ax_int.set_ylabel("Integral (V·s)", color='white')
+        self.ax_int.set_xlabel("Time (s)", color='white')
+        self.ax_wfA.set_xlabel("Rolling samples", color='white')
+        self.ax_wfB.set_xlabel("Rolling samples", color='white')
+
+        self._legend = self.ax_int.legend(loc="best")
+        for tt in self._legend.get_texts():
+            tt.set_color('white')
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        w = self.canvas.get_tk_widget()
+        try:
+            w.configure(bg=DARK_BG, highlightthickness=0, bd=0)
+        except Exception:
+            pass
+        w.pack(fill=tk.BOTH, expand=True)
+
+        self.meta = tk.Text(
+            self,
+            height=3,
+            bg=DARK_PANEL,
+            fg='white',
+            insertbackground='white',
+            font=('Courier', 9),
+            bd=0,
+            highlightthickness=0,
+        )
         self.meta.pack(fill=tk.X, pady=(6, 0))
         self.meta.configure(state=tk.DISABLED)
 
@@ -2205,7 +2390,9 @@ class LiveDashboard(ttk.Frame):
                 r_seq, t_unix, buf_idx, chmask, _r = struct.unpack("<QdQII", rec_hdr)
                 if int(r_seq) != int(seq):
                     # slot not yet written / overwritten; jump to last
-                    self._ring_play_seq = self._ring_last_seq
+                    # We likely fell behind and this slot got overwritten.
+                    # Jump close to the head and keep going next tick.
+                    self._ring_play_seq = max(1, self._ring_last_seq - 5)
                     return None, None
 
                 wfA = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
@@ -2216,85 +2403,63 @@ class LiveDashboard(ttk.Frame):
         except Exception:
             return None, None
 
-    def _redraw(self, snap: dict):
-        # Clear axes
-        self.ax_wfA.clear()
-        self.ax_wfB.clear()
-        self.ax_int.clear()
+    
+def _redraw(self, snap: dict):
+    # --- Waveform A ---
+    if self._streamA.size > 1:
+        x = np.arange(self._streamA.size, dtype=np.float32)
+        self.line_wfA.set_data(x, self._streamA)
+        self.ax_wfA.set_title("")
+        self.ax_wfA.set_xlim(0, max(1, self._streamA.size - 1))
+        _autoscale_y(self.ax_wfA, self._streamA)
+    else:
+        self.line_wfA.set_data([], [])
+        self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
 
-        # --- Channel A waveform (top) ---
-        if self._streamA.size > 1:
-            x = np.arange(self._streamA.size)
-            self.ax_wfA.plot(x, self._streamA, color=NEON_PINK, linewidth=1.0)
-            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel("Rolling samples", color='white')
-            self.ax_wfA.tick_params(colors='white')
-            self.ax_wfA.spines['left'].set_color(NEON_PINK)
-            self.ax_wfA.spines['bottom'].set_color('white')
-            self.ax_wfA.spines['top'].set_visible(False)
-            self.ax_wfA.spines['right'].set_visible(False)
-            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK)
-        else:
-            self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
-            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel("Rolling samples", color='white')
-            self.ax_wfA.tick_params(colors='white')
-            self.ax_wfA.spines['left'].set_color(NEON_PINK)
-            self.ax_wfA.spines['bottom'].set_color('white')
-            self.ax_wfA.spines['top'].set_visible(False)
-            self.ax_wfA.spines['right'].set_visible(False)
-            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK)
+    # --- Waveform B ---
+    if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+        xb = np.arange(self._streamB.size, dtype=np.float32)
+        self.line_wfB.set_data(xb, self._streamB)
+        self.ax_wfB.set_title("")
+        self.ax_wfB.set_xlim(0, max(1, self._streamB.size - 1))
+        _autoscale_y(self.ax_wfB, self._streamB)
+    else:
+        self.line_wfB.set_data([], [])
+        self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
+        # keep reasonable bounds so the axis doesn't jump wildly
+        self.ax_wfB.set_xlim(0, max(1, self._stream_window - 1))
 
-        # --- Channel B waveform (middle) ---
-        if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
-            xb = np.arange(self._streamB.size)
-            self.ax_wfB.plot(xb, self._streamB, color=NEON_GREEN, linewidth=1.0)
-            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel("Rolling samples", color='white')
-            self.ax_wfB.tick_params(colors='white')
-            self.ax_wfB.spines['left'].set_color(NEON_GREEN)
-            self.ax_wfB.spines['bottom'].set_color('white')
-            self.ax_wfB.spines['top'].set_visible(False)
-            self.ax_wfB.spines['right'].set_visible(False)
-            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN)
-        else:
-            self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
-            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel("Rolling samples", color='white')
-            self.ax_wfB.tick_params(colors='white')
-            self.ax_wfB.spines['left'].set_color(NEON_GREEN)
-            self.ax_wfB.spines['bottom'].set_color('white')
-            self.ax_wfB.spines['top'].set_visible(False)
-            self.ax_wfB.spines['right'].set_visible(False)
-            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN)
+    # --- Integral history ---
+    if self.t:
+        t = np.asarray(self.t, dtype=np.float32)
+        aA = np.asarray(self.areaA, dtype=np.float32)
+        self.line_intA.set_data(t, aA)
 
-        # --- Integration history strip (bottom) ---
-        if self.t:
-            self.ax_int.plot(self.t, self.areaA, color=NEON_PINK, linewidth=1.5, label="Mean integral A (V·s)")
-            if self.areaB and np.any(np.isfinite(np.asarray(self.areaB, dtype=float))) and np.any(np.abs(np.asarray(self.areaB, dtype=float)) > 0):
-                self.ax_int.plot(self.t, self.areaB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="Mean integral B (V·s)")
-            self.ax_int.set_ylabel("Integral (V·s)", color='white')
-            self.ax_int.set_xlabel("Time (s)", color='white')
-            self.ax_int.tick_params(colors='white')
-            self.ax_int.spines['left'].set_color('white')
-            self.ax_int.spines['bottom'].set_color('white')
-            self.ax_int.spines['top'].set_visible(False)
-            self.ax_int.spines['right'].set_visible(False)
-            self.ax_int.grid(True, alpha=0.15, color='white')
-            legend = self.ax_int.legend(loc="best")
-            for text in legend.get_texts():
-                text.set_color('white')
-        else:
-            self.ax_int.set_title("Integration: waiting for data…", color='white')
-            self.ax_int.set_ylabel("Integral (V·s)", color='white')
-            self.ax_int.set_xlabel("Time (s)", color='white')
-            self.ax_int.tick_params(colors='white')
-            self.ax_int.spines['left'].set_color('white')
-            self.ax_int.spines['bottom'].set_color('white')
-            self.ax_int.spines['top'].set_visible(False)
-            self.ax_int.spines['right'].set_visible(False)
-            self.ax_int.grid(True, alpha=0.15, color='white')
+        haveB = False
+        if self.areaB:
+            aB = np.asarray(self.areaB, dtype=np.float32)
+            if np.any(np.isfinite(aB)) and np.any(np.abs(aB) > 0):
+                self.line_intB.set_data(t, aB)
+                haveB = True
+        if not haveB:
+            self.line_intB.set_data([], [])
 
+        self.ax_int.set_xlim(float(t[0]), float(t[-1]) if t.size > 1 else float(t[0]) + 1.0)
+        # autoscale y across A and B if present
+        y_stack = aA
+        if haveB:
+            y_stack = np.concatenate([aA, aB])
+        _autoscale_y(self.ax_int, y_stack)
+    else:
+        self.line_intA.set_data([], [])
+        self.line_intB.set_data([], [])
+        self.ax_int.set_title("Integration: waiting for data…", color='white')
+        self.ax_int.set_xlim(0, 1)
+
+    # draw_idle coalesces redraws -> smoother UI
+    try:
+        self.canvas.draw_idle()
+    except Exception:
         self.canvas.draw()
 
     def _tick(self):
@@ -2412,19 +2577,14 @@ class LauncherGUI(tk.Tk):
         self.pump = None
         self._kill_after_id = None
 
-        # Apply dark mode theme
-        self.tk_setPalette(background='#2d2d2d', foreground='white', activeBackground='#404040', activeForeground='white')
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('TFrame', background='#2d2d2d')
-        style.configure('TLabel', background='#2d2d2d', foreground='white')
-        style.configure('TButton', background='#404040', foreground='white', borderwidth=1)
-        style.map('TButton', background=[('active', '#505050')])
-        style.configure('TNotebook', background='#2d2d2d', borderwidth=0)
-        style.configure('TNotebook.Tab', background='#404040', foreground='white', padding=[20, 10])
-        style.map('TNotebook.Tab', background=[('selected', '#505050')])
-        style.configure('TEntry', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white', borderwidth=1)
-        style.configure('TCombobox', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white')
+        
+        # Apply consistent dark theme (ttk) and reduce white focus outlines
+        apply_dark_ttk_theme(self)
+        try:
+            self.tk_setPalette(background=DARK_BG, foreground='white', activeBackground=DARK_WIDGET_ACTIVE, activeForeground='white')
+        except Exception:
+            pass
+
 
         self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
         self.var_data_dir = tk.StringVar(value="dataFile")
@@ -2440,11 +2600,11 @@ class LauncherGUI(tk.Tk):
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="Config YAML:").pack(side=tk.LEFT)
+        ttk.Label(top, text="Config YAML:", style="Muted.TLabel").pack(side=tk.LEFT)
         ttk.Entry(top, textvariable=self.var_config, width=52).pack(side=tk.LEFT, padx=(6,8))
         ttk.Button(top, text="Browse…", command=self._pick_yaml).pack(side=tk.LEFT)
 
-        ttk.Label(top, text="Data dir:").pack(side=tk.LEFT, padx=(16,4))
+        ttk.Label(top, text="Data dir:", style="Muted.TLabel").pack(side=tk.LEFT, padx=(16,4))
         ttk.Entry(top, textvariable=self.var_data_dir, width=24).pack(side=tk.LEFT)
 
         ttk.Button(top, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
@@ -2468,7 +2628,7 @@ class LauncherGUI(tk.Tk):
 
         logbox = ttk.Frame(tabs, padding=6)
         tabs.add(logbox, text="Log")
-        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9))
+        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg=DARK_PANEL, fg='#00ff41', insertbackground='white', font=('Courier', 9), bd=0, highlightthickness=0)
         self.log.pack(fill=tk.BOTH, expand=True)
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
