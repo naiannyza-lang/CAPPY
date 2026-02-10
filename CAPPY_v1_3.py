@@ -126,7 +126,7 @@ storage:
   rollover_minutes: 60
   session_rotate_hours: 24
   flush_every_records: 20000
-  flush_every_seconds: 10
+  flush_every_seconds: 2
   sqlite_commit_every_snips: 200
 
 notify:
@@ -136,7 +136,7 @@ notify:
   method: "sendmail"
   sendmail_path: "/usr/sbin/sendmail"
   subject_prefix: "[CAPPY]"
-  heartbeat_seconds: 5
+  heartbeat_seconds: 1
   interval_minutes: 120
 
 runtime:
@@ -180,6 +180,21 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+def _auto_time_axis(n: int, sample_rate_hz: float) -> Tuple[np.ndarray, str]:
+    """Return (t, unit) for n samples at sample_rate_hz, using a human scale (ns/us/ms/s)."""
+    sr = float(sample_rate_hz) if sample_rate_hz else 1.0
+    dt = 1.0 / sr
+    t = np.arange(int(n), dtype=np.float64) * dt
+    tmax = float(t[-1]) if t.size else 0.0
+    if tmax < 1e-6:
+        return t * 1e9, "ns"
+    if tmax < 1e-3:
+        return t * 1e6, "µs"
+    if tmax < 1.0:
+        return t * 1e3, "ms"
+    return t, "s"
 
 def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
@@ -1587,7 +1602,8 @@ class ArchiveBrowser(ttk.Frame):
         self.wlist.pack(fill=tk.BOTH, expand=True)
         self.wlist.bind("<<ListboxSelect>>", self._on_snip)
 
-        self.fig, self.ax = plt.subplots(figsize=(7.5,4.5))
+        self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
+        self.fig.tight_layout(pad=1.0)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -1883,44 +1899,83 @@ class ArchiveBrowser(ttk.Frame):
         self._apply_hour_filter()
         self._set_meta(f"Snips loaded: {len(self.snips):,}")
 
-    def _on_snip(self, _=None):
-        if self.snips.empty or self._snip_db_dir is None:
-            return
-        sel = self.wlist.curselection()
-        if not sel:
-            return
-        snip_id = int(self.wlist.get(sel[0]).split()[0])
-        df = self._snips_view if (hasattr(self,'_snips_view') and not self._snips_view.empty) else self.snips
-        row = df[df["id"] == snip_id]
-        if row.empty:
-            return
-        r = row.iloc[0]
-        store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
-        try:
-            wa, wb = store.load_waveforms(r, self._snip_db_dir)
-        finally:
-            store.close()
 
-        sr = float(r["sample_rate_hz"])
-        tvec = np.arange(len(wa)) / sr
+def _on_snip(self, _=None):
+    if self.snips.empty or self._snip_db_dir is None:
+        return
+    sel = self.wlist.curselection()
+    if not sel:
+        return
+    # listbox entry begins with integer id
+    try:
+        snip_id = int(str(self.wlist.get(sel[0])).split()[0])
+    except Exception:
+        return
 
-        self.ax.clear()
-        self.ax.plot(tvec, wa, label="A")
-        if wb is not None:
-            self.ax.plot(tvec, wb, label="B")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Volts")
-        self.ax.legend(loc="best")
-        # Avoid tight_layout on every frame for speed
-        self.canvas.draw()
+    df = self._snips_view if (hasattr(self, '_snips_view') and not self._snips_view.empty) else self.snips
+    row = df[df["id"] == snip_id]
+    if row.empty:
+        return
+    r = row.iloc[0]
 
-        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
-        self._set_meta(
-            f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} global={int(r['record_global'])}\n"
-            f"area_A_Vs={float(r['area_A_Vs'])} peak_A_V={float(r['peak_A_V'])}\n"
-            f"samples={int(r['n_samples'])} channels={int(r['n_channels'])}"
-        )
+    store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
+    try:
+        wa, wb = store.load_waveforms(r, self._snip_db_dir)
+    finally:
+        store.close()
+
+    sr = float(r.get("sample_rate_hz", np.nan))
+    if not np.isfinite(sr) or sr <= 0:
+        sr = 1.0
+
+    # Time axis with adaptive units (ns/us/ms/s)
+    tvec, unit = _auto_time_axis(len(wa), sr)
+
+    # Clear axes
+    self.axA.clear()
+    self.axB.clear()
+    self.axI.clear()
+
+    # Waveform A
+    self.axA.plot(tvec, wa)
+    self.axA.set_ylabel("A (V)")
+    self.axA.grid(True, alpha=0.2)
+
+    # Waveform B (if available)
+    if wb is not None:
+        self.axB.plot(tvec, wb)
+        self.axB.set_ylabel("B (V)")
+    else:
+        self.axB.text(0.02, 0.5, "Channel B not captured in this snip", transform=self.axB.transAxes)
+        self.axB.set_ylabel("B (V)")
+    self.axB.grid(True, alpha=0.2)
+
+    # Cumulative integral strip (V·s)
+    dt = 1.0 / sr
+    intA = np.cumsum(np.asarray(wa, dtype=np.float64)) * dt
+    self.axI.plot(tvec, intA, label="∫A dt")
+    if wb is not None:
+        intB = np.cumsum(np.asarray(wb, dtype=np.float64)) * dt
+        self.axI.plot(tvec, intB, linestyle="--", label="∫B dt")
+    self.axI.set_ylabel("Integral (V·s)")
+    self.axI.set_xlabel(f"Time ({unit})")
+    self.axI.grid(True, alpha=0.2)
+    self.axI.legend(loc="best")
+
+    self.canvas.draw()
+
+    ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
+    a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
+    b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
+    self._set_meta(
+        f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
+        f"Session: {r.get('session_id','?')}\n"
+        f"Buffer: {int(r.get('buffer_index',-1))}  Record: {int(r.get('record_in_buffer',-1))}  Global: {int(r.get('record_global',-1))}\n"
+        f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
+        f"Area A: {float(r.get('area_A_Vs',0.0)):.6g} V·s   Peak A: {float(r.get('peak_A_V',0.0)):.6g} V\n"
+        f"Area B: {float(r.get('area_B_Vs',0.0)):.6g} V·s   Peak B: {float(r.get('peak_B_V',0.0)):.6g} V\n"
+        f"Waveform points: {int(r.get('npts', len(wa)))}"
+    )
 
     def _set_meta(self, s: str):
         self.meta.configure(state=tk.NORMAL)
@@ -2056,7 +2111,6 @@ class LiveDashboard(ttk.Frame):
 
         while self.t and (self.t[-1] - self.t[0]) > 600.0:
             self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
-            self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
 
 
     def _open_ring_from_status(self, snap: dict):
@@ -2163,7 +2217,7 @@ class LiveDashboard(ttk.Frame):
         # --- Integration history strip (bottom) ---
         if self.t:
             self.ax_int.plot(self.t, self.areaA, label="Mean integral A (V·s)")
-            if any(abs(x) > 0 for x in self.areaB):
+            if self.areaB and np.any(np.isfinite(np.asarray(self.areaB, dtype=float))) and np.any(np.abs(np.asarray(self.areaB, dtype=float)) > 0):
                 self.ax_int.plot(self.t, self.areaB, linestyle="--", label="Mean integral B (V·s)")
             self.ax_int.set_ylabel("Integral (V·s)")
             self.ax_int.set_xlabel("Time (s)")
