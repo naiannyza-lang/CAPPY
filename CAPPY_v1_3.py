@@ -1671,30 +1671,29 @@ class ArchiveBrowser(ttk.Frame):
         if getattr(self, 'snips', pd.DataFrame()).empty is False:
             self._apply_hour_filter()
 
-
-def _apply_search(self):
-    """Filter the Sessions list by search text (session_id substring)."""
-    q = (self.var_search.get() if hasattr(self, "var_search") else "").strip()
-    if self.sessions is None or self.sessions.empty:
-        return
-    if not q:
-        self._sessions_view = self.sessions.copy().reset_index(drop=True)
-    else:
-        ql = q.lower()
-        view = self.sessions.copy()
-        # simple session-level filter
-        if ql.startswith("sid:"):
-            ql = ql.split(":", 1)[1].strip()
-        mask = view["session_id"].astype(str).str.lower().str.contains(ql, na=False)
-        self._sessions_view = view[mask].reset_index(drop=True)
-    # refresh listbox contents only (do not reload from disk)
-    self.slist.delete(0, tk.END)
-    if self._sessions_view.empty:
-        self.slist.insert(tk.END, "(no sessions match search)")
-        return
-    for _, r in self._sessions_view.iterrows():
-        t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
-        self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
+    def _apply_search(self):
+        """Filter the Sessions list by search text (session_id substring)."""
+        q = (self.var_search.get() if hasattr(self, "var_search") else "").strip()
+        if self.sessions is None or self.sessions.empty:
+            return
+        if not q:
+            self._sessions_view = self.sessions.copy().reset_index(drop=True)
+        else:
+            ql = q.lower()
+            view = self.sessions.copy()
+            # simple session-level filter
+            if ql.startswith("sid:"):
+                ql = ql.split(":", 1)[1].strip()
+            mask = view["session_id"].astype(str).str.lower().str.contains(ql, na=False)
+            self._sessions_view = view[mask].reset_index(drop=True)
+        # refresh listbox contents only (do not reload from disk)
+        self.slist.delete(0, tk.END)
+        if self._sessions_view.empty:
+            self.slist.insert(tk.END, "(no sessions match search)")
+            return
+        for _, r in self._sessions_view.iterrows():
+            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
+            self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
 
     def _sel_sid(self) -> Optional[str]:
         if self.sessions.empty:
@@ -1715,53 +1714,52 @@ def _apply_search(self):
         self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
         self.snips["_hour"] = dt.dt.strftime("%H")
 
-    
-def _populate_hours(self):
-    """Populate date combobox + hour listbox from currently loaded snips."""
-    self.hlist.delete(0, tk.END)
-    if self.snips is None or self.snips.empty:
+    def _populate_hours(self):
+        """Populate date combobox + hour listbox from currently loaded snips."""
+        self.hlist.delete(0, tk.END)
+        if self.snips is None or self.snips.empty:
+            try:
+                self.cmb_date["values"] = []
+                self.var_date.set("")
+            except Exception:
+                pass
+            return
+
+        self._build_hour_index()
+
+        # Dates available in this session's snips
+        dates = sorted(self.snips["_date"].unique().tolist())
+        # show newest first in UI
+        dates = list(reversed(dates))
+
         try:
-            self.cmb_date["values"] = []
-            self.var_date.set("")
+            self.cmb_date["values"] = dates
         except Exception:
             pass
-        return
 
-    self._build_hour_index()
+        # Default to newest date unless user already selected one
+        if self._sel_date is None or self._sel_date not in dates:
+            self._sel_date = dates[0] if dates else None
 
-    # Dates available in this session's snips
-    dates = sorted(self.snips["_date"].unique().tolist())
-    # show newest first in UI
-    dates = list(reversed(dates))
+        if self._sel_date is not None:
+            self.var_date.set(str(self._sel_date))
 
-    try:
-        self.cmb_date["values"] = dates
-    except Exception:
-        pass
+        # Hours for selected date
+        sub = self.snips[self.snips["_date"] == self._sel_date] if self._sel_date is not None else self.snips
+        counts = sub["_hour"].value_counts().sort_index()
+        hours = list(counts.index)
 
-    # Default to newest date unless user already selected one
-    if self._sel_date is None or self._sel_date not in dates:
-        self._sel_date = dates[0] if dates else None
+        for hh in hours:
+            self.hlist.insert(tk.END, f"{hh}:00  ({int(counts[hh])})")
 
-    if self._sel_date is not None:
-        self.var_date.set(str(self._sel_date))
+        if self._sel_hour is None or self._sel_hour not in hours:
+            self._sel_hour = str(hours[0]) if hours else None
 
-    # Hours for selected date
-    sub = self.snips[self.snips["_date"] == self._sel_date] if self._sel_date is not None else self.snips
-    counts = sub["_hour"].value_counts().sort_index()
-    hours = list(counts.index)
-
-    for hh in hours:
-        self.hlist.insert(tk.END, f"{hh}:00  ({int(counts[hh])})")
-
-    if self._sel_hour is None or self._sel_hour not in hours:
-        self._sel_hour = str(hours[0]) if hours else None
-
-    if self._sel_hour is not None and self._sel_hour in hours:
-        idx = hours.index(self._sel_hour)
-        self.hlist.selection_clear(0, tk.END)
-        self.hlist.selection_set(idx)
-        self.hlist.see(idx)
+        if self._sel_hour is not None and self._sel_hour in hours:
+            idx = hours.index(self._sel_hour)
+            self.hlist.selection_clear(0, tk.END)
+            self.hlist.selection_set(idx)
+            self.hlist.see(idx)
 
     def _apply_hour_filter(self):
         """Render wlist using selected date/hour."""
@@ -1804,18 +1802,17 @@ def _populate_hours(self):
             ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
             self.wlist.insert(tk.END, f"{int(r['id'])}  {ts.strftime('%Y-%m-%d %H:%M:%S')}  buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} g={int(r['record_global'])}")
 
-
-def _on_date(self, _=None):
-    if self.snips is None or self.snips.empty:
-        return
-    d = (self.var_date.get() or "").strip()
-    if not d:
-        return
-    self._sel_date = d
-    # reset hour selection so we pick first available for that date
-    self._sel_hour = None
-    self._populate_hours()
-    self._apply_hour_filter()
+    def _on_date(self, _=None):
+        if self.snips is None or self.snips.empty:
+            return
+        d = (self.var_date.get() or "").strip()
+        if not d:
+            return
+        self._sel_date = d
+        # reset hour selection so we pick first available for that date
+        self._sel_hour = None
+        self._populate_hours()
+        self._apply_hour_filter()
 
     def _on_hour(self, _=None):
         if self.snips is None or self.snips.empty:
@@ -2131,55 +2128,54 @@ class LiveDashboard(ttk.Frame):
         except Exception:
             return None, None
 
-    
-def _redraw(self, snap: dict):
-    # Clear axes
-    self.ax_wfA.clear()
-    self.ax_wfB.clear()
-    self.ax_int.clear()
+    def _redraw(self, snap: dict):
+        # Clear axes
+        self.ax_wfA.clear()
+        self.ax_wfB.clear()
+        self.ax_int.clear()
 
-    # --- Channel A waveform (top) ---
-    if self._streamA.size > 1:
-        x = np.arange(self._streamA.size)
-        self.ax_wfA.plot(x, self._streamA)
-        self.ax_wfA.set_ylabel("A (V)")
-        self.ax_wfA.set_xlabel("Rolling samples")
-        self.ax_wfA.grid(True, alpha=0.2)
-    else:
-        self.ax_wfA.set_title("Channel A: waiting for waveforms…")
-        self.ax_wfA.set_ylabel("A (V)")
-        self.ax_wfA.set_xlabel("Rolling samples")
-        self.ax_wfA.grid(True, alpha=0.2)
+        # --- Channel A waveform (top) ---
+        if self._streamA.size > 1:
+            x = np.arange(self._streamA.size)
+            self.ax_wfA.plot(x, self._streamA)
+            self.ax_wfA.set_ylabel("A (V)")
+            self.ax_wfA.set_xlabel("Rolling samples")
+            self.ax_wfA.grid(True, alpha=0.2)
+        else:
+            self.ax_wfA.set_title("Channel A: waiting for waveforms…")
+            self.ax_wfA.set_ylabel("A (V)")
+            self.ax_wfA.set_xlabel("Rolling samples")
+            self.ax_wfA.grid(True, alpha=0.2)
 
-    # --- Channel B waveform (middle) ---
-    if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
-        xb = np.arange(self._streamB.size)
-        self.ax_wfB.plot(xb, self._streamB)
-        self.ax_wfB.set_ylabel("B (V)")
-        self.ax_wfB.set_xlabel("Rolling samples")
-        self.ax_wfB.grid(True, alpha=0.2)
-    else:
-        self.ax_wfB.set_title("Channel B: waiting for waveforms…")
-        self.ax_wfB.set_ylabel("B (V)")
-        self.ax_wfB.set_xlabel("Rolling samples")
-        self.ax_wfB.grid(True, alpha=0.2)
+        # --- Channel B waveform (middle) ---
+        if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+            xb = np.arange(self._streamB.size)
+            self.ax_wfB.plot(xb, self._streamB)
+            self.ax_wfB.set_ylabel("B (V)")
+            self.ax_wfB.set_xlabel("Rolling samples")
+            self.ax_wfB.grid(True, alpha=0.2)
+        else:
+            self.ax_wfB.set_title("Channel B: waiting for waveforms…")
+            self.ax_wfB.set_ylabel("B (V)")
+            self.ax_wfB.set_xlabel("Rolling samples")
+            self.ax_wfB.grid(True, alpha=0.2)
 
-    # --- Integration history strip (bottom) ---
-    if self.t:
-        self.ax_int.plot(self.t, self.areaA, label="Mean integral A (V·s)")
-        if any(abs(x) > 0 for x in self.areaB):
-            self.ax_int.plot(self.t, self.areaB, linestyle="--", label="Mean integral B (V·s)")
-        self.ax_int.set_ylabel("Integral (V·s)")
-        self.ax_int.set_xlabel("Time (s)")
-        self.ax_int.grid(True, alpha=0.2)
-        self.ax_int.legend(loc="best")
-    else:
-        self.ax_int.set_title("Integration: waiting for data…")
-        self.ax_int.set_ylabel("Integral (V·s)")
-        self.ax_int.set_xlabel("Time (s)")
-        self.ax_int.grid(True, alpha=0.2)
+        # --- Integration history strip (bottom) ---
+        if self.t:
+            self.ax_int.plot(self.t, self.areaA, label="Mean integral A (V·s)")
+            if any(abs(x) > 0 for x in self.areaB):
+                self.ax_int.plot(self.t, self.areaB, linestyle="--", label="Mean integral B (V·s)")
+            self.ax_int.set_ylabel("Integral (V·s)")
+            self.ax_int.set_xlabel("Time (s)")
+            self.ax_int.grid(True, alpha=0.2)
+            self.ax_int.legend(loc="best")
+        else:
+            self.ax_int.set_title("Integration: waiting for data…")
+            self.ax_int.set_ylabel("Integral (V·s)")
+            self.ax_int.set_xlabel("Time (s)")
+            self.ax_int.grid(True, alpha=0.2)
 
-    self.canvas.draw()
+        self.canvas.draw()
 
     def _tick(self):
         snap = self._read_status()
