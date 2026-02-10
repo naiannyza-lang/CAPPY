@@ -519,15 +519,17 @@ class ParquetRollingWriter:
                 self._open_hour = None
 
 
+
 class WaveBinSqliteStore:
     """
     Store waveform snippets as:
-      - raw float32 data appended to time-rolled .bin files inside hourly folders
-      - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset
+      - raw float32 channel-separated data appended to time-rolled .bin files inside hourly folders
+      - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
 
     Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/):
       - index/snips_<session>.sqlite
-      - <HH:00>/waveforms/snips_<session>_<YYYYMMDD_HHMM>.bin
+      - <HH:00>/waveforms/A_snips_<session>_<YYYYMMDD_HHMM>.bin
+      - <HH:00>/waveforms/B_snips_<session>_<YYYYMMDD_HHMM>.bin
     """
     def __init__(self, day_dir: Path, session_id: str, rollover_minutes: int, commit_every: int):
         self.day_dir = day_dir
@@ -543,6 +545,7 @@ class WaveBinSqliteStore:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
+
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS snips (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -554,10 +557,21 @@ class WaveBinSqliteStore:
               channels_mask TEXT,
               sample_rate_hz REAL,
               n_samples INTEGER,
+
+              -- legacy combined payload (kept for backward compatibility)
               n_channels INTEGER,
               file TEXT,
               offset_bytes INTEGER,
               nbytes INTEGER,
+
+              -- channel-separated payload (preferred)
+              file_A TEXT,
+              offset_A INTEGER,
+              nbytes_A INTEGER,
+              file_B TEXT,
+              offset_B INTEGER,
+              nbytes_B INTEGER,
+
               area_A_Vs REAL,
               peak_A_V REAL,
               area_B_Vs REAL,
@@ -567,7 +581,26 @@ class WaveBinSqliteStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_snips_session_time ON snips(session_id, timestamp_ns);")
         self.conn.commit()
 
-        self._bin_fh = None
+        # Migration: add new columns if the DB already existed without them
+        try:
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(snips);").fetchall()}
+            need = {
+                "file_A": "ALTER TABLE snips ADD COLUMN file_A TEXT",
+                "offset_A": "ALTER TABLE snips ADD COLUMN offset_A INTEGER",
+                "nbytes_A": "ALTER TABLE snips ADD COLUMN nbytes_A INTEGER",
+                "file_B": "ALTER TABLE snips ADD COLUMN file_B TEXT",
+                "offset_B": "ALTER TABLE snips ADD COLUMN offset_B INTEGER",
+                "nbytes_B": "ALTER TABLE snips ADD COLUMN nbytes_B INTEGER",
+            }
+            for c, ddl in need.items():
+                if c not in cols:
+                    self.conn.execute(ddl)
+            self.conn.commit()
+        except Exception:
+            pass
+
+        self._fhA = None
+        self._fhB = None
         self._bin_key = None
         self._bin_hour = None
         self._rows_since_commit = 0
@@ -582,10 +615,12 @@ class WaveBinSqliteStore:
     def _minute_key(self, ts_ns: int) -> str:
         return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
 
-    def _open_bin(self, ts_ns: int, key: str):
+    def _open_bins(self, ts_ns: int, key: str):
         hour, base = self._hour_dir(ts_ns)
-        path = base / f"snips_{self.session_id}_{key}.bin"
-        self._bin_fh = open(path, "ab", buffering=0)
+        pathA = base / f"A_snips_{self.session_id}_{key}.bin"
+        pathB = base / f"B_snips_{self.session_id}_{key}.bin"
+        self._fhA = open(pathA, "ab", buffering=0)
+        self._fhB = open(pathB, "ab", buffering=0)
         self._bin_key = key
         self._bin_hour = hour
 
@@ -593,67 +628,96 @@ class WaveBinSqliteStore:
         key = self._minute_key(ts_ns)
         hour, _ = self._hour_dir(ts_ns)
 
-        if self._bin_key is None or self._bin_fh is None or self._bin_hour is None:
-            self._open_bin(ts_ns, key)
+        if self._bin_key is None or self._fhA is None or self._fhB is None or self._bin_hour is None:
+            self._open_bins(ts_ns, key)
             return
 
         # roll on hour boundary
         if hour != self._bin_hour:
             self.close_bin()
-            self._open_bin(ts_ns, key)
+            self._open_bins(ts_ns, key)
             return
 
         # roll on rollover window
-        t0 = datetime.strptime(self._bin_key, "%Y%m%d_%H%M")
-        t1 = datetime.strptime(key, "%Y%m%d_%H%M")
-        if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
+        try:
+            t0 = datetime.strptime(self._bin_key, "%Y%m%d_%H%M")
+            t1 = datetime.strptime(key, "%Y%m%d_%H%M")
+            if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
+                self.close_bin()
+                self._open_bins(ts_ns, key)
+        except Exception:
+            # if parsing fails, reopen
             self.close_bin()
-            self._open_bin(ts_ns, key)
+            self._open_bins(ts_ns, key)
 
     def append(self, *, ts_ns: int, buffer_index: int, record_in_buffer: int, record_global: int,
                channels_mask: str, sample_rate_hz: float, wfA_V: np.ndarray, wfB_V: Optional[np.ndarray],
                area_A_Vs: float, peak_A_V: float, area_B_Vs: float, peak_B_V: float):
         self._maybe_roll(ts_ns)
-        assert self._bin_fh is not None and self._bin_key is not None
+        assert self._fhA is not None and self._fhB is not None
 
         wfA = wfA_V.astype(np.float32, copy=False)
-        if wfB_V is None:
-            payload = wfA.tobytes(order="C")
-            n_channels = 1
-        else:
+        payloadA = wfA.tobytes(order="C")
+
+        offA = self._fhA.tell()
+        self._fhA.write(payloadA)
+
+        if wfB_V is not None:
             wfB = wfB_V.astype(np.float32, copy=False)
-            payload = wfA.tobytes(order="C") + wfB.tobytes(order="C")
+            payloadB = wfB.tobytes(order="C")
+            offB = self._fhB.tell()
+            self._fhB.write(payloadB)
             n_channels = 2
+        else:
+            payloadB = b""
+            offB = 0
+            n_channels = 1
 
-        offset = self._bin_fh.tell()
-        self._bin_fh.write(payload)
-
+        # Store file paths relative to day_dir so the archive can relocate the root
         try:
-            file_name = str(Path(self._bin_fh.name).relative_to(self.day_dir))
+            fileA = str(Path(self._fhA.name).relative_to(self.day_dir))
         except Exception:
-            file_name = str(Path(self._bin_fh.name).name)
+            fileA = str(Path(self._fhA.name).name)
+        try:
+            fileB = str(Path(self._fhB.name).relative_to(self.day_dir))
+        except Exception:
+            fileB = str(Path(self._fhB.name).name)
+
+        # Legacy combined fields: keep pointing at A only (so old viewers still show A)
+        file_legacy = fileA
+        off_legacy = offA
+        nbytes_legacy = len(payloadA)
 
         self.conn.execute(
-            "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+            "file,offset_bytes,nbytes,file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.session_id, int(ts_ns), int(buffer_index), int(record_in_buffer), int(record_global),
              str(channels_mask), float(sample_rate_hz), int(wfA.shape[0]), int(n_channels),
-             file_name, int(offset), int(len(payload)),
+             file_legacy, int(off_legacy), int(nbytes_legacy),
+             fileA, int(offA), int(len(payloadA)),
+             (fileB if wfB_V is not None else None),
+             (int(offB) if wfB_V is not None else None),
+             (int(len(payloadB)) if wfB_V is not None else None),
              float(area_A_Vs), float(peak_A_V), float(area_B_Vs), float(peak_B_V))
         )
+
         self._rows_since_commit += 1
         if self._rows_since_commit >= self.commit_every:
             self.conn.commit()
             self._rows_since_commit = 0
 
     def close_bin(self):
-        if self._bin_fh is not None:
-            try:
-                self._bin_fh.close()
-            finally:
-                self._bin_fh = None
-                self._bin_key = None
-                self._bin_hour = None
+        for fh_name in ("_fhA", "_fhB"):
+            fh = getattr(self, fh_name, None)
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                setattr(self, fh_name, None)
+        self._bin_key = None
+        self._bin_hour = None
 
     def close(self):
         try:
@@ -672,11 +736,40 @@ class WaveBinSqliteStore:
             pass
 
     def load_waveforms(self, row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Load channel-separated waveforms if available; otherwise fall back to legacy combined payload.
+        """
+        n_samples = int(row.get("n_samples", 0))
+
+        # Prefer channel-separated fields when present and non-null
+        fileA = row.get("file_A", None)
+        offA = row.get("offset_A", None)
+        nbytesA = row.get("nbytes_A", None)
+
+        if isinstance(fileA, str) and fileA and pd.notna(offA) and pd.notna(nbytesA):
+            binA = day_dir / str(fileA)
+            with open(binA, "rb") as fh:
+                fh.seek(int(offA))
+                payloadA = fh.read(int(nbytesA))
+            a = np.frombuffer(payloadA, dtype=np.float32)[:n_samples]
+
+            fileB = row.get("file_B", None)
+            offB = row.get("offset_B", None)
+            nbytesB = row.get("nbytes_B", None)
+            if isinstance(fileB, str) and fileB and pd.notna(offB) and pd.notna(nbytesB):
+                binB = day_dir / str(fileB)
+                with open(binB, "rb") as fh:
+                    fh.seek(int(offB))
+                    payloadB = fh.read(int(nbytesB))
+                b = np.frombuffer(payloadB, dtype=np.float32)[:n_samples]
+                return a, b
+            return a, None
+
+        # Legacy fallback
         bin_path = day_dir / str(row["file"])
         offset = int(row["offset_bytes"])
         nbytes = int(row["nbytes"])
-        n_samples = int(row["n_samples"])
-        n_channels = int(row["n_channels"])
+        n_channels = int(row.get("n_channels", 1))
         with open(bin_path, "rb") as fh:
             fh.seek(offset)
             payload = fh.read(nbytes)
@@ -1477,8 +1570,13 @@ class ArchiveBrowser(ttk.Frame):
         self.slist = tk.Listbox(left)
         self.slist.pack(fill=tk.BOTH, expand=True)
         self.slist.bind("<<ListboxSelect>>", self._on_session)
+        ttk.Label(left, text="Date").pack(anchor="w", pady=(8,0))
+        self.var_date = tk.StringVar(value="")
+        self.cmb_date = ttk.Combobox(left, textvariable=self.var_date, state="readonly", width=18)
+        self.cmb_date.pack(fill=tk.X, expand=False)
+        self.cmb_date.bind("<<ComboboxSelected>>", self._on_date)
 
-        ttk.Label(left, text="Date / Hour").pack(anchor="w", pady=(8,0))
+        ttk.Label(left, text="Hour").pack(anchor="w", pady=(6,0))
         self.hlist = tk.Listbox(left, height=8, exportselection=False)
         self.hlist.pack(fill=tk.X, expand=False)
         self.hlist.bind("<<ListboxSelect>>", self._on_hour)
@@ -1573,6 +1671,31 @@ class ArchiveBrowser(ttk.Frame):
         if getattr(self, 'snips', pd.DataFrame()).empty is False:
             self._apply_hour_filter()
 
+
+def _apply_search(self):
+    """Filter the Sessions list by search text (session_id substring)."""
+    q = (self.var_search.get() if hasattr(self, "var_search") else "").strip()
+    if self.sessions is None or self.sessions.empty:
+        return
+    if not q:
+        self._sessions_view = self.sessions.copy().reset_index(drop=True)
+    else:
+        ql = q.lower()
+        view = self.sessions.copy()
+        # simple session-level filter
+        if ql.startswith("sid:"):
+            ql = ql.split(":", 1)[1].strip()
+        mask = view["session_id"].astype(str).str.lower().str.contains(ql, na=False)
+        self._sessions_view = view[mask].reset_index(drop=True)
+    # refresh listbox contents only (do not reload from disk)
+    self.slist.delete(0, tk.END)
+    if self._sessions_view.empty:
+        self.slist.insert(tk.END, "(no sessions match search)")
+        return
+    for _, r in self._sessions_view.iterrows():
+        t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
+        self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
+
     def _sel_sid(self) -> Optional[str]:
         if self.sessions.empty:
             return None
@@ -1592,34 +1715,53 @@ class ArchiveBrowser(ttk.Frame):
         self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
         self.snips["_hour"] = dt.dt.strftime("%H")
 
-    def _populate_hours(self):
-        """Fill the date/hour listbox with counts, and select a sensible default."""
-        self.hlist.delete(0, tk.END)
-        if self.snips is None or self.snips.empty:
-            return
-        self._build_hour_index()
+    
+def _populate_hours(self):
+    """Populate date combobox + hour listbox from currently loaded snips."""
+    self.hlist.delete(0, tk.END)
+    if self.snips is None or self.snips.empty:
+        try:
+            self.cmb_date["values"] = []
+            self.var_date.set("")
+        except Exception:
+            pass
+        return
 
-        # Default date: newest date in the current snips view
-        if self._sel_date is None:
-            self._sel_date = str(self.snips["_date"].iloc[0])
+    self._build_hour_index()
 
-        sub = self.snips[self.snips["_date"] == self._sel_date]
-        counts = sub["_hour"].value_counts().sort_index()
+    # Dates available in this session's snips
+    dates = sorted(self.snips["_date"].unique().tolist())
+    # show newest first in UI
+    dates = list(reversed(dates))
 
-        # Show only hours that have data (cleaner than 00-23 full list)
-        hours = list(counts.index)
-        for hh in hours:
-            self.hlist.insert(tk.END, f"{hh}:00  ({int(counts[hh])})")
+    try:
+        self.cmb_date["values"] = dates
+    except Exception:
+        pass
 
-        if self._sel_hour is None:
-            self._sel_hour = str(hours[0]) if hours else None
+    # Default to newest date unless user already selected one
+    if self._sel_date is None or self._sel_date not in dates:
+        self._sel_date = dates[0] if dates else None
 
-        # select current hour row
-        if self._sel_hour is not None and self._sel_hour in hours:
-            idx = hours.index(self._sel_hour)
-            self.hlist.selection_clear(0, tk.END)
-            self.hlist.selection_set(idx)
-            self.hlist.see(idx)
+    if self._sel_date is not None:
+        self.var_date.set(str(self._sel_date))
+
+    # Hours for selected date
+    sub = self.snips[self.snips["_date"] == self._sel_date] if self._sel_date is not None else self.snips
+    counts = sub["_hour"].value_counts().sort_index()
+    hours = list(counts.index)
+
+    for hh in hours:
+        self.hlist.insert(tk.END, f"{hh}:00  ({int(counts[hh])})")
+
+    if self._sel_hour is None or self._sel_hour not in hours:
+        self._sel_hour = str(hours[0]) if hours else None
+
+    if self._sel_hour is not None and self._sel_hour in hours:
+        idx = hours.index(self._sel_hour)
+        self.hlist.selection_clear(0, tk.END)
+        self.hlist.selection_set(idx)
+        self.hlist.see(idx)
 
     def _apply_hour_filter(self):
         """Render wlist using selected date/hour."""
@@ -1662,6 +1804,19 @@ class ArchiveBrowser(ttk.Frame):
             ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
             self.wlist.insert(tk.END, f"{int(r['id'])}  {ts.strftime('%Y-%m-%d %H:%M:%S')}  buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} g={int(r['record_global'])}")
 
+
+def _on_date(self, _=None):
+    if self.snips is None or self.snips.empty:
+        return
+    d = (self.var_date.get() or "").strip()
+    if not d:
+        return
+    self._sel_date = d
+    # reset hour selection so we pick first available for that date
+    self._sel_hour = None
+    self._populate_hours()
+    self._apply_hour_filter()
+
     def _on_hour(self, _=None):
         if self.snips is None or self.snips.empty:
             return
@@ -1698,12 +1853,26 @@ class ArchiveBrowser(ttk.Frame):
             db = idx_dir / f"snips_{sid}.sqlite"
             if db.exists():
                 conn = sqlite3.connect(db)
-                self.snips = pd.read_sql_query(
-                    "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                    "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
-                    conn,
-                    params=(sid,),
-                )
+                
+                try:
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,"
+                        "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+                        "area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                        params=(sid,),
+                    )
+                except Exception:
+                    # Legacy DB schema (no channel-separated columns)
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                        params=(sid,),
+                    )
                 conn.close()
                 self._snip_db_dir = ddir
                 break
@@ -1823,10 +1992,12 @@ class LiveDashboard(ttk.Frame):
         self.lbl_temp = mkrow("Board temp (°C)")
 
         # --- plots ---
-        self.fig = plt.Figure(figsize=(8.2, 6.2))
+        self.fig = plt.Figure(figsize=(8.2, 7.2))
 
-        self.ax_int = self.fig.add_subplot(211)
-        self.ax_wf = self.fig.add_subplot(212)
+        # Scope-like layout: Channel A (top), Channel B (middle), Integration history (bottom)
+        self.ax_wfA = self.fig.add_subplot(311)
+        self.ax_wfB = self.fig.add_subplot(312)
+        self.ax_int = self.fig.add_subplot(313)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -1960,42 +2131,55 @@ class LiveDashboard(ttk.Frame):
         except Exception:
             return None, None
 
-    def _redraw(self, snap: dict):
-        self.ax_int.clear()
-        self.ax_wf.clear()
+    
+def _redraw(self, snap: dict):
+    # Clear axes
+    self.ax_wfA.clear()
+    self.ax_wfB.clear()
+    self.ax_int.clear()
 
-        if self.t:
-            # integral: A red, B pink dashed
-            self.ax_int.plot(self.t, self.areaA, color="red", label="Mean integral A (V·s)")
-            if any(abs(x) > 0 for x in self.areaB):
-                self.ax_int.plot(self.t, self.areaB, color="pink", linestyle="--", label="Mean integral B (V·s)")
-            self.ax_int.set_ylabel("Integral (V·s)")
-            self.ax_int.set_xlabel("Time (s)")
-            self.ax_int.grid(True, alpha=0.2)
-            self.ax_int.legend(loc="best")
-        else:
-            self.ax_int.set_title("Integral: waiting for data…")
-            self.ax_int.set_xlabel("Time (s)")
-            self.ax_int.set_ylabel("Integral (V·s)")
-            self.ax_int.grid(True, alpha=0.2)
+    # --- Channel A waveform (top) ---
+    if self._streamA.size > 1:
+        x = np.arange(self._streamA.size)
+        self.ax_wfA.plot(x, self._streamA)
+        self.ax_wfA.set_ylabel("A (V)")
+        self.ax_wfA.set_xlabel("Rolling samples")
+        self.ax_wfA.grid(True, alpha=0.2)
+    else:
+        self.ax_wfA.set_title("Channel A: waiting for waveforms…")
+        self.ax_wfA.set_ylabel("A (V)")
+        self.ax_wfA.set_xlabel("Rolling samples")
+        self.ax_wfA.grid(True, alpha=0.2)
 
-        # waveform: TRUE scrolling (concatenate every buffer waveform into a rolling strip chart)
-        if self._streamA.size > 1:
-            x = np.arange(self._streamA.size)
-            self.ax_wf.plot(x, self._streamA, color="blue")
-            if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
-                xb = np.arange(self._streamB.size)
-                self.ax_wf.plot(xb, self._streamB, color="pink", linestyle="--")
-            self.ax_wf.set_ylabel("V")
-            self.ax_wf.set_xlabel("Rolling samples (concatenated)")
-            self.ax_wf.grid(True, alpha=0.2)
-        else:
-            self.ax_wf.set_title("Waveform: waiting for waveforms…")
-            self.ax_wf.set_xlabel("Rolling samples")
-            self.ax_wf.set_ylabel("V")
-            self.ax_wf.grid(True, alpha=0.2)
-        # Avoid tight_layout on every frame for speed
-        self.canvas.draw()
+    # --- Channel B waveform (middle) ---
+    if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+        xb = np.arange(self._streamB.size)
+        self.ax_wfB.plot(xb, self._streamB)
+        self.ax_wfB.set_ylabel("B (V)")
+        self.ax_wfB.set_xlabel("Rolling samples")
+        self.ax_wfB.grid(True, alpha=0.2)
+    else:
+        self.ax_wfB.set_title("Channel B: waiting for waveforms…")
+        self.ax_wfB.set_ylabel("B (V)")
+        self.ax_wfB.set_xlabel("Rolling samples")
+        self.ax_wfB.grid(True, alpha=0.2)
+
+    # --- Integration history strip (bottom) ---
+    if self.t:
+        self.ax_int.plot(self.t, self.areaA, label="Mean integral A (V·s)")
+        if any(abs(x) > 0 for x in self.areaB):
+            self.ax_int.plot(self.t, self.areaB, linestyle="--", label="Mean integral B (V·s)")
+        self.ax_int.set_ylabel("Integral (V·s)")
+        self.ax_int.set_xlabel("Time (s)")
+        self.ax_int.grid(True, alpha=0.2)
+        self.ax_int.legend(loc="best")
+    else:
+        self.ax_int.set_title("Integration: waiting for data…")
+        self.ax_int.set_ylabel("Integral (V·s)")
+        self.ax_int.set_xlabel("Time (s)")
+        self.ax_int.grid(True, alpha=0.2)
+
+    self.canvas.draw()
 
     def _tick(self):
         snap = self._read_status()
