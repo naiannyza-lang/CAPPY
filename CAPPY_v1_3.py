@@ -1586,6 +1586,7 @@ def run_capture(cfg_path: Path) -> int:
 class ArchiveBrowser(ttk.Frame):
     def __init__(self, data_dir: Path, master=None):
         super().__init__(master)
+        self._tz = datetime.now().astimezone().tzinfo
         self.data_dir = data_dir
         self.captures = data_dir / "captures"
         self.sessions = pd.DataFrame()
@@ -1604,24 +1605,7 @@ class ArchiveBrowser(ttk.Frame):
         filt.pack(fill=tk.X)
 
         self.var_dir = tk.StringVar(value=str(self.data_dir))
-        self.var_start = tk.StringVar(value="")
-        self.var_end = tk.StringVar(value="")
-
-        ttk.Label(filt, text="Data dir:").pack(side=tk.LEFT)
-        ttk.Entry(filt, textvariable=self.var_dir, width=42).pack(side=tk.LEFT, padx=(4,8))
-        ttk.Button(filt, text="Browse…", command=self._pick_dir).pack(side=tk.LEFT)
-
-        ttk.Label(filt, text="Start (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(16,4))
-        ttk.Entry(filt, textvariable=self.var_start, width=12).pack(side=tk.LEFT)
-        ttk.Label(filt, text="End:").pack(side=tk.LEFT, padx=(8,4))
-        ttk.Entry(filt, textvariable=self.var_end, width=12).pack(side=tk.LEFT)
-        ttk.Button(filt, text="Refresh", command=self._refresh).pack(side=tk.LEFT, padx=(12,0))
-
-        self.var_search = tk.StringVar(value="")
-        ttk.Label(filt, text="Search:").pack(side=tk.LEFT, padx=(16,4))
-        ttk.Entry(filt, textvariable=self.var_search, width=18).pack(side=tk.LEFT)
-        ttk.Button(filt, text="Apply", command=self._apply_search).pack(side=tk.LEFT, padx=(6,0))
-
+        
         pan = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
         pan.pack(fill=tk.BOTH, expand=True, pady=(8,0))
         left = ttk.Frame(pan, padding=6)
@@ -1638,14 +1622,23 @@ class ArchiveBrowser(ttk.Frame):
         self.cmb_date = ttk.Combobox(left, textvariable=self.var_date, state="readonly", width=18)
         self.cmb_date.pack(fill=tk.X, expand=False)
         self.cmb_date.bind("<<ComboboxSelected>>", self._on_date)
+        hour_row = ttk.Frame(left)
+        hour_row.pack(fill=tk.X, pady=(6,0))
+        ttk.Label(hour_row, text="Hour").pack(side=tk.LEFT)
+        self.var_seek = tk.StringVar(value="")
+        seek_entry = ttk.Entry(hour_row, textvariable=self.var_seek, width=7)
+        seek_entry.pack(side=tk.LEFT, padx=(8,4))
+        ttk.Label(hour_row, text="MM:SS").pack(side=tk.LEFT)
+        ttk.Button(hour_row, text="Go", command=self._seek_mmss).pack(side=tk.LEFT, padx=(6,0))
+        # allow Enter in the seek box to trigger
+        seek_entry.bind("<Return>", lambda _e: self._seek_mmss())
 
-        ttk.Label(left, text="Hour").pack(anchor="w", pady=(6,0))
         self.hlist = tk.Listbox(left, height=8, exportselection=False)
         self.hlist.pack(fill=tk.X, expand=False)
         self.hlist.bind("<<ListboxSelect>>", self._on_hour)
         self.hlist.bind("<MouseWheel>", self._on_hour_wheel)
 
-        ttk.Label(left, text="Waveform snippets (timestamped)").pack(anchor="w", pady=(8,0))
+        ttk.Label(left, text="Waveform snippets").pack(anchor="w", pady=(8,0))
         self.wlist = tk.Listbox(left, exportselection=False)
         self.wlist.pack(fill=tk.BOTH, expand=True)
         self.wlist.bind("<<ListboxSelect>>", self._on_snip)
@@ -1714,9 +1707,7 @@ class ArchiveBrowser(ttk.Frame):
 
     def _refresh(self):
         try:
-            sd = _parse_date(self.var_start.get().strip()) if self.var_start.get().strip() else None
-            ed = _parse_date(self.var_end.get().strip()) if self.var_end.get().strip() else None
-            self.sessions = self._list_sessions(sd, ed)
+            self.sessions = self._list_sessions(None, None)
             self.sessions_all = self.sessions.copy()
             self._sessions_view = self.sessions.copy().reset_index(drop=True)
         except Exception as ex:
@@ -1732,36 +1723,12 @@ class ArchiveBrowser(ttk.Frame):
 
         self._sessions_view = getattr(self, '_sessions_view', self.sessions).reset_index(drop=True)
         for _, r in self._sessions_view.iterrows():
-            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
+            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9, tz=self._tz)
             self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
 
         # If a session is already selected and snips are loaded, re-apply snip filter.
         if getattr(self, 'snips', pd.DataFrame()).empty is False:
             self._apply_hour_filter()
-
-    def _apply_search(self):
-        """Filter the Sessions list by search text (session_id substring)."""
-        q = (self.var_search.get() if hasattr(self, "var_search") else "").strip()
-        if self.sessions is None or self.sessions.empty:
-            return
-        if not q:
-            self._sessions_view = self.sessions.copy().reset_index(drop=True)
-        else:
-            ql = q.lower()
-            view = self.sessions.copy()
-            # simple session-level filter
-            if ql.startswith("sid:"):
-                ql = ql.split(":", 1)[1].strip()
-            mask = view["session_id"].astype(str).str.lower().str.contains(ql, na=False)
-            self._sessions_view = view[mask].reset_index(drop=True)
-        # refresh listbox contents only (do not reload from disk)
-        self.slist.delete(0, tk.END)
-        if self._sessions_view.empty:
-            self.slist.insert(tk.END, "(no sessions match search)")
-            return
-        for _, r in self._sessions_view.iterrows():
-            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
-            self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
 
     def _sel_sid(self) -> Optional[str]:
         if self.sessions.empty:
@@ -1777,7 +1744,8 @@ class ArchiveBrowser(ttk.Frame):
         """Add _date/_hour columns to self.snips (local time)."""
         if self.snips is None or self.snips.empty:
             return
-        dt = pd.to_datetime(self.snips["timestamp_ns"], unit="ns")
+        # Treat stored ns as UTC epoch, then convert to local timezone for display/grouping.
+        dt = pd.to_datetime(self.snips["timestamp_ns"], unit="ns", utc=True).dt.tz_convert(self._tz)
         self.snips = self.snips.copy()
         self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
         self.snips["_hour"] = dt.dt.strftime("%H")
@@ -1842,24 +1810,6 @@ class ArchiveBrowser(ttk.Frame):
         if "_hour" in df.columns and self._sel_hour is not None:
             df = df[df["_hour"] == self._sel_hour]
 
-        # Optional snip-level search. Supports:
-        #   id:123, buf:10, g:50000, rec:7  (exact match)
-        #   otherwise substring match on the rendered list line
-        q = (getattr(self, "var_search", tk.StringVar(value="")).get() or "").strip()
-        if q:
-            ql = q.lower()
-            try:
-                if ql.startswith("id:"):
-                    df = df[df["id"] == int(ql.split(":", 1)[1])]
-                elif ql.startswith("buf:"):
-                    df = df[df["buffer_index"] == int(ql.split(":", 1)[1])]
-                elif ql.startswith(("g:", "global:")):
-                    df = df[df["record_global"] == int(ql.split(":", 1)[1])]
-                elif ql.startswith("rec:"):
-                    df = df[df["record_in_buffer"] == int(ql.split(":", 1)[1])]
-            except Exception:
-                pass
-
         self._snips_view = df.sort_values("timestamp_ns", ascending=False)
 
         if self._snips_view.empty:
@@ -1867,8 +1817,8 @@ class ArchiveBrowser(ttk.Frame):
             return
 
         for _, r in self._snips_view.iterrows():
-            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
-            self.wlist.insert(tk.END, f"{int(r['id'])}  {ts.strftime('%Y-%m-%d %H:%M:%S')}  buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} g={int(r['record_global'])}")
+            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
+            self.wlist.insert(tk.END, f"{ts.strftime('%H:%M:%S')}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
 
     def _on_date(self, _=None):
         if self.snips is None or self.snips.empty:
@@ -1893,6 +1843,62 @@ class ArchiveBrowser(ttk.Frame):
         self._sel_hour = txt.split(":")[0].strip()
         self._apply_hour_filter()
 
+
+
+def _seek_mmss(self):
+    """Jump to the snip closest to MM:SS within the currently selected date/hour."""
+    if getattr(self, "_snips_view", pd.DataFrame()).empty:
+        return
+    txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
+    if not txt:
+        return
+    # Parse MM:SS (allow SS or M:SS)
+    mm = 0
+    ss = 0
+    try:
+        if ":" in txt:
+            a, b = txt.split(":", 1)
+            mm = int(a)
+            ss = int(b)
+        else:
+            ss = int(txt)
+    except Exception:
+        messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
+        return
+    if ss < 0 or ss > 59 or mm < 0:
+        messagebox.showerror("Invalid time", "Seconds must be 0–59.")
+        return
+    if self._sel_date is None or self._sel_hour is None:
+        return
+    try:
+        # Build a local-time target and compare in epoch ns
+        y, m, d = map(int, str(self._sel_date).split("-"))
+        hh = int(self._sel_hour)
+        target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
+        target_ns = int(target_local.timestamp() * 1e9)
+    except Exception:
+        return
+
+    df = self._snips_view.copy()
+    # Find nearest timestamp
+    try:
+        idx_min = (df["timestamp_ns"].astype("int64") - target_ns).abs().idxmin()
+    except Exception:
+        return
+    # Position in the currently rendered order
+    try:
+        pos = df.reset_index().index[df.reset_index()["index"] == idx_min][0]
+    except Exception:
+        # fallback: brute force
+        pos = 0
+    self.wlist.selection_clear(0, tk.END)
+    self.wlist.selection_set(pos)
+    self.wlist.see(pos)
+    # trigger display
+    try:
+        self._on_snip()
+    except Exception:
+        pass
     def _on_hour_wheel(self, evt):
         # Mouse wheel scroll selects next/prev hour entry
         if self.hlist.size() == 0:
@@ -2033,7 +2039,7 @@ class ArchiveBrowser(ttk.Frame):
 
         self.canvas.draw()
 
-        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
+        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
         a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
         b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
         self._set_meta(
