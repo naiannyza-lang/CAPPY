@@ -42,6 +42,11 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+plt.style.use('dark_background')
+
+# Define neon colors
+NEON_PINK = "#FF00EE"
+NEON_GREEN = "#26FF00"
 
 ATS_AVAILABLE = False
 ats = None
@@ -1603,11 +1608,15 @@ class ArchiveBrowser(ttk.Frame):
         self.wlist.bind("<<ListboxSelect>>", self._on_snip)
 
         self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
+        self.fig.patch.set_facecolor('#1e1e1e')
+        self.axA.set_facecolor('#2d2d2d')
+        self.axB.set_facecolor('#2d2d2d')
+        self.axI.set_facecolor('#2d2d2d')
         self.fig.tight_layout(pad=1.0)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.meta = tk.Text(right, height=11)
+        self.meta = tk.Text(right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
         self.meta.pack(fill=tk.X, pady=(8,0))
         self.meta.configure(state=tk.DISABLED)
 
@@ -1899,83 +1908,104 @@ class ArchiveBrowser(ttk.Frame):
         self._apply_hour_filter()
         self._set_meta(f"Snips loaded: {len(self.snips):,}")
 
+    def _on_snip(self, _=None):
+        if self.snips.empty or self._snip_db_dir is None:
+            return
+        sel = self.wlist.curselection()
+        if not sel:
+            return
+        # listbox entry begins with integer id
+        try:
+            snip_id = int(str(self.wlist.get(sel[0])).split()[0])
+        except Exception:
+            return
 
-def _on_snip(self, _=None):
-    if self.snips.empty or self._snip_db_dir is None:
-        return
-    sel = self.wlist.curselection()
-    if not sel:
-        return
-    # listbox entry begins with integer id
-    try:
-        snip_id = int(str(self.wlist.get(sel[0])).split()[0])
-    except Exception:
-        return
+        df = self._snips_view if (hasattr(self, '_snips_view') and not self._snips_view.empty) else self.snips
+        row = df[df["id"] == snip_id]
+        if row.empty:
+            return
+        r = row.iloc[0]
 
-    df = self._snips_view if (hasattr(self, '_snips_view') and not self._snips_view.empty) else self.snips
-    row = df[df["id"] == snip_id]
-    if row.empty:
-        return
-    r = row.iloc[0]
+        store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
+        try:
+            wa, wb = store.load_waveforms(r, self._snip_db_dir)
+        finally:
+            store.close()
 
-    store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
-    try:
-        wa, wb = store.load_waveforms(r, self._snip_db_dir)
-    finally:
-        store.close()
+        sr = float(r.get("sample_rate_hz", np.nan))
+        if not np.isfinite(sr) or sr <= 0:
+            sr = 1.0
 
-    sr = float(r.get("sample_rate_hz", np.nan))
-    if not np.isfinite(sr) or sr <= 0:
-        sr = 1.0
+        # Time axis with adaptive units (ns/us/ms/s)
+        tvec, unit = _auto_time_axis(len(wa), sr)
 
-    # Time axis with adaptive units (ns/us/ms/s)
-    tvec, unit = _auto_time_axis(len(wa), sr)
+        # Clear axes
+        self.axA.clear()
+        self.axB.clear()
+        self.axI.clear()
 
-    # Clear axes
-    self.axA.clear()
-    self.axB.clear()
-    self.axI.clear()
+        # Waveform A
+        self.axA.plot(tvec, wa, color=NEON_PINK, linewidth=1.5)
+        self.axA.set_ylabel("A (V)", color=NEON_PINK)
+        self.axA.tick_params(colors=NEON_PINK)
+        self.axA.spines['left'].set_color(NEON_PINK)
+        self.axA.spines['bottom'].set_color('white')
+        self.axA.spines['top'].set_visible(False)
+        self.axA.spines['right'].set_visible(False)
+        self.axA.grid(True, alpha=0.15, color=NEON_PINK)
 
-    # Waveform A
-    self.axA.plot(tvec, wa)
-    self.axA.set_ylabel("A (V)")
-    self.axA.grid(True, alpha=0.2)
+        # Waveform B (if available)
+        if wb is not None:
+            self.axB.plot(tvec, wb, color=NEON_GREEN, linewidth=1.5)
+            self.axB.set_ylabel("B (V)", color=NEON_GREEN)
+            self.axB.tick_params(colors=NEON_GREEN)
+            self.axB.spines['left'].set_color(NEON_GREEN)
+            self.axB.spines['bottom'].set_color('white')
+            self.axB.spines['top'].set_visible(False)
+            self.axB.spines['right'].set_visible(False)
+        else:
+            self.axB.text(0.02, 0.5, "Channel B not captured in this snip", transform=self.axB.transAxes, color='white')
+            self.axB.set_ylabel("B (V)", color='white')
+            self.axB.tick_params(colors='white')
+            self.axB.spines['left'].set_color('white')
+            self.axB.spines['bottom'].set_color('white')
+            self.axB.spines['top'].set_visible(False)
+            self.axB.spines['right'].set_visible(False)
+        self.axB.grid(True, alpha=0.15, color='white')
 
-    # Waveform B (if available)
-    if wb is not None:
-        self.axB.plot(tvec, wb)
-        self.axB.set_ylabel("B (V)")
-    else:
-        self.axB.text(0.02, 0.5, "Channel B not captured in this snip", transform=self.axB.transAxes)
-        self.axB.set_ylabel("B (V)")
-    self.axB.grid(True, alpha=0.2)
+        # Cumulative integral strip (V·s)
+        dt = 1.0 / sr
+        intA = np.cumsum(np.asarray(wa, dtype=np.float64)) * dt
+        self.axI.plot(tvec, intA, color=NEON_PINK, linewidth=1.5, label="∫A dt")
+        if wb is not None:
+            intB = np.cumsum(np.asarray(wb, dtype=np.float64)) * dt
+            self.axI.plot(tvec, intB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="∫B dt")
+        self.axI.set_ylabel("Integral (V·s)", color='white')
+        self.axI.set_xlabel(f"Time ({unit})", color='white')
+        self.axI.tick_params(colors='white')
+        self.axI.spines['left'].set_color('white')
+        self.axI.spines['bottom'].set_color('white')
+        self.axI.spines['top'].set_visible(False)
+        self.axI.spines['right'].set_visible(False)
+        self.axI.grid(True, alpha=0.15, color='white')
+        legend = self.axI.legend(loc="best")
+        for text in legend.get_texts():
+            text.set_color('white')
 
-    # Cumulative integral strip (V·s)
-    dt = 1.0 / sr
-    intA = np.cumsum(np.asarray(wa, dtype=np.float64)) * dt
-    self.axI.plot(tvec, intA, label="∫A dt")
-    if wb is not None:
-        intB = np.cumsum(np.asarray(wb, dtype=np.float64)) * dt
-        self.axI.plot(tvec, intB, linestyle="--", label="∫B dt")
-    self.axI.set_ylabel("Integral (V·s)")
-    self.axI.set_xlabel(f"Time ({unit})")
-    self.axI.grid(True, alpha=0.2)
-    self.axI.legend(loc="best")
+        self.canvas.draw()
 
-    self.canvas.draw()
-
-    ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
-    a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
-    b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
-    self._set_meta(
-        f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
-        f"Session: {r.get('session_id','?')}\n"
-        f"Buffer: {int(r.get('buffer_index',-1))}  Record: {int(r.get('record_in_buffer',-1))}  Global: {int(r.get('record_global',-1))}\n"
-        f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
-        f"Area A: {float(r.get('area_A_Vs',0.0)):.6g} V·s   Peak A: {float(r.get('peak_A_V',0.0)):.6g} V\n"
-        f"Area B: {float(r.get('area_B_Vs',0.0)):.6g} V·s   Peak B: {float(r.get('peak_B_V',0.0)):.6g} V\n"
-        f"Waveform points: {int(r.get('npts', len(wa)))}"
-    )
+        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
+        a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
+        b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
+        self._set_meta(
+            f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
+            f"Session: {r.get('session_id','?')}\n"
+            f"Buffer: {int(r.get('buffer_index',-1))}  Record: {int(r.get('record_in_buffer',-1))}  Global: {int(r.get('record_global',-1))}\n"
+            f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
+            f"Area A: {float(r.get('area_A_Vs',0.0)):.6g} V·s   Peak A: {float(r.get('peak_A_V',0.0)):.6g} V\n"
+            f"Area B: {float(r.get('area_B_Vs',0.0)):.6g} V·s   Peak B: {float(r.get('peak_B_V',0.0)):.6g} V\n"
+            f"Waveform points: {int(r.get('npts', len(wa)))}"
+        )
 
     def _set_meta(self, s: str):
         self.meta.configure(state=tk.NORMAL)
@@ -2045,16 +2075,20 @@ class LiveDashboard(ttk.Frame):
 
         # --- plots ---
         self.fig = plt.Figure(figsize=(8.2, 7.2))
+        self.fig.patch.set_facecolor('#1e1e1e')
 
         # Scope-like layout: Channel A (top), Channel B (middle), Integration history (bottom)
         self.ax_wfA = self.fig.add_subplot(311)
+        self.ax_wfA.set_facecolor('#2d2d2d')
         self.ax_wfB = self.fig.add_subplot(312)
+        self.ax_wfB.set_facecolor('#2d2d2d')
         self.ax_int = self.fig.add_subplot(313)
+        self.ax_int.set_facecolor('#2d2d2d')
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.meta = tk.Text(self, height=3)
+        self.meta = tk.Text(self, height=3, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
         self.meta.pack(fill=tk.X, pady=(6, 0))
         self.meta.configure(state=tk.DISABLED)
 
@@ -2191,43 +2225,75 @@ class LiveDashboard(ttk.Frame):
         # --- Channel A waveform (top) ---
         if self._streamA.size > 1:
             x = np.arange(self._streamA.size)
-            self.ax_wfA.plot(x, self._streamA)
-            self.ax_wfA.set_ylabel("A (V)")
-            self.ax_wfA.set_xlabel("Rolling samples")
-            self.ax_wfA.grid(True, alpha=0.2)
+            self.ax_wfA.plot(x, self._streamA, color=NEON_PINK, linewidth=1.0)
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
+            self.ax_wfA.set_xlabel("Rolling samples", color='white')
+            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.spines['left'].set_color(NEON_PINK)
+            self.ax_wfA.spines['bottom'].set_color('white')
+            self.ax_wfA.spines['top'].set_visible(False)
+            self.ax_wfA.spines['right'].set_visible(False)
+            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK)
         else:
-            self.ax_wfA.set_title("Channel A: waiting for waveforms…")
-            self.ax_wfA.set_ylabel("A (V)")
-            self.ax_wfA.set_xlabel("Rolling samples")
-            self.ax_wfA.grid(True, alpha=0.2)
+            self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
+            self.ax_wfA.set_xlabel("Rolling samples", color='white')
+            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.spines['left'].set_color(NEON_PINK)
+            self.ax_wfA.spines['bottom'].set_color('white')
+            self.ax_wfA.spines['top'].set_visible(False)
+            self.ax_wfA.spines['right'].set_visible(False)
+            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK)
 
         # --- Channel B waveform (middle) ---
         if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
             xb = np.arange(self._streamB.size)
-            self.ax_wfB.plot(xb, self._streamB)
-            self.ax_wfB.set_ylabel("B (V)")
-            self.ax_wfB.set_xlabel("Rolling samples")
-            self.ax_wfB.grid(True, alpha=0.2)
+            self.ax_wfB.plot(xb, self._streamB, color=NEON_GREEN, linewidth=1.0)
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
+            self.ax_wfB.set_xlabel("Rolling samples", color='white')
+            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.spines['left'].set_color(NEON_GREEN)
+            self.ax_wfB.spines['bottom'].set_color('white')
+            self.ax_wfB.spines['top'].set_visible(False)
+            self.ax_wfB.spines['right'].set_visible(False)
+            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN)
         else:
-            self.ax_wfB.set_title("Channel B: waiting for waveforms…")
-            self.ax_wfB.set_ylabel("B (V)")
-            self.ax_wfB.set_xlabel("Rolling samples")
-            self.ax_wfB.grid(True, alpha=0.2)
+            self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
+            self.ax_wfB.set_xlabel("Rolling samples", color='white')
+            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.spines['left'].set_color(NEON_GREEN)
+            self.ax_wfB.spines['bottom'].set_color('white')
+            self.ax_wfB.spines['top'].set_visible(False)
+            self.ax_wfB.spines['right'].set_visible(False)
+            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN)
 
         # --- Integration history strip (bottom) ---
         if self.t:
-            self.ax_int.plot(self.t, self.areaA, label="Mean integral A (V·s)")
+            self.ax_int.plot(self.t, self.areaA, color=NEON_PINK, linewidth=1.5, label="Mean integral A (V·s)")
             if self.areaB and np.any(np.isfinite(np.asarray(self.areaB, dtype=float))) and np.any(np.abs(np.asarray(self.areaB, dtype=float)) > 0):
-                self.ax_int.plot(self.t, self.areaB, linestyle="--", label="Mean integral B (V·s)")
-            self.ax_int.set_ylabel("Integral (V·s)")
-            self.ax_int.set_xlabel("Time (s)")
-            self.ax_int.grid(True, alpha=0.2)
-            self.ax_int.legend(loc="best")
+                self.ax_int.plot(self.t, self.areaB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="Mean integral B (V·s)")
+            self.ax_int.set_ylabel("Integral (V·s)", color='white')
+            self.ax_int.set_xlabel("Time (s)", color='white')
+            self.ax_int.tick_params(colors='white')
+            self.ax_int.spines['left'].set_color('white')
+            self.ax_int.spines['bottom'].set_color('white')
+            self.ax_int.spines['top'].set_visible(False)
+            self.ax_int.spines['right'].set_visible(False)
+            self.ax_int.grid(True, alpha=0.15, color='white')
+            legend = self.ax_int.legend(loc="best")
+            for text in legend.get_texts():
+                text.set_color('white')
         else:
-            self.ax_int.set_title("Integration: waiting for data…")
-            self.ax_int.set_ylabel("Integral (V·s)")
-            self.ax_int.set_xlabel("Time (s)")
-            self.ax_int.grid(True, alpha=0.2)
+            self.ax_int.set_title("Integration: waiting for data…", color='white')
+            self.ax_int.set_ylabel("Integral (V·s)", color='white')
+            self.ax_int.set_xlabel("Time (s)", color='white')
+            self.ax_int.tick_params(colors='white')
+            self.ax_int.spines['left'].set_color('white')
+            self.ax_int.spines['bottom'].set_color('white')
+            self.ax_int.spines['top'].set_visible(False)
+            self.ax_int.spines['right'].set_visible(False)
+            self.ax_int.grid(True, alpha=0.15, color='white')
 
         self.canvas.draw()
 
@@ -2346,6 +2412,20 @@ class LauncherGUI(tk.Tk):
         self.pump = None
         self._kill_after_id = None
 
+        # Apply dark mode theme
+        self.tk_setPalette(background='#2d2d2d', foreground='white', activeBackground='#404040', activeForeground='white')
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background='#2d2d2d')
+        style.configure('TLabel', background='#2d2d2d', foreground='white')
+        style.configure('TButton', background='#404040', foreground='white', borderwidth=1)
+        style.map('TButton', background=[('active', '#505050')])
+        style.configure('TNotebook', background='#2d2d2d', borderwidth=0)
+        style.configure('TNotebook.Tab', background='#404040', foreground='white', padding=[20, 10])
+        style.map('TNotebook.Tab', background=[('selected', '#505050')])
+        style.configure('TEntry', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white', borderwidth=1)
+        style.configure('TCombobox', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white')
+
         self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
         self.var_data_dir = tk.StringVar(value="dataFile")
 
@@ -2388,7 +2468,7 @@ class LauncherGUI(tk.Tk):
 
         logbox = ttk.Frame(tabs, padding=6)
         tabs.add(logbox, text="Log")
-        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED)
+        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9))
         self.log.pack(fill=tk.BOTH, expand=True)
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
