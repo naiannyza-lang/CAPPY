@@ -2600,6 +2600,87 @@ class LauncherGUI(tk.Tk):
             except Exception as ex:
                 messagebox.showerror('CAPPY', f'Failed to create default config {cfgB}: {ex}')
 
+
+    def _refresh_yaml_lists(self):
+        """Populate YAML dropdowns from the script directory + CWD."""
+        try:
+            base = self.script_path.parent
+        except Exception:
+            base = Path.cwd()
+
+        yamls = []
+        for root in [base, Path.cwd()]:
+            try:
+                for p in sorted(root.glob("*.y*ml")):
+                    if p.is_file():
+                        yamls.append(str(p))
+            except Exception:
+                pass
+
+        # de-dup while preserving order
+        seen = set()
+        choices = []
+        for p in yamls:
+            if p not in seen:
+                seen.add(p)
+                choices.append(p)
+
+        # Also include current selections even if outside base
+        for cur in [self.var_configA.get(), self.var_configB.get()]:
+            if cur and cur not in seen:
+                choices.insert(0, cur)
+                seen.add(cur)
+
+        self._yaml_choices = choices
+
+        # Update comboboxes if already created
+        for cb in [getattr(self, "cb_cfgA", None), getattr(self, "cb_cfgB", None)]:
+            try:
+                if cb is not None:
+                    cb.configure(values=self._yaml_choices)
+            except Exception:
+                pass
+
+    def _list_data_dirs(self):
+        """Return likely archive/data directories (e.g., dataFile*, dataFile_9352)."""
+        try:
+            base = self.script_path.parent
+        except Exception:
+            base = Path.cwd()
+
+        dirs = []
+        for root in [base, Path.cwd()]:
+            try:
+                for p in sorted(root.iterdir()):
+                    if p.is_dir() and p.name.lower().startswith("datafile"):
+                        dirs.append(p.name)
+            except Exception:
+                pass
+
+        # de-dup
+        seen = set()
+        out = []
+        for d in dirs:
+            if d not in seen:
+                seen.add(d)
+                out.append(d)
+
+        # Ensure current selections exist in the list so the combobox doesn't blank out
+        for cur in [self.var_data_dirA.get(), self.var_data_dirB.get()]:
+            if cur and cur not in seen:
+                out.insert(0, cur)
+                seen.add(cur)
+
+        return out
+
+    def _refresh_data_dir_lists(self):
+        vals = self._list_data_dirs()
+        for cb in [getattr(self, "cb_dirA", None), getattr(self, "cb_dirB", None)]:
+            try:
+                if cb is not None:
+                    cb.configure(values=vals)
+            except Exception:
+                pass
     def _pick_yaml(self, var: tk.StringVar):
         p = filedialog.askopenfilename(title="Select YAML", filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")])
         if p:
