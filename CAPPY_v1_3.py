@@ -2094,7 +2094,7 @@ class LiveDashboard(ttk.Frame):
         # rolling stream buffers for true scrolling (concatenate each buffer waveform)
         self._streamA = np.empty((0,), dtype=np.float32)
         self._streamB = np.empty((0,), dtype=np.float32)
-        self._stream_window = 20000  # points shown in scrolling mode
+        self._stream_window = 10000  # points shown in scrolling mode (per-board)
 
         self._started_unix: Optional[float] = None
         self._last_seen_seq: int = 0
@@ -2458,6 +2458,15 @@ class _ProcLogPump:
         return out
 
 
+    # Back-compat aliases (older bindings / external callers)
+    def on_session(self, *a, **k):
+        return self._on_session(*a, **k)
+
+    def on_snip(self, *a, **k):
+        return self._on_snip(*a, **k)
+
+
+
 class LauncherGUI(tk.Tk):
     """Simple launcher: Start Capture / Browse Archive / Open YAML."""
     def __init__(self, script_path: Path):
@@ -2504,6 +2513,7 @@ class LauncherGUI(tk.Tk):
 
         ttk.Button(top, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
         ttk.Button(top, text="Browse Archive", command=self._browse).pack(side=tk.LEFT)
+        ttk.Button(top, text="Secondary Board…", command=self._open_secondary_board).pack(side=tk.LEFT, padx=(8,0))
 
         ctrl = ttk.Frame(self, padding=8)
         ctrl.pack(fill=tk.X)
@@ -2534,6 +2544,18 @@ class LauncherGUI(tk.Tk):
         self.log.insert(tk.END, s + "\n")
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
+
+    def _open_secondary_board(self):
+        """Open a second window for a second Alazar card (e.g., SystemId=1 ATS-9462).
+
+        This runs the same capture software (this script) in a separate subprocess using a
+        separate YAML + separate data directory, and shows a separate live dashboard + archive.
+        """
+        try:
+            win = SecondaryBoardWindow(self, self.script_path)
+            win.grab_set()  # modal-ish but still movable
+        except Exception as e:
+            messagebox.showerror('CAPPY', str(e))
 
     def _pick_yaml(self):
         p = filedialog.askopenfilename(title="Select YAML", filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")])
