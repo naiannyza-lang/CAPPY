@@ -799,49 +799,6 @@ class WaveBinSqliteStore:
         return arr[:n_samples], None
 
 
-def load_waveforms_from_row(row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Read waveform payloads referenced by a snip row WITHOUT opening/creating any SQLite DB."""
-    n_samples = int(row.get("n_samples", 0))
-
-    # Prefer channel-separated fields when present and non-null
-    fileA = row.get("file_A", None)
-    offA = row.get("offset_A", None)
-    nbytesA = row.get("nbytes_A", None)
-
-    if isinstance(fileA, str) and fileA and pd.notna(offA) and pd.notna(nbytesA):
-        binA = day_dir / str(fileA)
-        with open(binA, "rb") as fh:
-            fh.seek(int(offA))
-            payloadA = fh.read(int(nbytesA))
-        a = np.frombuffer(payloadA, dtype=np.float32)[:n_samples]
-
-        fileB = row.get("file_B", None)
-        offB = row.get("offset_B", None)
-        nbytesB = row.get("nbytes_B", None)
-        if isinstance(fileB, str) and fileB and pd.notna(offB) and pd.notna(nbytesB):
-            binB = day_dir / str(fileB)
-            with open(binB, "rb") as fh:
-                fh.seek(int(offB))
-                payloadB = fh.read(int(nbytesB))
-            b = np.frombuffer(payloadB, dtype=np.float32)[:n_samples]
-            return a, b
-        return a, None
-
-    # Legacy fallback
-    bin_path = day_dir / str(row["file"])
-    offset = int(row["offset_bytes"])
-    nbytes = int(row["nbytes"])
-    n_channels = int(row.get("n_channels", 1))
-    with open(bin_path, "rb") as fh:
-        fh.seek(offset)
-        payload = fh.read(nbytes)
-    arr = np.frombuffer(payload, dtype=np.float32)
-    if n_channels == 2:
-        return arr[:n_samples], arr[n_samples:2*n_samples]
-    return arr[:n_samples], None
-
-
-
 class CappyArchive:
 
     def __init__(self, data_dir: Path, rollover_minutes: int, flush_every_records: int,
@@ -1586,7 +1543,6 @@ def run_capture(cfg_path: Path) -> int:
 class ArchiveBrowser(ttk.Frame):
     def __init__(self, data_dir: Path, master=None):
         super().__init__(master)
-        self._tz = datetime.now().astimezone().tzinfo
         self.data_dir = data_dir
         self.captures = data_dir / "captures"
         self.sessions = pd.DataFrame()
@@ -1605,7 +1561,24 @@ class ArchiveBrowser(ttk.Frame):
         filt.pack(fill=tk.X)
 
         self.var_dir = tk.StringVar(value=str(self.data_dir))
-        
+        self.var_start = tk.StringVar(value="")
+        self.var_end = tk.StringVar(value="")
+
+        ttk.Label(filt, text="Data dir:").pack(side=tk.LEFT)
+        ttk.Entry(filt, textvariable=self.var_dir, width=42).pack(side=tk.LEFT, padx=(4,8))
+        ttk.Button(filt, text="Browse…", command=self._pick_dir).pack(side=tk.LEFT)
+
+        ttk.Label(filt, text="Start (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(16,4))
+        ttk.Entry(filt, textvariable=self.var_start, width=12).pack(side=tk.LEFT)
+        ttk.Label(filt, text="End:").pack(side=tk.LEFT, padx=(8,4))
+        ttk.Entry(filt, textvariable=self.var_end, width=12).pack(side=tk.LEFT)
+        ttk.Button(filt, text="Refresh", command=self._refresh).pack(side=tk.LEFT, padx=(12,0))
+
+        self.var_search = tk.StringVar(value="")
+        ttk.Label(filt, text="Search:").pack(side=tk.LEFT, padx=(16,4))
+        ttk.Entry(filt, textvariable=self.var_search, width=18).pack(side=tk.LEFT)
+        ttk.Button(filt, text="Apply", command=self._apply_search).pack(side=tk.LEFT, padx=(6,0))
+
         pan = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
         pan.pack(fill=tk.BOTH, expand=True, pady=(8,0))
         left = ttk.Frame(pan, padding=6)
@@ -1622,23 +1595,14 @@ class ArchiveBrowser(ttk.Frame):
         self.cmb_date = ttk.Combobox(left, textvariable=self.var_date, state="readonly", width=18)
         self.cmb_date.pack(fill=tk.X, expand=False)
         self.cmb_date.bind("<<ComboboxSelected>>", self._on_date)
-        hour_row = ttk.Frame(left)
-        hour_row.pack(fill=tk.X, pady=(6,0))
-        ttk.Label(hour_row, text="Hour").pack(side=tk.LEFT)
-        self.var_seek = tk.StringVar(value="")
-        seek_entry = ttk.Entry(hour_row, textvariable=self.var_seek, width=7)
-        seek_entry.pack(side=tk.LEFT, padx=(8,4))
-        ttk.Label(hour_row, text="MM:SS").pack(side=tk.LEFT)
-        ttk.Button(hour_row, text="Go", command=self._seek_mmss).pack(side=tk.LEFT, padx=(6,0))
-        # allow Enter in the seek box to trigger
-        seek_entry.bind("<Return>", lambda _e: self._seek_mmss())
 
+        ttk.Label(left, text="Hour").pack(anchor="w", pady=(6,0))
         self.hlist = tk.Listbox(left, height=8, exportselection=False)
         self.hlist.pack(fill=tk.X, expand=False)
         self.hlist.bind("<<ListboxSelect>>", self._on_hour)
         self.hlist.bind("<MouseWheel>", self._on_hour_wheel)
 
-        ttk.Label(left, text="Waveform snippets").pack(anchor="w", pady=(8,0))
+        ttk.Label(left, text="Waveform snippets (timestamped)").pack(anchor="w", pady=(8,0))
         self.wlist = tk.Listbox(left, exportselection=False)
         self.wlist.pack(fill=tk.BOTH, expand=True)
         self.wlist.bind("<<ListboxSelect>>", self._on_snip)
@@ -1707,7 +1671,9 @@ class ArchiveBrowser(ttk.Frame):
 
     def _refresh(self):
         try:
-            self.sessions = self._list_sessions(None, None)
+            sd = _parse_date(self.var_start.get().strip()) if self.var_start.get().strip() else None
+            ed = _parse_date(self.var_end.get().strip()) if self.var_end.get().strip() else None
+            self.sessions = self._list_sessions(sd, ed)
             self.sessions_all = self.sessions.copy()
             self._sessions_view = self.sessions.copy().reset_index(drop=True)
         except Exception as ex:
@@ -1723,12 +1689,36 @@ class ArchiveBrowser(ttk.Frame):
 
         self._sessions_view = getattr(self, '_sessions_view', self.sessions).reset_index(drop=True)
         for _, r in self._sessions_view.iterrows():
-            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9, tz=self._tz)
+            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
             self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
 
         # If a session is already selected and snips are loaded, re-apply snip filter.
         if getattr(self, 'snips', pd.DataFrame()).empty is False:
             self._apply_hour_filter()
+
+    def _apply_search(self):
+        """Filter the Sessions list by search text (session_id substring)."""
+        q = (self.var_search.get() if hasattr(self, "var_search") else "").strip()
+        if self.sessions is None or self.sessions.empty:
+            return
+        if not q:
+            self._sessions_view = self.sessions.copy().reset_index(drop=True)
+        else:
+            ql = q.lower()
+            view = self.sessions.copy()
+            # simple session-level filter
+            if ql.startswith("sid:"):
+                ql = ql.split(":", 1)[1].strip()
+            mask = view["session_id"].astype(str).str.lower().str.contains(ql, na=False)
+            self._sessions_view = view[mask].reset_index(drop=True)
+        # refresh listbox contents only (do not reload from disk)
+        self.slist.delete(0, tk.END)
+        if self._sessions_view.empty:
+            self.slist.insert(tk.END, "(no sessions match search)")
+            return
+        for _, r in self._sessions_view.iterrows():
+            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9)
+            self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
 
     def _sel_sid(self) -> Optional[str]:
         if self.sessions.empty:
@@ -1744,8 +1734,7 @@ class ArchiveBrowser(ttk.Frame):
         """Add _date/_hour columns to self.snips (local time)."""
         if self.snips is None or self.snips.empty:
             return
-        # Treat stored ns as UTC epoch, then convert to local timezone for display/grouping.
-        dt = pd.to_datetime(self.snips["timestamp_ns"], unit="ns", utc=True).dt.tz_convert(self._tz)
+        dt = pd.to_datetime(self.snips["timestamp_ns"], unit="ns")
         self.snips = self.snips.copy()
         self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
         self.snips["_hour"] = dt.dt.strftime("%H")
@@ -1810,6 +1799,24 @@ class ArchiveBrowser(ttk.Frame):
         if "_hour" in df.columns and self._sel_hour is not None:
             df = df[df["_hour"] == self._sel_hour]
 
+        # Optional snip-level search. Supports:
+        #   id:123, buf:10, g:50000, rec:7  (exact match)
+        #   otherwise substring match on the rendered list line
+        q = (getattr(self, "var_search", tk.StringVar(value="")).get() or "").strip()
+        if q:
+            ql = q.lower()
+            try:
+                if ql.startswith("id:"):
+                    df = df[df["id"] == int(ql.split(":", 1)[1])]
+                elif ql.startswith("buf:"):
+                    df = df[df["buffer_index"] == int(ql.split(":", 1)[1])]
+                elif ql.startswith(("g:", "global:")):
+                    df = df[df["record_global"] == int(ql.split(":", 1)[1])]
+                elif ql.startswith("rec:"):
+                    df = df[df["record_in_buffer"] == int(ql.split(":", 1)[1])]
+            except Exception:
+                pass
+
         self._snips_view = df.sort_values("timestamp_ns", ascending=False)
 
         if self._snips_view.empty:
@@ -1817,8 +1824,8 @@ class ArchiveBrowser(ttk.Frame):
             return
 
         for _, r in self._snips_view.iterrows():
-            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
-            self.wlist.insert(tk.END, f"{ts.strftime('%H:%M:%S')}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
+            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
+            self.wlist.insert(tk.END, f"{int(r['id'])}  {ts.strftime('%Y-%m-%d %H:%M:%S')}  buf={int(r['buffer_index'])} rec={int(r['record_in_buffer'])} g={int(r['record_global'])}")
 
     def _on_date(self, _=None):
         if self.snips is None or self.snips.empty:
@@ -1843,62 +1850,6 @@ class ArchiveBrowser(ttk.Frame):
         self._sel_hour = txt.split(":")[0].strip()
         self._apply_hour_filter()
 
-
-
-def _seek_mmss(self):
-    """Jump to the snip closest to MM:SS within the currently selected date/hour."""
-    if getattr(self, "_snips_view", pd.DataFrame()).empty:
-        return
-    txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
-    if not txt:
-        return
-    # Parse MM:SS (allow SS or M:SS)
-    mm = 0
-    ss = 0
-    try:
-        if ":" in txt:
-            a, b = txt.split(":", 1)
-            mm = int(a)
-            ss = int(b)
-        else:
-            ss = int(txt)
-    except Exception:
-        messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
-        return
-    if ss < 0 or ss > 59 or mm < 0:
-        messagebox.showerror("Invalid time", "Seconds must be 0–59.")
-        return
-    if self._sel_date is None or self._sel_hour is None:
-        return
-    try:
-        # Build a local-time target and compare in epoch ns
-        y, m, d = map(int, str(self._sel_date).split("-"))
-        hh = int(self._sel_hour)
-        target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
-        target_ns = int(target_local.timestamp() * 1e9)
-    except Exception:
-        return
-
-    df = self._snips_view.copy()
-    # Find nearest timestamp
-    try:
-        idx_min = (df["timestamp_ns"].astype("int64") - target_ns).abs().idxmin()
-    except Exception:
-        return
-    # Position in the currently rendered order
-    try:
-        pos = df.reset_index().index[df.reset_index()["index"] == idx_min][0]
-    except Exception:
-        # fallback: brute force
-        pos = 0
-    self.wlist.selection_clear(0, tk.END)
-    self.wlist.selection_set(pos)
-    self.wlist.see(pos)
-    # trigger display
-    try:
-        self._on_snip()
-    except Exception:
-        pass
     def _on_hour_wheel(self, evt):
         # Mouse wheel scroll selects next/prev hour entry
         if self.hlist.size() == 0:
@@ -1957,6 +1908,14 @@ def _seek_mmss(self):
         self._apply_hour_filter()
         self._set_meta(f"Snips loaded: {len(self.snips):,}")
 
+
+    # Back-compat / external callback aliases (some older GUI code binds without leading underscore)
+    def on_session(self, *_a, **_k):
+        return self._on_session(*_a, **_k)
+
+    def on_snip(self, *_a, **_k):
+        return self._on_snip(*_a, **_k)
+
     def _on_snip(self, _=None):
         if self.snips.empty or self._snip_db_dir is None:
             return
@@ -1975,7 +1934,11 @@ def _seek_mmss(self):
             return
         r = row.iloc[0]
 
-        wa, wb = load_waveforms_from_row(r, self._snip_db_dir)
+        store = WaveBinSqliteStore(self._snip_db_dir, "tmp", rollover_minutes=60, commit_every=1000)
+        try:
+            wa, wb = store.load_waveforms(r, self._snip_db_dir)
+        finally:
+            store.close()
 
         sr = float(r.get("sample_rate_hz", np.nan))
         if not np.isfinite(sr) or sr <= 0:
@@ -2039,7 +2002,7 @@ def _seek_mmss(self):
 
         self.canvas.draw()
 
-        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
+        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9)
         a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
         b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
         self._set_meta(
@@ -2094,7 +2057,7 @@ class LiveDashboard(ttk.Frame):
         # rolling stream buffers for true scrolling (concatenate each buffer waveform)
         self._streamA = np.empty((0,), dtype=np.float32)
         self._streamB = np.empty((0,), dtype=np.float32)
-        self._stream_window = 10000  # points shown in scrolling mode (per-board)
+        self._stream_window = 10000  # points shown in scrolling mode (default reduced for dual-board view)
 
         self._started_unix: Optional[float] = None
         self._last_seen_seq: int = 0
@@ -2137,12 +2100,7 @@ class LiveDashboard(ttk.Frame):
         self.meta.pack(fill=tk.X, pady=(6, 0))
         self.meta.configure(state=tk.DISABLED)
 
-        # Schedule periodic UI updates
-        if hasattr(self, "_tick"):
-            self.after(100, self._tick)
-        else:
-            # Fallback to avoid startup crash if _tick is missing due to editing/merge issues
-            self.after(100, lambda: None)
+        self.after(100, self._tick)
 
     def _set_meta(self, s: str):
         self.meta.configure(state=tk.NORMAL)
@@ -2411,12 +2369,7 @@ class LiveDashboard(ttk.Frame):
             self._redraw(snap)
 
             self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
-        # Schedule periodic UI updates
-        if hasattr(self, "_tick"):
-            self.after(100, self._tick)
-        else:
-            # Fallback to avoid startup crash if _tick is missing due to editing/merge issues
-            self.after(100, lambda: None)
+        self.after(100, self._tick)
 
 class _ProcLogPump:
     """
@@ -2458,26 +2411,23 @@ class _ProcLogPump:
         return out
 
 
-    # Back-compat aliases (older bindings / external callers)
-    def on_session(self, *a, **k):
-        return self._on_session(*a, **k)
-
-    def on_snip(self, *a, **k):
-        return self._on_snip(*a, **k)
-
-
 
 class LauncherGUI(tk.Tk):
-    """Simple launcher: Start Capture / Browse Archive / Open YAML."""
+    """Dual-board launcher: run two capture processes and show side-by-side dashboards + archives."""
     def __init__(self, script_path: Path):
         super().__init__()
         self.script_path = script_path
-        self.proc = None
-        self.pump = None
+
+        # Two capture subprocesses (board A/B)
+        self.procA = None
+        self.procB = None
+        self.pumpA = None
+        self.pumpB = None
         self._kill_after_id = None
 
         # Apply dark mode theme
-        self.tk_setPalette(background='#2d2d2d', foreground='white', activeBackground='#404040', activeForeground='white')
+        self.tk_setPalette(background='#2d2d2d', foreground='white',
+                           activeBackground='#404040', activeForeground='white')
         style = ttk.Style()
         style.theme_use('clam')
         style.configure('TFrame', background='#2d2d2d')
@@ -2485,85 +2435,159 @@ class LauncherGUI(tk.Tk):
         style.configure('TButton', background='#404040', foreground='white', borderwidth=1)
         style.map('TButton', background=[('active', '#505050')])
         style.configure('TNotebook', background='#2d2d2d', borderwidth=0)
-        style.configure('TNotebook.Tab', background='#404040', foreground='white', padding=[20, 10])
+        style.configure('TNotebook.Tab', background='#404040', foreground='white', padding=[18, 9])
         style.map('TNotebook.Tab', background=[('selected', '#505050')])
         style.configure('TEntry', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white', borderwidth=1)
         style.configure('TCombobox', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white')
 
-        self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
-        self.var_data_dir = tk.StringVar(value="dataFile")
+        # Board A (ATS-9352, currently used)
+        self.var_configA = tk.StringVar(value="CAPPY_v1_3_A.yaml")
+        self.var_data_dirA = tk.StringVar(value="dataFile_9352")
 
-        # Auto-create default config so you never need to run `init` in a terminal.
-        cfgp = Path(self.var_config.get())
-        if not cfgp.exists():
-            try:
-                _atomic_write_text(cfgp, DEFAULT_YAML)
-            except Exception as ex:
-                messagebox.showerror('CAPPY', f'Failed to create default config {cfgp}: {ex}')
+        # Board B (ATS-9462, System ID 1)
+        self.var_configB = tk.StringVar(value="CAPPY_v1_3_B.yaml")
+        self.var_data_dirB = tk.StringVar(value="dataFile_9462")
 
+        # Auto-create default configs if missing (B is a copy of A with system_id=1 if possible)
+        self._ensure_default_configs()
+
+        # --- top config bar ---
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="Config YAML:").pack(side=tk.LEFT)
-        ttk.Entry(top, textvariable=self.var_config, width=52).pack(side=tk.LEFT, padx=(6,8))
-        ttk.Button(top, text="Browse…", command=self._pick_yaml).pack(side=tk.LEFT)
+        # Row 1: Board A
+        rowA = ttk.Frame(top)
+        rowA.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(rowA, text="Board A (ATS-9352) YAML:").pack(side=tk.LEFT)
+        ttk.Entry(rowA, textvariable=self.var_configA, width=44).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(rowA, text="Browse…", command=lambda: self._pick_yaml(self.var_configA)).pack(side=tk.LEFT)
 
-        ttk.Label(top, text="Data dir:").pack(side=tk.LEFT, padx=(16,4))
-        ttk.Entry(top, textvariable=self.var_data_dir, width=24).pack(side=tk.LEFT)
+        ttk.Label(rowA, text="Data dir:").pack(side=tk.LEFT, padx=(14, 4))
+        ttk.Entry(rowA, textvariable=self.var_data_dirA, width=22).pack(side=tk.LEFT)
 
-        ttk.Button(top, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
-        ttk.Button(top, text="Browse Archive", command=self._browse).pack(side=tk.LEFT)
-        ttk.Button(top, text="Secondary Board…", command=self._open_secondary_board).pack(side=tk.LEFT, padx=(8,0))
+        # Row 2: Board B
+        rowB = ttk.Frame(top)
+        rowB.pack(fill=tk.X)
+        ttk.Label(rowB, text="Board B (ATS-9462) YAML:").pack(side=tk.LEFT)
+        ttk.Entry(rowB, textvariable=self.var_configB, width=44).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(rowB, text="Browse…", command=lambda: self._pick_yaml(self.var_configB)).pack(side=tk.LEFT)
 
+        ttk.Label(rowB, text="Data dir:").pack(side=tk.LEFT, padx=(14, 4))
+        ttk.Entry(rowB, textvariable=self.var_data_dirB, width=22).pack(side=tk.LEFT)
+
+        # --- control bar ---
         ctrl = ttk.Frame(self, padding=8)
         ctrl.pack(fill=tk.X)
 
-        self.btn = ttk.Button(ctrl, text="Start Capture", command=self._toggle)
-        self.btn.pack(side=tk.LEFT)
-        ttk.Button(ctrl, text="Stop", command=self._stop).pack(side=tk.LEFT, padx=(8,0))
-        self.lbl = ttk.Label(ctrl, text="State: idle")
-        self.lbl.pack(side=tk.LEFT, padx=(16,0))
+        ttk.Button(ctrl, text="Open YAML A", command=lambda: self._open_yaml(self.var_configA)).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Open YAML B", command=lambda: self._open_yaml(self.var_configB)).pack(side=tk.LEFT, padx=(6, 14))
 
-        # Tabs (Overview + Log)
+        self.btn_armA = ttk.Button(ctrl, text="Start A", command=lambda: self._toggle("A"))
+        self.btn_armA.pack(side=tk.LEFT)
+        self.btn_armB = ttk.Button(ctrl, text="Start B", command=lambda: self._toggle("B"))
+        self.btn_armB.pack(side=tk.LEFT, padx=(6, 0))
+        self.btn_armBoth = ttk.Button(ctrl, text="Arm Both", command=self._arm_both)
+        self.btn_armBoth.pack(side=tk.LEFT, padx=(14, 0))
+
+        ttk.Button(ctrl, text="Stop All", command=self._stop_all).pack(side=tk.LEFT, padx=(14, 0))
+
+        self.lbl = ttk.Label(ctrl, text="State: idle")
+        self.lbl.pack(side=tk.LEFT, padx=(16, 0))
+
+        # --- tabs ---
         tabs = ttk.Notebook(self)
         tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.dashboard = LiveDashboard(tabs, self.var_data_dir)
-        tabs.add(self.dashboard, text="Overview")
+        # Overview (split-screen dashboards)
+        overview = ttk.Frame(tabs, padding=0)
+        tabs.add(overview, text="Overview")
 
+        pan = ttk.Panedwindow(overview, orient=tk.HORIZONTAL)
+        pan.pack(fill=tk.BOTH, expand=True)
+
+        left = ttk.Labelframe(pan, text="Board A (ATS-9352)", padding=6)
+        right = ttk.Labelframe(pan, text="Board B (ATS-9462)", padding=6)
+
+        self.dashboardA = LiveDashboard(left, self.var_data_dirA)
+        self.dashboardA.pack(fill=tk.BOTH, expand=True)
+        self.dashboardB = LiveDashboard(right, self.var_data_dirB)
+        self.dashboardB.pack(fill=tk.BOTH, expand=True)
+
+        pan.add(left, weight=1)
+        pan.add(right, weight=1)
+
+        # Archive (split-screen browsers)
+        arch = ttk.Frame(tabs, padding=0)
+        tabs.add(arch, text="Archive")
+
+        apan = ttk.Panedwindow(arch, orient=tk.HORIZONTAL)
+        apan.pack(fill=tk.BOTH, expand=True)
+
+        aleft = ttk.Labelframe(apan, text="Archive A", padding=6)
+        aright = ttk.Labelframe(apan, text="Archive B", padding=6)
+
+        self.archiveA = ArchiveBrowser(Path(self.var_data_dirA.get()), master=aleft)
+        self.archiveA.pack(fill=tk.BOTH, expand=True)
+        self.archiveB = ArchiveBrowser(Path(self.var_data_dirB.get()), master=aright)
+        self.archiveB.pack(fill=tk.BOTH, expand=True)
+
+        # Update archive roots when data-dir vars change
+        self.var_data_dirA.trace_add("write", lambda *_: self._reset_archive("A"))
+        self.var_data_dirB.trace_add("write", lambda *_: self._reset_archive("B"))
+
+        apan.add(aleft, weight=1)
+        apan.add(aright, weight=1)
+
+        # Log (combined)
         logbox = ttk.Frame(tabs, padding=6)
         tabs.add(logbox, text="Log")
-        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9))
+        self.log = tk.Text(
+            logbox, wrap="word", state=tk.DISABLED,
+            bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9)
+        )
         self.log.pack(fill=tk.BOTH, expand=True)
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.after(100, self._poll)
 
-    def _append(self, s: str):
-        self.log.configure(state=tk.NORMAL)
-        self.log.insert(tk.END, s + "\n")
-        self.log.see(tk.END)
-        self.log.configure(state=tk.DISABLED)
+    # ---------------- config helpers ----------------
+    def _ensure_default_configs(self):
+        # Create Board A config if missing
+        cfgA = Path(self.var_configA.get())
+        if not cfgA.exists():
+            try:
+                _atomic_write_text(cfgA, DEFAULT_YAML)
+            except Exception as ex:
+                messagebox.showerror('CAPPY', f'Failed to create default config {cfgA}: {ex}')
 
-    def _open_secondary_board(self):
-        """Open a second window for a second Alazar card (e.g., SystemId=1 ATS-9462).
+        # Create Board B config if missing: try to derive from A and set system_id=1
+        cfgB = Path(self.var_configB.get())
+        if not cfgB.exists():
+            try:
+                txt = Path(self.var_configA.get()).read_text(encoding="utf-8")
+            except Exception:
+                txt = DEFAULT_YAML
+            # Best-effort edit: set "system_id: 1" if present; otherwise append under board:
+            if re.search(r'^\s*system_id\s*:\s*\d+\s*$', txt, flags=re.M):
+                txt = re.sub(r'(^\s*system_id\s*:\s*)\d+(\s*$)', r'\g<1>1\2', txt, flags=re.M)
+            else:
+                # ensure "board:" section exists
+                if not re.search(r'^\s*board\s*:\s*$', txt, flags=re.M):
+                    txt = "board:\n  system_id: 1\n\n" + txt
+                else:
+                    txt = re.sub(r'(^\s*board\s*:\s*$)', r'\1\n  system_id: 1', txt, flags=re.M)
+            try:
+                _atomic_write_text(cfgB, txt)
+            except Exception as ex:
+                messagebox.showerror('CAPPY', f'Failed to create default config {cfgB}: {ex}')
 
-        This runs the same capture software (this script) in a separate subprocess using a
-        separate YAML + separate data directory, and shows a separate live dashboard + archive.
-        """
-        try:
-            win = SecondaryBoardWindow(self, self.script_path)
-            win.grab_set()  # modal-ish but still movable
-        except Exception as e:
-            messagebox.showerror('CAPPY', str(e))
-
-    def _pick_yaml(self):
+    def _pick_yaml(self, var: tk.StringVar):
         p = filedialog.askopenfilename(title="Select YAML", filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")])
         if p:
-            self.var_config.set(p)
+            var.set(p)
 
-    def _open_yaml(self):
-        p = Path(self.var_config.get()).expanduser()
+    def _open_yaml(self, var: tk.StringVar):
+        p = Path(var.get()).expanduser()
         if not p.exists():
             messagebox.showerror("Missing", f"Config not found:\n{p}")
             return
@@ -2578,35 +2602,70 @@ class LauncherGUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    def _browse(self):
+    def _reset_archive(self, which: str):
         try:
-            win = tk.Toplevel(self)
-            win.title('CAPPY Archive')
-            app = ArchiveBrowser(Path(self.var_data_dir.get()), master=win)
-            app.pack(fill=tk.BOTH, expand=True)
+            if which == "A":
+                parent = self.archiveA.master
+                self.archiveA.destroy()
+                self.archiveA = ArchiveBrowser(Path(self.var_data_dirA.get()), master=parent)
+                self.archiveA.pack(fill=tk.BOTH, expand=True)
+            else:
+                parent = self.archiveB.master
+                self.archiveB.destroy()
+                self.archiveB = ArchiveBrowser(Path(self.var_data_dirB.get()), master=parent)
+                self.archiveB.pack(fill=tk.BOTH, expand=True)
         except Exception as e:
-            messagebox.showerror('CAPPY', str(e))
+            self._append(f"[GUI] archive reset {which} failed: {e}")
 
-    def _toggle(self):
-        if self.proc is None:
-            self._start()
+    # ---------------- capture control ----------------
+    def _toggle(self, which: str):
+        if which == "A":
+            if self.procA is None:
+                self._start("A")
+            else:
+                self._stop("A")
         else:
-            self._stop()
+            if self.procB is None:
+                self._start("B")
+            else:
+                self._stop("B")
 
-    def _start(self):
+    def _arm_both(self):
+        # Arm both "as simultaneously as we can" from a single-threaded GUI.
+        # Start A then B immediately (order doesn't materially matter for external trigger cases).
+        if self.procA is None:
+            okA = self._start("A", quiet=True)
+        else:
+            okA = True
+        if self.procB is None:
+            okB = self._start("B", quiet=True)
+        else:
+            okB = True
+        if okA and okB:
+            self._append("[GUI] Arm Both: started A + B")
+        self._update_state_label()
+
+    def _start(self, which: str, quiet: bool=False) -> bool:
         import subprocess
-        if self.proc is not None:
-            return
-        cfg_path = Path(self.var_config.get()).expanduser()
+        if which == "A":
+            if self.procA is not None:
+                return True
+            cfg_path = Path(self.var_configA.get()).expanduser()
+        else:
+            if self.procB is not None:
+                return True
+            cfg_path = Path(self.var_configB.get()).expanduser()
+
         if not cfg_path.exists():
-            messagebox.showerror("Missing", f"Config not found:\n{cfg_path}")
-            return
+            if not quiet:
+                messagebox.showerror("Missing", f"Config not found:\n{cfg_path}")
+            return False
 
         cmd = [sys.executable, str(self.script_path), "capture", "--config", str(cfg_path)]
-        self._append("RUN: " + " ".join(cmd))
+        self._append(("RUN[A]: " if which=="A" else "RUN[B]: ") + " ".join(cmd))
 
         try:
-            self.proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -2614,76 +2673,114 @@ class LauncherGUI(tk.Tk):
                 bufsize=1,
                 cwd=str(self.script_path.parent),
             )
-            self.pump = _ProcLogPump(self.proc)
+            pump = _ProcLogPump(proc)
         except Exception as e:
-            self.proc = None
-            self.pump = None
-            messagebox.showerror("CAPPY", f"Failed to start capture:\n{e}")
-            return
+            if not quiet:
+                messagebox.showerror("CAPPY", f"Failed to start capture {which}:\n{e}")
+            return False
 
-        self.lbl.config(text="State: capturing")
-        self.btn.config(text="Stop Capture")
+        if which == "A":
+            self.procA, self.pumpA = proc, pump
+        else:
+            self.procB, self.pumpB = proc, pump
 
-    def _stop(self):
-        if self.proc is None:
+        self._update_buttons()
+        self._update_state_label()
+        return True
+
+    def _stop(self, which: str):
+        proc = self.procA if which=="A" else self.procB
+        if proc is None:
             return
         try:
             try:
-                self.proc.send_signal(signal.SIGINT)
-                self._append("[GUI] sent SIGINT")
+                proc.send_signal(signal.SIGINT)
+                self._append(f"[GUI] sent SIGINT to {which}")
             except Exception:
-                self.proc.terminate()
-                self._append("[GUI] sent terminate")
+                proc.terminate()
+                self._append(f"[GUI] sent terminate to {which}")
         except Exception as e:
-            self._append("[GUI] stop failed: " + str(e))
+            self._append(f"[GUI] stop {which} failed: {e}")
 
         if self._kill_after_id is None:
             self._kill_after_id = self.after(2500, self._kill_if_running)
 
+    def _stop_all(self):
+        self._stop("A")
+        self._stop("B")
+
     def _kill_if_running(self):
         self._kill_after_id = None
-        if self.proc is None:
-            return
-        try:
-            if self.proc.poll() is None:
-                self.proc.kill()
-                self._append("[GUI] forced kill")
-        except Exception as e:
-            self._append("[GUI] kill failed: " + str(e))
+        for which, proc in (("A", self.procA), ("B", self.procB)):
+            if proc is None:
+                continue
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    self._append(f"[GUI] forced kill {which}")
+            except Exception as e:
+                self._append(f"[GUI] kill {which} failed: {e}")
+
+    def _update_buttons(self):
+        self.btn_armA.config(text=("Stop A" if self.procA is not None else "Start A"))
+        self.btn_armB.config(text=("Stop B" if self.procB is not None else "Start B"))
+
+    def _update_state_label(self):
+        a = "ON" if self.procA is not None else "OFF"
+        b = "ON" if self.procB is not None else "OFF"
+        self.lbl.config(text=f"State: A {a}   B {b}")
+
+    def _append(self, s: str):
+        self.log.configure(state=tk.NORMAL)
+        self.log.insert(tk.END, s + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    def _poll(self):
+        # Drain log output
+        if self.pumpA is not None:
+            for ln in self.pumpA.drain(max_lines=250):
+                self._append("[A] " + ln)
+        if self.pumpB is not None:
+            for ln in self.pumpB.drain(max_lines=250):
+                self._append("[B] " + ln)
+
+        # Watch for exits
+        for which in ("A", "B"):
+            proc = self.procA if which=="A" else self.procB
+            pump = self.pumpA if which=="A" else self.pumpB
+            if proc is None:
+                continue
+            rc = proc.poll()
+            if rc is not None:
+                try:
+                    if pump is not None:
+                        for ln in pump.drain(max_lines=10000):
+                            self._append(f"[{which}] " + ln)
+                        pump.stop()
+                except Exception:
+                    pass
+                self._append(f"[GUI] DAQ {which} exited rc={rc}")
+                if which == "A":
+                    self.procA = None
+                    self.pumpA = None
+                else:
+                    self.procB = None
+                    self.pumpB = None
+
+        self._update_buttons()
+        self._update_state_label()
+        self.after(100, self._poll)
 
     def _on_close(self):
         try:
-            if self.proc is not None and self.proc.poll() is None:
-                self._stop()
+            if (self.procA is not None and self.procA.poll() is None) or (self.procB is not None and self.procB.poll() is None):
+                self._stop_all()
                 self.after(600, self.destroy)
                 return
         except Exception:
             pass
         self.destroy()
-
-
-    def _poll(self):
-        if self.pump is not None:
-            for ln in self.pump.drain(max_lines=400):
-                self._append(ln)
-
-        if self.proc is not None:
-            rc = self.proc.poll()
-            if rc is not None:
-                try:
-                    if self.pump is not None:
-                        for ln in self.pump.drain(max_lines=10000):
-                            self._append(ln)
-                        self.pump.stop()
-                except Exception:
-                    pass
-                self._append(f"[GUI] DAQ exited rc={rc}")
-                self.proc = None
-                self.pump = None
-                self.lbl.config(text="State: idle")
-                self.btn.config(text="Start Capture")
-
-        self.after(100, self._poll)
 
 
 def run_browse(data_dir: Path) -> int:
@@ -2733,4 +2830,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
