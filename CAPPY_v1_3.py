@@ -2456,11 +2456,11 @@ def _redraw(self, snap: dict):
         self.ax_int.set_title("Integration: waiting for data…", color='white')
         self.ax_int.set_xlim(0, 1)
 
-    # draw_idle coalesces redraws -> smoother UI
-    try:
-        self.canvas.draw_idle()
-    except Exception:
-        self.canvas.draw()
+        # draw_idle coalesces redraws -> smoother UI
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            self.canvas.draw()
 
     def _tick(self):
         snap = self._read_status()
