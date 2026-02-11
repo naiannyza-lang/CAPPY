@@ -2380,6 +2380,7 @@ class LiveDashboard(ttk.Frame):
 
         self._started_unix: Optional[float] = None
         self._last_seen_seq: int = 0
+        self._sample_rate_hz: float = 180e6  # Default to 180 MS/s for ATS-9462
 
         # --- top stats ---
         stats = ttk.Frame(self)
@@ -2573,20 +2574,24 @@ class LiveDashboard(ttk.Frame):
 
         # --- Channel A waveform (top) - Optimized rendering ---
         if self._streamA.size > 1:
+            # Convert samples to time (microseconds)
+            dt_us = 1.0 / self._sample_rate_hz * 1e6  # time per sample in microseconds
+            
             # Use downsampled view if stream is very large for better performance
             if self._streamA.size > 50000:
                 # Decimate for display only - use every Nth point
                 step = max(1, self._streamA.size // 20000)
-                x_view = np.arange(0, self._streamA.size, step)
+                x_indices = np.arange(0, self._streamA.size, step)
+                x_view = x_indices * dt_us  # Convert to microseconds
                 y_view = self._streamA[::step]
             else:
-                x_view = np.arange(self._streamA.size)
+                x_view = np.arange(self._streamA.size) * dt_us  # Convert to microseconds
                 y_view = self._streamA
             
             # Plot with reduced antialiasing for speed
             line_a, = self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True, rasterized=True)
             self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK, fontsize=10)
-            self.ax_wfA.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfA.set_xlabel("Time (µs)", color='white', fontsize=9)
             self.ax_wfA.tick_params(colors='white', labelsize=9)
             self.ax_wfA.spines['left'].set_color(NEON_PINK)
             self.ax_wfA.spines['bottom'].set_color('white')
@@ -2612,7 +2617,7 @@ class LiveDashboard(ttk.Frame):
         else:
             self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
             self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK, fontsize=10)
-            self.ax_wfA.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfA.set_xlabel("Time (µs)", color='white', fontsize=9)
             self.ax_wfA.tick_params(colors='white', labelsize=9)
             self.ax_wfA.spines['left'].set_color(NEON_PINK)
             self.ax_wfA.spines['bottom'].set_color('white')
@@ -2622,18 +2627,22 @@ class LiveDashboard(ttk.Frame):
 
         # --- Channel B waveform (middle) - Optimized rendering ---
         if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+            # Convert samples to time (microseconds)
+            dt_us = 1.0 / self._sample_rate_hz * 1e6  # time per sample in microseconds
+            
             # Use downsampled view if stream is very large
             if self._streamB.size > 50000:
                 step = max(1, self._streamB.size // 20000)
-                xb_view = np.arange(0, self._streamB.size, step)
+                xb_indices = np.arange(0, self._streamB.size, step)
+                xb_view = xb_indices * dt_us  # Convert to microseconds
                 yb_view = self._streamB[::step]
             else:
-                xb_view = np.arange(self._streamB.size)
+                xb_view = np.arange(self._streamB.size) * dt_us  # Convert to microseconds
                 yb_view = self._streamB
             
             line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN, fontsize=10)
-            self.ax_wfB.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfB.set_xlabel("Time (µs)", color='white', fontsize=9)
             self.ax_wfB.tick_params(colors='white', labelsize=9)
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
@@ -2659,7 +2668,7 @@ class LiveDashboard(ttk.Frame):
         else:
             self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN, fontsize=10)
-            self.ax_wfB.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfB.set_xlabel("Time (µs)", color='white', fontsize=9)
             self.ax_wfB.tick_params(colors='white', labelsize=9)
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
@@ -2777,6 +2786,13 @@ class LiveDashboard(ttk.Frame):
             bt = snap.get("board_temp_c", None)
             self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
 
+            # Capture sample rate for time axis calculations
+            if 'sample_rate_hz' in snap:
+                try:
+                    self._sample_rate_hz = float(snap['sample_rate_hz'])
+                except:
+                    pass
+
             self._open_ring_from_status(snap)
             self._append_point(snap)
             # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
@@ -2790,6 +2806,17 @@ class LiveDashboard(ttk.Frame):
                     break
                 if wfA is not None:
                     try:
+                        # Remove per-waveform DC offset before concatenating to prevent steps
+                        # Calculate the DC offset from the last portion of existing stream
+                        # and the first portion of new waveform to smooth the transition
+                        if self._streamA.size > 64:
+                            # Get average of last 32 samples from existing stream
+                            tail_avg = np.mean(self._streamA[-32:])
+                            # Get average of first 32 samples from new waveform
+                            head_avg = np.mean(wfA[:min(32, wfA.size)])
+                            # Apply offset to new waveform to match existing stream
+                            wfA = wfA - head_avg + tail_avg
+                        
                         self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
                         if self._streamA.size > self._stream_window:
                             self._streamA = self._streamA[-self._stream_window:]
@@ -2797,6 +2824,12 @@ class LiveDashboard(ttk.Frame):
                         pass
                 if wfB is not None:
                     try:
+                        # Same DC continuity correction for channel B
+                        if self._streamB.size > 64:
+                            tail_avg = np.mean(self._streamB[-32:])
+                            head_avg = np.mean(wfB[:min(32, wfB.size)])
+                            wfB = wfB - head_avg + tail_avg
+                        
                         self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
                         if self._streamB.size > self._stream_window:
                             self._streamB = self._streamB[-self._stream_window:]
