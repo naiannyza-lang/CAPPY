@@ -1134,13 +1134,14 @@ def _codes_to_volts_u16(u16: np.ndarray, vpp: float, apply_offset_correction: bo
     # Standard bipolar conversion: 0V = code 32768
     volts = (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
     
-    # Optional: Remove DC offset for cleaner plots
-    # This removes any constant offset that might cause "steps" in the display
-    if apply_offset_correction and volts.size > 16:
-        # Use first 10% of samples to estimate DC offset
-        # (assumes trigger doesn't occur in first 10%)
-        n_baseline = max(8, min(int(volts.size * 0.1), 128))
-        dc_offset = np.median(volts[:n_baseline])
+    # FIX: For short records (individual triggered events), DC offset correction
+    # creates artificial discontinuities between records. Only apply for long
+    # continuous acquisitions where we can reliably estimate a global DC offset.
+    # For triggered mode with short records, it's better to keep raw ADC output.
+    if apply_offset_correction and volts.size > 1024:
+        # Only apply to long continuous waveforms (>1024 samples)
+        # Use median of entire waveform for global DC offset
+        dc_offset = np.median(volts)
         volts = volts - dc_offset
     
     return volts
@@ -1594,6 +1595,24 @@ def run_capture(cfg_path: Path) -> int:
             if ch_count == 2:
                 A = raw[0::2].reshape(rpb, spr)
                 B = raw[1::2].reshape(rpb, spr)
+                
+                # FIX: Convert entire channel buffer to volts BEFORE processing records
+                # This prevents per-record DC offset issues that create discontinuities
+                if store_volts:
+                    A_volts = np.zeros_like(A, dtype=np.float32)
+                    B_volts = np.zeros_like(B, dtype=np.float32)
+                    for r in range(rpb):
+                        # Convert without per-record DC offset correction
+                        A_volts[r] = (A[r].astype(np.float32) - 32768.0) * (float(vppA) / 65536.0)
+                        B_volts[r] = (B[r].astype(np.float32) - 32768.0) * (float(vppB) / 65536.0)
+                    
+                    # Apply global DC offset correction to entire buffer if enabled
+                    if dc_offset_correction:
+                        dc_A = np.median(A_volts)
+                        dc_B = np.median(B_volts)
+                        A_volts -= dc_A
+                        B_volts -= dc_B
+                
                 areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
                 areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB)
                 for r in range(rpb):
@@ -1607,8 +1626,12 @@ def run_capture(cfg_path: Path) -> int:
                         area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]), baseline_B_V=float(baseB[r]),
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
-                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, apply_offset_correction=dc_offset_correction) if store_volts else A[r].astype(np.float32)
-                        wfB_V = _codes_to_volts_u16(B[r], vpp=vppB, apply_offset_correction=dc_offset_correction) if store_volts else B[r].astype(np.float32)
+                        if store_volts:
+                            wfA_V = A_volts[r]
+                            wfB_V = B_volts[r]
+                        else:
+                            wfA_V = A[r].astype(np.float32)
+                            wfB_V = B[r].astype(np.float32)
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -1619,6 +1642,17 @@ def run_capture(cfg_path: Path) -> int:
                         )
             else:
                 A = raw.reshape(rpb, spr)
+                
+                # FIX: Convert entire channel buffer to volts BEFORE processing records
+                if store_volts:
+                    A_volts = np.zeros_like(A, dtype=np.float32)
+                    for r in range(rpb):
+                        A_volts[r] = (A[r].astype(np.float32) - 32768.0) * (float(vppA) / 65536.0)
+                    
+                    if dc_offset_correction:
+                        dc_A = np.median(A_volts)
+                        A_volts -= dc_A
+                
                 areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
                 for r in range(rpb):
                     rec_g = global_rec + r
@@ -1631,7 +1665,10 @@ def run_capture(cfg_path: Path) -> int:
                         area_B_Vs=0.0, peak_B_V=0.0, baseline_B_V=0.0,
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
-                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, apply_offset_correction=dc_offset_correction) if store_volts else A[r].astype(np.float32)
+                        if store_volts:
+                            wfA_V = A_volts[r]
+                        else:
+                            wfA_V = A[r].astype(np.float32)
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -1676,12 +1713,14 @@ def run_capture(cfg_path: Path) -> int:
             # Write EVERY buffer's representative waveform into the live ring for smooth GUI playback
             try:
                 # Use record 0 as representative; convert to volts with correct per-channel Vpp
-                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA, apply_offset_correction=dc_offset_correction)
-                wfB_live = None
-                chmask_live = 1
-                if ch_count == 2:
-                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB, apply_offset_correction=dc_offset_correction)
-                    chmask_live = 3
+                # FIX: Use the already-converted volts if available
+                if store_volts and 'A_volts' in locals():
+                    wfA_live = A_volts[0]
+                    wfB_live = B_volts[0] if ch_count == 2 else None
+                else:
+                    wfA_live = _codes_to_volts_u16(A[0], vpp=vppA, apply_offset_correction=False)
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB, apply_offset_correction=False) if ch_count == 2 else None
+                chmask_live = 3 if ch_count == 2 else 1
                 ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
             except Exception:
                 pass
@@ -2806,10 +2845,16 @@ class LiveDashboard(ttk.Frame):
                     break
                 if wfA is not None:
                     try:
-                        # FIX: Don't apply DC stitching correction between records
-                        # Each record is a separate triggered acquisition with potential time gaps
-                        # The original stitching code was creating artificial drift by forcing
-                        # continuity between discontinuous records
+                        # Remove per-waveform DC offset before concatenating to prevent steps
+                        # Calculate the DC offset from the last portion of existing stream
+                        # and the first portion of new waveform to smooth the transition
+                        if self._streamA.size > 64:
+                            # Get average of last 32 samples from existing stream
+                            tail_avg = np.mean(self._streamA[-32:])
+                            # Get average of first 32 samples from new waveform
+                            head_avg = np.mean(wfA[:min(32, wfA.size)])
+                            # Apply offset to new waveform to match existing stream
+                            wfA = wfA - head_avg + tail_avg
                         
                         self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
                         if self._streamA.size > self._stream_window:
@@ -2818,7 +2863,11 @@ class LiveDashboard(ttk.Frame):
                         pass
                 if wfB is not None:
                     try:
-                        # FIX: Don't apply DC stitching correction between records
+                        # Same DC continuity correction for channel B
+                        if self._streamB.size > 64:
+                            tail_avg = np.mean(self._streamB[-32:])
+                            head_avg = np.mean(wfB[:min(32, wfB.size)])
+                            wfB = wfB - head_avg + tail_avg
                         
                         self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
                         if self._streamB.size > self._stream_window:
