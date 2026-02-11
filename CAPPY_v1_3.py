@@ -598,8 +598,10 @@ class WaveBinSqliteStore:
 
               area_A_Vs REAL,
               peak_A_V REAL,
+              baseline_A_V REAL,
               area_B_Vs REAL,
-              peak_B_V REAL
+              peak_B_V REAL,
+              baseline_B_V REAL
             );
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_snips_session_time ON snips(session_id, timestamp_ns);")
@@ -615,6 +617,8 @@ class WaveBinSqliteStore:
                 "file_B": "ALTER TABLE snips ADD COLUMN file_B TEXT",
                 "offset_B": "ALTER TABLE snips ADD COLUMN offset_B INTEGER",
                 "nbytes_B": "ALTER TABLE snips ADD COLUMN nbytes_B INTEGER",
+                "baseline_A_V": "ALTER TABLE snips ADD COLUMN baseline_A_V REAL",
+                "baseline_B_V": "ALTER TABLE snips ADD COLUMN baseline_B_V REAL",
             }
             for c, ddl in need.items():
                 if c not in cols:
@@ -676,7 +680,8 @@ class WaveBinSqliteStore:
 
     def append(self, *, ts_ns: int, buffer_index: int, record_in_buffer: int, record_global: int,
                channels_mask: str, sample_rate_hz: float, wfA_V: np.ndarray, wfB_V: Optional[np.ndarray],
-               area_A_Vs: float, peak_A_V: float, area_B_Vs: float, peak_B_V: float):
+               area_A_Vs: float, peak_A_V: float, area_B_Vs: float, peak_B_V: float,
+               baseline_A_V: float = 0.0, baseline_B_V: float = 0.0):
         self._maybe_roll(ts_ns)
         assert self._fhA is not None and self._fhB is not None
 
@@ -714,8 +719,8 @@ class WaveBinSqliteStore:
 
         self.conn.execute(
             "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
-            "file,offset_bytes,nbytes,file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "file,offset_bytes,nbytes,file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.session_id, int(ts_ns), int(buffer_index), int(record_in_buffer), int(record_global),
              str(channels_mask), float(sample_rate_hz), int(wfA.shape[0]), int(n_channels),
              file_legacy, int(off_legacy), int(nbytes_legacy),
@@ -723,7 +728,7 @@ class WaveBinSqliteStore:
              (fileB if wfB_V is not None else None),
              (int(offB) if wfB_V is not None else None),
              (int(len(payloadB)) if wfB_V is not None else None),
-             float(area_A_Vs), float(peak_A_V), float(area_B_Vs), float(peak_B_V))
+             float(area_A_Vs), float(peak_A_V), float(baseline_A_V), float(area_B_Vs), float(peak_B_V), float(baseline_B_V))
         )
 
         self._rows_since_commit += 1
@@ -1460,6 +1465,7 @@ def run_capture(cfg_path: Path) -> int:
                             wfA_V=wfA_V, wfB_V=wfB_V,
                             area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
                             area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]),
+                            baseline_A_V=float(baseA[r]), baseline_B_V=float(baseB[r]),
                         )
             else:
                 A = raw.reshape(rpb, spr)
@@ -1482,6 +1488,7 @@ def run_capture(cfg_path: Path) -> int:
                             wfA_V=wfA_V, wfB_V=None,
                             area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
                             area_B_Vs=0.0, peak_B_V=0.0,
+                            baseline_A_V=float(baseA[r]), baseline_B_V=0.0,
                         )
 
             # Per-buffer summaries for live GUI plotting
@@ -1940,20 +1947,23 @@ class ArchiveBrowser(ttk.Frame):
                         "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,"
                         "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
-                        "area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                        "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
                         "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
                         conn,
                         params=(sid,),
                     )
                 except Exception:
-                    # Legacy DB schema (no channel-separated columns)
-                    self.snips = pd.read_sql_query(
-                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
-                        "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
-                        conn,
-                        params=(sid,),
-                    )
+                    # Legacy DB schema (no channel-separated columns or baseline columns)
+                    try:
+                        self.snips = pd.read_sql_query(
+                            "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                            "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                            "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                            conn,
+                            params=(sid,),
+                        )
+                    except Exception:
+                        pass
                 conn.close()
                 self._snip_db_dir = ddir
                 break
@@ -2008,6 +2018,13 @@ class ArchiveBrowser(ttk.Frame):
         # Get baseline values (mean voltage in baseline window, already computed during acquisition)
         baseline_A = float(r.get("baseline_A_V", 0.0))
         baseline_B = float(r.get("baseline_B_V", 0.0))
+        
+        # Fallback: If baseline values are missing (old data), calculate from waveform
+        # Using first 64 samples as baseline window (matching default config)
+        if baseline_A == 0.0 and len(wa) >= 64:
+            baseline_A = float(np.mean(wa[:64]))
+        if baseline_B == 0.0 and wb is not None and len(wb) >= 64:
+            baseline_B = float(np.mean(wb[:64]))
         
         # Apply baseline subtraction to waveforms for display
         wa_bs = wa - baseline_A
