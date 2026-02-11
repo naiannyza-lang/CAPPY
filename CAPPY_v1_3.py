@@ -1125,71 +1125,106 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
     """
     Read FPGA/ADC temperatures via AlazarGetParameter.
 
-    For ATS9352-class PCIe digitizers, the ATS-SDK exposes temperature parameters that are
-    retrieved with AlazarGetParameter(handle, channel, parameter, long*).
+    Notes:
+      - Different driver/firmware generations have returned these values either as:
+          (a) a 32-bit IEEE754 float encoded in the low 32 bits of the returned long, or
+          (b) an integer temperature in degrees C stored in the returned long.
+      - Some wrappers expose the handle under different attribute names.
 
-    Practical reality across driver versions:
-      * Many drivers return the temperature directly as an integer number of °C in retValue.
-      * Some releases/notes mention historical issues with GET_FPGA_TEMPERATURE returning bad values on ATS9352,
-        so you may see out-of-range readings if the driver/firmware combo is affected.
-
-    This helper:
-      1) Reads retValue as a signed long and uses it as °C if it looks sane.
-      2) If it looks insane, it attempts to interpret the low 32 bits as an IEEE-754 float (legacy/variant encodings).
+    This function tries multiple decoding strategies and records diagnostics to help
+    understand why a particular system returns None.
     """
-    import ctypes
-    import math
-    import struct
+    import ctypes, struct, math
 
     out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
 
-    if not ATS_AVAILABLE or ats is None:
-        return out
+    # Parameter IDs from ATS-SDK docs
+    GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
+    GET_ADC_TEMPERATURE  = getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104)
 
-    GET_FPGA_TEMPERATURE = int(getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080))
-    GET_ADC_TEMPERATURE  = int(getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104))
+    # Success code is typically 512 (ApiSuccess). Some wrappers may return 0.
+    API_SUCCESS = getattr(ats, "ApiSuccess", 512)
 
-    API_SUCCESS = int(getattr(ats, "ApiSuccess", 512))  # ApiSuccess is 512 in ATS-SDK
+    def _get_handle():
+        for name in ("handle", "boardHandle", "_handle", "_board_handle", "hBoard", "_hBoard"):
+            h = getattr(board, name, None)
+            if h is not None:
+                return h
+        return None
 
-    def _ok(rc: int) -> bool:
-        return int(rc) in (0, API_SUCCESS)
+    def _decode_long_as_temp(val_long: int) -> Optional[float]:
+        # Strategy 1: treat as integer degrees C
+        if -40 <= val_long <= 150:
+            return float(val_long)
 
-    def _sanitize(x: float) -> Optional[float]:
-        try:
-            xf = float(x)
-        except Exception:
-            return None
-        if not math.isfinite(xf):
-            return None
-        if xf < -50.0 or xf > 200.0:
-            return None
-        return xf
+        # Strategy 2: treat low 32 bits as float
+        u32 = val_long & 0xFFFFFFFF
+        f = struct.unpack("<f", struct.pack("<I", u32))[0]
+        if math.isfinite(f) and (-40.0 <= f <= 150.0):
+            return float(f)
 
-    def _decode_temp(ret_long: int) -> Optional[float]:
-        v1 = _sanitize(float(ret_long))
-        if v1 is not None:
-            return v1
-        try:
-            u32 = int(ret_long) & 0xFFFFFFFF
-            v2 = struct.unpack("<f", struct.pack("<I", u32))[0]
-            return _sanitize(v2)
-        except Exception:
-            return None
+        return None
 
-    def _get(param: int) -> Optional[float]:
-        try:
-            ret = ctypes.c_long(0)
-            rc = ats.AlazarGetParameter(board.handle, 0, int(param), ctypes.byref(ret))
-            if not _ok(rc):
-                return None
-            return _decode_temp(int(ret.value))
-        except Exception:
-            return None
+    def _get(param) -> tuple[Optional[float], dict]:
+        diag = {"param": int(param), "attempts": []}
+        h = _get_handle()
+        if h is None:
+            diag["error"] = "no board handle attribute found"
+            return None, diag
 
-    out["fpga"] = _get(GET_FPGA_TEMPERATURE)
-    out["adc"]  = _get(GET_ADC_TEMPERATURE)
+        # Channel argument is ignored for many board-level parameters, but try a few.
+        chan_candidates = [0]
+        for nm in ("CHANNEL_ALL", "CHANNEL_A"):
+            if hasattr(ats, nm):
+                try:
+                    chan_candidates.append(int(getattr(ats, nm)))
+                except Exception:
+                    pass
+        # Deduplicate while preserving order
+        seen = set()
+        chan_candidates = [c for c in chan_candidates if not (c in seen or seen.add(c))]
+
+        for ch in chan_candidates:
+            ret_long = ctypes.c_long(0)
+            try:
+                rc = ats.AlazarGetParameter(h, int(ch), int(param), ctypes.byref(ret_long))
+            except Exception as e:
+                diag["attempts"].append({"ch": int(ch), "exception": repr(e)})
+                continue
+
+            attempt = {"ch": int(ch), "rc": int(rc), "raw_long": int(ret_long.value)}
+            # Try to map rc to text if possible (helps debugging)
+            try:
+                if hasattr(ats, "AlazarErrorToText"):
+                    attempt["rc_text"] = str(ats.AlazarErrorToText(int(rc)))
+            except Exception:
+                pass
+
+            if rc in (0, API_SUCCESS):
+                temp = _decode_long_as_temp(int(ret_long.value))
+                attempt["decoded_c"] = temp
+                diag["attempts"].append(attempt)
+                if temp is not None:
+                    return temp, diag
+            else:
+                diag["attempts"].append(attempt)
+
+        return None, diag
+
+    fpga, d_fpga = _get(GET_FPGA_TEMPERATURE)
+    adc,  d_adc  = _get(GET_ADC_TEMPERATURE)
+
+    out["fpga"] = fpga
+    out["adc"]  = adc
+
+    # Attach diagnostics for later inspection (non-fatal if user ignores it)
+    out["diag"] = {"fpga": d_fpga, "adc": d_adc}
+    try:
+        setattr(board, "_last_temp_diag", out["diag"])
+    except Exception:
+        pass
+
     return out
-
 def channels_mask_to_str(mask: int) -> str:
     parts = []
     if mask & ats.CHANNEL_A:
@@ -1575,7 +1610,7 @@ def run_capture(cfg_path: Path) -> int:
                             bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
                         except Exception:
                             bt = None
-                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt)
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
                         notifier.emit_now()
                 else:
                     notifier.update(
@@ -1588,7 +1623,7 @@ def run_capture(cfg_path: Path) -> int:
                             bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
                         except Exception:
                             bt = None
-                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt)
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
                         notifier.emit_now()
             except Exception:
                 pass
