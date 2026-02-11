@@ -64,10 +64,6 @@ DEFAULT_YAML = r"""# =========================
 # Use *samples* where possible
 # =========================
 
-board:
-  system_id: 2
-  board_id: 1
-
 clock:
   source: INTERNAL_CLOCK
   sample_rate_msps: 250.0
@@ -107,7 +103,7 @@ timing:
   bunch_spacing_samples: 424      # adjust to your bunch spacing
 
 acquisition:
-  channels_mask: CHANNEL_A        # CHANNEL_A or CHANNEL_A|CHANNEL_B
+  channels_mask: CHANNEL_A|CHANNEL_B
   pre_trigger_samples: 0
   post_trigger_samples: 256       # full record = pre + post
   records_per_buffer: 128
@@ -123,10 +119,10 @@ waveforms:
   enable: true
   full_record: true
   mode: every_n
-  every_n: 20000
+  every_n: 1
   threshold_integral_Vs: 0.0
   threshold_peak_V: 0.0
-  max_waveforms_per_sec: 50
+  max_waveforms_per_sec: 100000
   store_volts: true
 
 storage:
@@ -1295,10 +1291,7 @@ def run_capture(cfg_path: Path) -> int:
     )
     store_volts = bool(waves.get("store_volts", True))
 
-    board_cfg = cfg.get('board', {}) if isinstance(cfg, dict) else {}
-    system_id = int(board_cfg.get('system_id', 2))
-    board_id = int(board_cfg.get('board_id', 1))
-    board = ats.Board(systemId=system_id, boardId=board_id)
+    board = ats.Board(systemId=2, boardId=1)
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
@@ -1403,7 +1396,12 @@ def run_capture(cfg_path: Path) -> int:
             try:
                 board.waitAsyncBufferComplete(buf.addr, wait_timeout_ms)
             except Exception as ex:
-                if "ApiWaitTimeout" in str(ex):
+                s_ex = str(ex)
+                # Normal stop path: occurs after AbortAsyncRead / SIGINT
+                if ("ApiWaitCanceled" in s_ex) or ("ApiWaitCancelled" in s_ex):
+                    break
+                if "ApiWaitTimeout" in s_ex:
+
                     timeout_count += 1
                     ago_s = (time.time_ns() - last_buffer_ns) / 1e9
                     notifier.update(state="waiting_for_trigger", time=time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1605,13 +1603,6 @@ class ArchiveBrowser(ttk.Frame):
         self._build()
         self._refresh()
 
-    
-    # --- Back-compat aliases (older UI code may call these without underscore) ---
-    def on_session(self, *args, **kwargs):
-        return self._on_session(*args, **kwargs)
-
-    def on_snip(self, *args, **kwargs):
-        return self._on_snip(*args, **kwargs)
     def _build(self):
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.BOTH, expand=True)
@@ -1859,60 +1850,60 @@ class ArchiveBrowser(ttk.Frame):
 
 
 
-    def _seek_mmss(self):
-        """Jump to the snip closest to MM:SS within the currently selected date/hour."""
-        if getattr(self, "_snips_view", pd.DataFrame()).empty:
-            return
-        txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
-        if not txt:
-            return
-        # Parse MM:SS (allow SS or M:SS)
-        mm = 0
-        ss = 0
-        try:
-            if ":" in txt:
-                a, b = txt.split(":", 1)
-                mm = int(a)
-                ss = int(b)
-            else:
-                ss = int(txt)
-        except Exception:
-            messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
-            return
-        if ss < 0 or ss > 59 or mm < 0:
-            messagebox.showerror("Invalid time", "Seconds must be 0–59.")
-            return
-        if self._sel_date is None or self._sel_hour is None:
-            return
-        try:
-            # Build a local-time target and compare in epoch ns
-            y, m, d = map(int, str(self._sel_date).split("-"))
-            hh = int(self._sel_hour)
-            target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
-            target_ns = int(target_local.timestamp() * 1e9)
-        except Exception:
-            return
+def _seek_mmss(self):
+    """Jump to the snip closest to MM:SS within the currently selected date/hour."""
+    if getattr(self, "_snips_view", pd.DataFrame()).empty:
+        return
+    txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
+    if not txt:
+        return
+    # Parse MM:SS (allow SS or M:SS)
+    mm = 0
+    ss = 0
+    try:
+        if ":" in txt:
+            a, b = txt.split(":", 1)
+            mm = int(a)
+            ss = int(b)
+        else:
+            ss = int(txt)
+    except Exception:
+        messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
+        return
+    if ss < 0 or ss > 59 or mm < 0:
+        messagebox.showerror("Invalid time", "Seconds must be 0–59.")
+        return
+    if self._sel_date is None or self._sel_hour is None:
+        return
+    try:
+        # Build a local-time target and compare in epoch ns
+        y, m, d = map(int, str(self._sel_date).split("-"))
+        hh = int(self._sel_hour)
+        target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
+        target_ns = int(target_local.timestamp() * 1e9)
+    except Exception:
+        return
 
-        df = self._snips_view.copy()
-        # Find nearest timestamp
-        try:
-            idx_min = (df["timestamp_ns"].astype("int64") - target_ns).abs().idxmin()
-        except Exception:
-            return
-        # Position in the currently rendered order
-        try:
-            pos = df.reset_index().index[df.reset_index()["index"] == idx_min][0]
-        except Exception:
-            # fallback: brute force
-            pos = 0
-        self.wlist.selection_clear(0, tk.END)
-        self.wlist.selection_set(pos)
-        self.wlist.see(pos)
-        # trigger display
-        try:
-            self._on_snip()
-        except Exception:
-            pass
+    df = self._snips_view.copy()
+    # Find nearest timestamp
+    try:
+        idx_min = (df["timestamp_ns"].astype("int64") - target_ns).abs().idxmin()
+    except Exception:
+        return
+    # Position in the currently rendered order
+    try:
+        pos = df.reset_index().index[df.reset_index()["index"] == idx_min][0]
+    except Exception:
+        # fallback: brute force
+        pos = 0
+    self.wlist.selection_clear(0, tk.END)
+    self.wlist.selection_set(pos)
+    self.wlist.see(pos)
+    # trigger display
+    try:
+        self._on_snip()
+    except Exception:
+        pass
     def _on_hour_wheel(self, evt):
         # Mouse wheel scroll selects next/prev hour entry
         if self.hlist.size() == 0:
