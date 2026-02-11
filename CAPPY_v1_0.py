@@ -391,19 +391,29 @@ class LiveRingWriter:
         import struct
         # Downsample / coerce to float32 length npts
         def to_npts(w: np.ndarray) -> np.ndarray:
-            """Resample waveform to exactly npts using linear interpolation.
-
-            This avoids the 'stair-step' / aliasing artifacts you were seeing from pure decimation.
-            """
             w = np.asarray(w, dtype=np.float32)
             if w.size == self.npts:
                 return w
             if w.size < 2:
                 return np.zeros((self.npts,), dtype=np.float32)
 
-            x_old = np.linspace(0.0, 1.0, num=w.size, dtype=np.float32)
-            x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
-            return np.interp(x_new, x_old, w).astype(np.float32, copy=False)
+            if w.size < self.npts:
+                # Upsample by linear interpolation to avoid flat padded tails
+                x_old = np.linspace(0.0, 1.0, num=w.size, dtype=np.float32)
+                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
+                return np.interp(x_new, x_old, w).astype(np.float32, copy=False)
+
+            # Downsample by decimation then trim
+            step = max(1, int(w.size // self.npts))
+            w2 = w[::step]
+            if w2.size > self.npts:
+                w2 = w2[: self.npts]
+            elif w2.size < self.npts:
+                # If decimation undershot (rare), interpolate to exact length
+                x_old = np.linspace(0.0, 1.0, num=w2.size, dtype=np.float32)
+                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
+                w2 = np.interp(x_new, x_old, w2).astype(np.float32, copy=False)
+            return w2
 
         a = to_npts(wfA)
         if wfB is None:
@@ -2532,19 +2542,21 @@ class LiveDashboard(ttk.Frame):
             
             # Plot with reduced antialiasing for speed
             line_a, = self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True, rasterized=True)
-            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel("Rolling samples", color='white')
-            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK, fontsize=10)
+            self.ax_wfA.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfA.tick_params(colors='white', labelsize=9)
             self.ax_wfA.spines['left'].set_color(NEON_PINK)
             self.ax_wfA.spines['bottom'].set_color('white')
             self.ax_wfA.spines['top'].set_visible(False)
             self.ax_wfA.spines['right'].set_visible(False)
             self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
+            # Format y-axis ticks
+            self.ax_wfA.ticklabel_format(axis='y', style='scientific', scilimits=(-3, 3), useMathText=True)
         else:
             self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
-            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel("Rolling samples", color='white')
-            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK, fontsize=10)
+            self.ax_wfA.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfA.tick_params(colors='white', labelsize=9)
             self.ax_wfA.spines['left'].set_color(NEON_PINK)
             self.ax_wfA.spines['bottom'].set_color('white')
             self.ax_wfA.spines['top'].set_visible(False)
@@ -2563,19 +2575,21 @@ class LiveDashboard(ttk.Frame):
                 yb_view = self._streamB
             
             line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
-            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel("Rolling samples", color='white')
-            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN, fontsize=10)
+            self.ax_wfB.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfB.tick_params(colors='white', labelsize=9)
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
             self.ax_wfB.spines['top'].set_visible(False)
             self.ax_wfB.spines['right'].set_visible(False)
             self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
+            # Format y-axis ticks
+            self.ax_wfB.ticklabel_format(axis='y', style='scientific', scilimits=(-3, 3), useMathText=True)
         else:
             self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
-            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel("Rolling samples", color='white')
-            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN, fontsize=10)
+            self.ax_wfB.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfB.tick_params(colors='white', labelsize=9)
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
             self.ax_wfB.spines['top'].set_visible(False)
@@ -2595,34 +2609,39 @@ class LiveDashboard(ttk.Frame):
                 areaA_view = self.areaA
                 areaB_view = self.areaB
             
-            self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=True, rasterized=True)
+            self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="∫A dt", antialiased=True, rasterized=True)
             if areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
-                self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=True, rasterized=True)
+                self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="∫B dt", antialiased=True, rasterized=True)
             self.ax_int.set_ylabel("Integral (V·s)", color='white')
-            self.ax_int.set_xlabel("Time (s)", color='white')
-            self.ax_int.tick_params(colors='white')
+            self.ax_int.set_xlabel("Time (µs)", color='white')
+            self.ax_int.tick_params(colors='white', labelsize=9)
             self.ax_int.spines['left'].set_color('white')
             self.ax_int.spines['bottom'].set_color('white')
             self.ax_int.spines['top'].set_visible(False)
             self.ax_int.spines['right'].set_visible(False)
             self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
-            legend = self.ax_int.legend(loc="best")
+            # Use scientific notation with offset for y-axis
+            self.ax_int.ticklabel_format(axis='y', style='scientific', scilimits=(-3, 3), useMathText=True)
+            # Position legend in upper right, slightly transparent background
+            legend = self.ax_int.legend(loc="upper right", framealpha=0.7, fancybox=True)
+            legend.get_frame().set_facecolor('#2d2d2d')
+            legend.get_frame().set_edgecolor('white')
             for text in legend.get_texts():
                 text.set_color('white')
         else:
             self.ax_int.set_title("Integration: waiting for data…", color='white')
-            self.ax_int.set_ylabel("Integral (V·s)", color='white')
-            self.ax_int.set_xlabel("Time (s)", color='white')
-            self.ax_int.tick_params(colors='white')
+            self.ax_int.set_ylabel("Integral (V·s)", color='white', fontsize=10)
+            self.ax_int.set_xlabel("Time (µs)", color='white', fontsize=9)
+            self.ax_int.tick_params(colors='white', labelsize=9)
             self.ax_int.spines['left'].set_color('white')
             self.ax_int.spines['bottom'].set_color('white')
             self.ax_int.spines['top'].set_visible(False)
             self.ax_int.spines['right'].set_visible(False)
             self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
 
-        # Use tight layout for better spacing
+        # Use tight layout with extra padding to prevent label overlap
         try:
-            self.fig.tight_layout(pad=0.5)
+            self.fig.tight_layout(pad=1.5, h_pad=1.0, w_pad=0.5)
         except Exception:
             pass
         
