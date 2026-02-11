@@ -63,6 +63,10 @@ DEFAULT_YAML = r"""# =========================
 # Proton beam default: 250 MS/s
 # Use *samples* where possible
 # =========================
+board:
+  system_id: 2
+  board_id: 1
+
 
 clock:
   source: INTERNAL_CLOCK
@@ -122,7 +126,7 @@ waveforms:
   every_n: 1
   threshold_integral_Vs: 0.0
   threshold_peak_V: 0.0
-  max_waveforms_per_sec: 100000
+  max_waveforms_per_sec: 50
   store_volts: true
 
 storage:
@@ -1291,7 +1295,10 @@ def run_capture(cfg_path: Path) -> int:
     )
     store_volts = bool(waves.get("store_volts", True))
 
-    board = ats.Board(systemId=2, boardId=1)
+    binfo = cfg.get("board", {}) if isinstance(cfg, dict) else {}
+    systemId = int(binfo.get("system_id", 2))
+    boardId = int(binfo.get("board_id", 1))
+    board = ats.Board(systemId=systemId, boardId=boardId)
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
@@ -1396,12 +1403,7 @@ def run_capture(cfg_path: Path) -> int:
             try:
                 board.waitAsyncBufferComplete(buf.addr, wait_timeout_ms)
             except Exception as ex:
-                s_ex = str(ex)
-                # Normal stop path: occurs after AbortAsyncRead / SIGINT
-                if ("ApiWaitCanceled" in s_ex) or ("ApiWaitCancelled" in s_ex):
-                    break
-                if "ApiWaitTimeout" in s_ex:
-
+                if "ApiWaitTimeout" in str(ex):
                     timeout_count += 1
                     ago_s = (time.time_ns() - last_buffer_ns) / 1e9
                     notifier.update(state="waiting_for_trigger", time=time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1415,6 +1417,9 @@ def run_capture(cfg_path: Path) -> int:
                     if rearm_if_no_trigger_s > 0 and ago_s >= float(rearm_if_no_trigger_s):
                         _do_rearm()
                     continue
+                if "ApiWaitCanceled" in str(ex) or "ApiWaitCancelled" in str(ex):
+                    # Normal stop path (SIGINT / abortAsyncRead)
+                    break
                 raise
 
             timeout_count = 0
@@ -1591,11 +1596,6 @@ def run_capture(cfg_path: Path) -> int:
 class ArchiveBrowser(ttk.Frame):
     def __init__(self, data_dir: Path, master=None):
         super().__init__(master)
-        # Back-compat aliases for various callback names used across older builds
-        self.on_session = self._on_session
-        self.on_snip = self._on_snip
-        self._on_session_ = self._on_session
-        self._on_snip_ = self._on_snip
         self._tz = datetime.now().astimezone().tzinfo
         self.data_dir = data_dir
         self.captures = data_dir / "captures"
@@ -1607,14 +1607,6 @@ class ArchiveBrowser(ttk.Frame):
         self._sel_hour = None
         self._build()
         self._refresh()
-
-    def __getattr__(self, name):
-        # Robust back-compat for historical callback names
-        if name in ("on_session", "_on_session_", "on_session_", "_on_session__"):
-            return self._on_session
-        if name in ("on_snip", "_on_snip_", "on_snip_", "_on_snip__"):
-            return self._on_snip
-        raise AttributeError(name)
 
     def _build(self):
         top = ttk.Frame(self, padding=8)
@@ -2080,18 +2072,23 @@ def _seek_mmss(self):
 
 
 
-    # ------------------------------------------------------------------
-    # Back-compat callback aliases (some older UI code binds these names)
+    # --- Legacy callback compatibility (older bindings may call these names) ---
+    def _on_session_(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
+
     def on_session(self, *args, **kwargs):
         return self._on_session(*args, **kwargs)
+
+    def on_session_(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
+
+    def _on_snip_(self, *args, **kwargs):
+        return self._on_snip(*args, **kwargs)
 
     def on_snip(self, *args, **kwargs):
         return self._on_snip(*args, **kwargs)
 
-    def _on_session_(self, *args, **kwargs):
-        return self._on_session(*args, **kwargs)
-
-    def _on_snip_(self, *args, **kwargs):
+    def on_snip_(self, *args, **kwargs):
         return self._on_snip(*args, **kwargs)
 
 class LiveDashboard(ttk.Frame):
@@ -2703,24 +2700,6 @@ def run_browse(data_dir: Path) -> int:
     app.pack(fill=tk.BOTH, expand=True)
     root.mainloop()
     return 0
-
-    # Back-compat callbacks for archive bindings used in older builds
-    def _on_session_(self, event=None):
-        if hasattr(self, "archive") and self.archive is not None:
-            return getattr(self.archive, "_on_session")(event)
-        return None
-
-    def _on_snip_(self, event=None):
-        if hasattr(self, "archive") and self.archive is not None:
-            return getattr(self.archive, "_on_snip")(event)
-        return None
-
-    def on_session(self, event=None):
-        return self._on_session_(event)
-
-    def on_snip(self, event=None):
-        return self._on_snip_(event)
-
 
 def main() -> int:
     argv = sys.argv[1:]
