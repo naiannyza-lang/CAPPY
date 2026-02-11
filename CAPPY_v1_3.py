@@ -2005,6 +2005,14 @@ class ArchiveBrowser(ttk.Frame):
         if not np.isfinite(sr) or sr <= 0:
             sr = 1.0
 
+        # Get baseline values (mean voltage in baseline window, already computed during acquisition)
+        baseline_A = float(r.get("baseline_A_V", 0.0))
+        baseline_B = float(r.get("baseline_B_V", 0.0))
+        
+        # Apply baseline subtraction to waveforms for display
+        wa_bs = wa - baseline_A
+        wb_bs = wb - baseline_B if wb is not None else None
+
         # Time axis with adaptive units (ns/us/ms/s)
         tvec, unit = _auto_time_axis(len(wa), sr)
 
@@ -2013,8 +2021,9 @@ class ArchiveBrowser(ttk.Frame):
         self.axB.clear()
         self.axI.clear()
 
-        # Waveform A
-        self.axA.plot(tvec, wa, color=NEON_PINK, linewidth=1.5)
+        # Waveform A (baseline-subtracted)
+        self.axA.plot(tvec, wa_bs, color=NEON_PINK, linewidth=1.5)
+        self.axA.axhline(0, color='white', linewidth=0.5, linestyle='--', alpha=0.3)
         self.axA.set_ylabel("A (V)", color=NEON_PINK)
         self.axA.tick_params(colors=NEON_PINK)
         self.axA.spines['left'].set_color(NEON_PINK)
@@ -2023,9 +2032,10 @@ class ArchiveBrowser(ttk.Frame):
         self.axA.spines['right'].set_visible(False)
         self.axA.grid(True, alpha=0.15, color=NEON_PINK)
 
-        # Waveform B (if available)
-        if wb is not None:
-            self.axB.plot(tvec, wb, color=NEON_GREEN, linewidth=1.5)
+        # Waveform B (baseline-subtracted if available)
+        if wb_bs is not None:
+            self.axB.plot(tvec, wb_bs, color=NEON_GREEN, linewidth=1.5)
+            self.axB.axhline(0, color='white', linewidth=0.5, linestyle='--', alpha=0.3)
             self.axB.set_ylabel("B (V)", color=NEON_GREEN)
             self.axB.tick_params(colors=NEON_GREEN)
             self.axB.spines['left'].set_color(NEON_GREEN)
@@ -2042,12 +2052,12 @@ class ArchiveBrowser(ttk.Frame):
             self.axB.spines['right'].set_visible(False)
         self.axB.grid(True, alpha=0.15, color='white')
 
-        # Cumulative integral strip (V·s)
+        # Cumulative integral (V·s) - using baseline-subtracted waveforms
         dt = 1.0 / sr
-        intA = np.cumsum(np.asarray(wa, dtype=np.float64)) * dt
+        intA = np.cumsum(np.asarray(wa_bs, dtype=np.float64)) * dt
         self.axI.plot(tvec, intA, color=NEON_PINK, linewidth=1.5, label="∫A dt")
-        if wb is not None:
-            intB = np.cumsum(np.asarray(wb, dtype=np.float64)) * dt
+        if wb_bs is not None:
+            intB = np.cumsum(np.asarray(wb_bs, dtype=np.float64)) * dt
             self.axI.plot(tvec, intB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="∫B dt")
         self.axI.set_ylabel("Integral (V·s)", color='white')
         self.axI.set_xlabel(f"Time ({unit})", color='white')
@@ -2073,6 +2083,7 @@ class ArchiveBrowser(ttk.Frame):
             f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
             f"Area A: {float(r.get('area_A_Vs',0.0)):.6g} V·s   Peak A: {float(r.get('peak_A_V',0.0)):.6g} V\n"
             f"Area B: {float(r.get('area_B_Vs',0.0)):.6g} V·s   Peak B: {float(r.get('peak_B_V',0.0)):.6g} V\n"
+            f"Baseline A: {baseline_A:.6g} V   Baseline B: {baseline_B:.6g} V\n"
             f"Waveform points: {int(r.get('npts', len(wa)))}"
         )
 
