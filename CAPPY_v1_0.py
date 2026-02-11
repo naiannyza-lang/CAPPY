@@ -265,8 +265,12 @@ def ats_const(prefix_or_name: str, maybe_name: str | None = None) -> int:
         print(f"[WARN] Using '{name}' instead of '{target}'")
         return int(getattr(ats, name))
 
-    opts = [a for a in dir(ats) if (a.startswith(prefix) if prefix else True)]
-    raise AttributeError(f"atsapi constant not found: {target} (prefix={prefix}). Example options: {opts[:40]} ...")
+    try:
+        opts = [a for a in dir(ats) if (a.startswith(prefix) if prefix else True)]
+        opts_msg = f". Example options: {opts[:40]} ..."
+    except (AttributeError, TypeError):
+        opts_msg = ""
+    raise AttributeError(f"atsapi constant not found: {target} (prefix={prefix}){opts_msg}")
 
 def _write_json_atomic(path: Path, obj: dict) -> None:
     """Atomic JSON write to survive crashes/power loss."""
