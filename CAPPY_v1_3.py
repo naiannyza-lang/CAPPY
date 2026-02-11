@@ -1142,9 +1142,10 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
     GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
     GET_ADC_TEMPERATURE  = getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104)
 
-    # Success code is typically 512 (ApiSuccess). Some wrappers may return 0.
-    API_SUCCESS = getattr(ats, "ApiSuccess", 512)
-
+    # Success code is typically 512 (ApiSuccess). Some wrappers may return 0 or 200 (0xC8)
+    # ATS boards commonly return 512 on success
+    API_SUCCESS_CODES = [0, 512, 200]
+    
     def _get_handle():
         for name in ("handle", "boardHandle", "_handle", "_board_handle", "hBoard", "_hBoard"):
             h = getattr(board, name, None)
@@ -1157,11 +1158,23 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
         if -40 <= val_long <= 150:
             return float(val_long)
 
-        # Strategy 2: treat low 32 bits as float
+        # Strategy 2: treat low 32 bits as float (common for newer firmware)
         u32 = val_long & 0xFFFFFFFF
-        f = struct.unpack("<f", struct.pack("<I", u32))[0]
-        if math.isfinite(f) and (-40.0 <= f <= 150.0):
-            return float(f)
+        try:
+            f = struct.unpack("<f", struct.pack("<I", u32))[0]
+            if math.isfinite(f) and (-40.0 <= f <= 150.0):
+                return float(f)
+        except Exception:
+            pass
+
+        # Strategy 3: For ATS-9352 and similar boards, try high 32 bits as float
+        u32_high = (val_long >> 32) & 0xFFFFFFFF
+        try:
+            f = struct.unpack("<f", struct.pack("<I", u32_high))[0]
+            if math.isfinite(f) and (-40.0 <= f <= 150.0):
+                return float(f)
+        except Exception:
+            pass
 
         return None
 
@@ -1172,18 +1185,18 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
             diag["error"] = "no board handle attribute found"
             return None, diag
 
-        # Channel argument is ignored for many board-level parameters, but try a few.
-        chan_candidates = [0]
-        for nm in ("CHANNEL_ALL", "CHANNEL_A"):
+        # Try multiple channel arguments - for ATS-9352 and most boards, channel is typically 1 (CHANNEL_A)
+        # or can be channel-agnostic (0 or CHANNEL_ALL)
+        chan_candidates = [1, 0]  # Try CHANNEL_A first, then 0
+        for nm in ("CHANNEL_A", "CHANNEL_ALL", "CHANNEL_B", "CHANNEL_C", "CHANNEL_D"):
             if hasattr(ats, nm):
                 try:
-                    chan_candidates.append(int(getattr(ats, nm)))
+                    chan_val = int(getattr(ats, nm))
+                    if chan_val not in chan_candidates:
+                        chan_candidates.append(chan_val)
                 except Exception:
                     pass
-        # Deduplicate while preserving order
-        seen = set()
-        chan_candidates = [c for c in chan_candidates if not (c in seen or seen.add(c))]
-
+        
         for ch in chan_candidates:
             ret_long = ctypes.c_long(0)
             try:
@@ -1200,7 +1213,8 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
             except Exception:
                 pass
 
-            if rc in (0, API_SUCCESS):
+            # Accept multiple success codes
+            if rc in API_SUCCESS_CODES:
                 temp = _decode_long_as_temp(int(ret_long.value))
                 attempt["decoded_c"] = temp
                 diag["attempts"].append(attempt)
@@ -2504,15 +2518,29 @@ class LiveDashboard(ttk.Frame):
             return None, None
 
     def _redraw(self, snap: dict):
-        # Clear axes
+        """
+        Redraw all plots with optimizations for smooth scrolling.
+        Uses smart axis limits and efficient plotting for better performance.
+        """
+        # Clear axes efficiently
         self.ax_wfA.clear()
         self.ax_wfB.clear()
         self.ax_int.clear()
 
-        # --- Channel A waveform (top) ---
+        # --- Channel A waveform (top) - Optimized rendering ---
         if self._streamA.size > 1:
-            x = np.arange(self._streamA.size)
-            self.ax_wfA.plot(x, self._streamA, color=NEON_PINK, linewidth=1.0)
+            # Use downsampled view if stream is very large for better performance
+            if self._streamA.size > 50000:
+                # Decimate for display only - use every Nth point
+                step = max(1, self._streamA.size // 20000)
+                x_view = np.arange(0, self._streamA.size, step)
+                y_view = self._streamA[::step]
+            else:
+                x_view = np.arange(self._streamA.size)
+                y_view = self._streamA
+            
+            # Plot with reduced antialiasing for speed
+            line_a, = self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True, rasterized=True)
             self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
             self.ax_wfA.set_xlabel("Rolling samples", color='white')
             self.ax_wfA.tick_params(colors='white')
@@ -2520,7 +2548,7 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfA.spines['bottom'].set_color('white')
             self.ax_wfA.spines['top'].set_visible(False)
             self.ax_wfA.spines['right'].set_visible(False)
-            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK)
+            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
         else:
             self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
             self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
@@ -2530,12 +2558,20 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfA.spines['bottom'].set_color('white')
             self.ax_wfA.spines['top'].set_visible(False)
             self.ax_wfA.spines['right'].set_visible(False)
-            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK)
+            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
 
-        # --- Channel B waveform (middle) ---
+        # --- Channel B waveform (middle) - Optimized rendering ---
         if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
-            xb = np.arange(self._streamB.size)
-            self.ax_wfB.plot(xb, self._streamB, color=NEON_GREEN, linewidth=1.0)
+            # Use downsampled view if stream is very large
+            if self._streamB.size > 50000:
+                step = max(1, self._streamB.size // 20000)
+                xb_view = np.arange(0, self._streamB.size, step)
+                yb_view = self._streamB[::step]
+            else:
+                xb_view = np.arange(self._streamB.size)
+                yb_view = self._streamB
+            
+            line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
             self.ax_wfB.set_xlabel("Rolling samples", color='white')
             self.ax_wfB.tick_params(colors='white')
@@ -2543,7 +2579,7 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfB.spines['bottom'].set_color('white')
             self.ax_wfB.spines['top'].set_visible(False)
             self.ax_wfB.spines['right'].set_visible(False)
-            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN)
+            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
         else:
             self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
@@ -2553,13 +2589,24 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfB.spines['bottom'].set_color('white')
             self.ax_wfB.spines['top'].set_visible(False)
             self.ax_wfB.spines['right'].set_visible(False)
-            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN)
+            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
 
         # --- Integration history strip (bottom) ---
         if self.t:
-            self.ax_int.plot(self.t, self.areaA, color=NEON_PINK, linewidth=1.5, label="Mean integral A (V·s)")
-            if self.areaB and np.any(np.isfinite(np.asarray(self.areaB, dtype=float))) and np.any(np.abs(np.asarray(self.areaB, dtype=float)) > 0):
-                self.ax_int.plot(self.t, self.areaB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="Mean integral B (V·s)")
+            # Downsample integration history if very long for better performance
+            if len(self.t) > 5000:
+                step = max(1, len(self.t) // 2000)
+                t_view = self.t[::step]
+                areaA_view = self.areaA[::step]
+                areaB_view = self.areaB[::step] if self.areaB else []
+            else:
+                t_view = self.t
+                areaA_view = self.areaA
+                areaB_view = self.areaB
+            
+            self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=True, rasterized=True)
+            if areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
+                self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=True, rasterized=True)
             self.ax_int.set_ylabel("Integral (V·s)", color='white')
             self.ax_int.set_xlabel("Time (s)", color='white')
             self.ax_int.tick_params(colors='white')
@@ -2567,7 +2614,7 @@ class LiveDashboard(ttk.Frame):
             self.ax_int.spines['bottom'].set_color('white')
             self.ax_int.spines['top'].set_visible(False)
             self.ax_int.spines['right'].set_visible(False)
-            self.ax_int.grid(True, alpha=0.15, color='white')
+            self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
             legend = self.ax_int.legend(loc="best")
             for text in legend.get_texts():
                 text.set_color('white')
@@ -2580,9 +2627,17 @@ class LiveDashboard(ttk.Frame):
             self.ax_int.spines['bottom'].set_color('white')
             self.ax_int.spines['top'].set_visible(False)
             self.ax_int.spines['right'].set_visible(False)
-            self.ax_int.grid(True, alpha=0.15, color='white')
+            self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
 
-        self.canvas.draw()
+        # Use tight layout for better spacing
+        try:
+            self.fig.tight_layout(pad=0.5)
+        except Exception:
+            pass
+        
+        # Efficient canvas draw with flush
+        self.canvas.draw_idle()  # Use draw_idle() instead of draw() for better performance
+        self.canvas.flush_events()
 
     def _tick(self):
         snap = self._read_status()
