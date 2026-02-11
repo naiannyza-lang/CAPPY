@@ -1123,120 +1123,147 @@ def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
 
 def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
     """
-    Read FPGA/ADC temperatures via AlazarGetParameter.
+    Read FPGA/ADC temperatures via board methods or AlazarGetParameter.
 
     Notes:
-      - Different driver/firmware generations have returned these values either as:
-          (a) a 32-bit IEEE754 float encoded in the low 32 bits of the returned long, or
-          (b) an integer temperature in degrees C stored in the returned long.
-      - Some wrappers expose the handle under different attribute names.
-
-    This function tries multiple decoding strategies and records diagnostics to help
-    understand why a particular system returns None.
+      - Different atsapi wrappers expose temperature differently:
+          (a) board.getBoardTemperature() or board.getTemperature() (high-level)
+          (b) ats.AlazarGetParameter() with temperature parameter IDs (low-level)
+      - Different driver/firmware generations return values as float or integer
+      
+    This function tries multiple strategies and records diagnostics.
     """
     import ctypes, struct, math
 
     out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
 
-    # Parameter IDs from ATS-SDK docs
-    GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
-    GET_ADC_TEMPERATURE  = getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104)
+    # Strategy 1: Try high-level board methods (most common in atsapi wrappers)
+    try:
+        if hasattr(board, 'getBoardTemperature'):
+            temp = float(board.getBoardTemperature())
+            if -40.0 <= temp <= 150.0:
+                out["adc"] = temp  # Usually returns ADC temp
+                out["diag"] = {"method": "getBoardTemperature", "value": temp}
+                return out
+    except Exception as e:
+        pass
 
-    # Success code is typically 512 (ApiSuccess). Some wrappers may return 0 or 200 (0xC8)
-    # ATS boards commonly return 512 on success
-    API_SUCCESS_CODES = [0, 512, 200]
-    
-    def _get_handle():
-        for name in ("handle", "boardHandle", "_handle", "_board_handle", "hBoard", "_hBoard"):
-            h = getattr(board, name, None)
-            if h is not None:
-                return h
-        return None
+    try:
+        if hasattr(board, 'getTemperature'):
+            temp = float(board.getTemperature())
+            if -40.0 <= temp <= 150.0:
+                out["adc"] = temp  # Usually returns ADC temp
+                out["diag"] = {"method": "getTemperature", "value": temp}
+                return out
+    except Exception as e:
+        pass
 
-    def _decode_long_as_temp(val_long: int) -> Optional[float]:
-        # Strategy 1: treat as integer degrees C
-        if -40 <= val_long <= 150:
-            return float(val_long)
+    # Strategy 2: Try direct ctypes call to AlazarGetParameter if available
+    if hasattr(ats, 'AlazarGetParameter'):
+        # Parameter IDs from ATS-SDK docs
+        GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
+        GET_ADC_TEMPERATURE  = getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104)
 
-        # Strategy 2: treat low 32 bits as float (common for newer firmware)
-        u32 = val_long & 0xFFFFFFFF
-        try:
-            f = struct.unpack("<f", struct.pack("<I", u32))[0]
-            if math.isfinite(f) and (-40.0 <= f <= 150.0):
-                return float(f)
-        except Exception:
-            pass
-
-        # Strategy 3: For ATS-9352 and similar boards, try high 32 bits as float
-        u32_high = (val_long >> 32) & 0xFFFFFFFF
-        try:
-            f = struct.unpack("<f", struct.pack("<I", u32_high))[0]
-            if math.isfinite(f) and (-40.0 <= f <= 150.0):
-                return float(f)
-        except Exception:
-            pass
-
-        return None
-
-    def _get(param) -> tuple[Optional[float], dict]:
-        diag = {"param": int(param), "attempts": []}
-        h = _get_handle()
-        if h is None:
-            diag["error"] = "no board handle attribute found"
-            return None, diag
-
-        # Try multiple channel arguments - for ATS-9352 and most boards, channel is typically 1 (CHANNEL_A)
-        # or can be channel-agnostic (0 or CHANNEL_ALL)
-        chan_candidates = [1, 0]  # Try CHANNEL_A first, then 0
-        for nm in ("CHANNEL_A", "CHANNEL_ALL", "CHANNEL_B", "CHANNEL_C", "CHANNEL_D"):
-            if hasattr(ats, nm):
-                try:
-                    chan_val = int(getattr(ats, nm))
-                    if chan_val not in chan_candidates:
-                        chan_candidates.append(chan_val)
-                except Exception:
-                    pass
+        # Success code is typically 512 (ApiSuccess). Some wrappers may return 0 or 200 (0xC8)
+        API_SUCCESS_CODES = [0, 512, 200]
         
-        for ch in chan_candidates:
-            ret_long = ctypes.c_long(0)
-            try:
-                rc = ats.AlazarGetParameter(h, int(ch), int(param), ctypes.byref(ret_long))
-            except Exception as e:
-                diag["attempts"].append({"ch": int(ch), "exception": repr(e)})
-                continue
+        def _get_handle():
+            for name in ("handle", "boardHandle", "_handle", "_board_handle", "hBoard", "_hBoard"):
+                h = getattr(board, name, None)
+                if h is not None:
+                    return h
+            return None
 
-            attempt = {"ch": int(ch), "rc": int(rc), "raw_long": int(ret_long.value)}
-            # Try to map rc to text if possible (helps debugging)
+        def _decode_long_as_temp(val_long: int) -> Optional[float]:
+            # Strategy 1: treat as integer degrees C
+            if -40 <= val_long <= 150:
+                return float(val_long)
+
+            # Strategy 2: treat low 32 bits as float (common for newer firmware)
+            u32 = val_long & 0xFFFFFFFF
             try:
-                if hasattr(ats, "AlazarErrorToText"):
-                    attempt["rc_text"] = str(ats.AlazarErrorToText(int(rc)))
+                f = struct.unpack("<f", struct.pack("<I", u32))[0]
+                if math.isfinite(f) and (-40.0 <= f <= 150.0):
+                    return float(f)
             except Exception:
                 pass
 
-            # Accept multiple success codes
-            if rc in API_SUCCESS_CODES:
-                temp = _decode_long_as_temp(int(ret_long.value))
-                attempt["decoded_c"] = temp
-                diag["attempts"].append(attempt)
-                if temp is not None:
-                    return temp, diag
-            else:
-                diag["attempts"].append(attempt)
+            # Strategy 3: For ATS-9352 and similar boards, try high 32 bits as float
+            u32_high = (val_long >> 32) & 0xFFFFFFFF
+            try:
+                f = struct.unpack("<f", struct.pack("<I", u32_high))[0]
+                if math.isfinite(f) and (-40.0 <= f <= 150.0):
+                    return float(f)
+            except Exception:
+                pass
 
-        return None, diag
+            return None
 
-    fpga, d_fpga = _get(GET_FPGA_TEMPERATURE)
-    adc,  d_adc  = _get(GET_ADC_TEMPERATURE)
+        def _get(param) -> tuple[Optional[float], dict]:
+            diag = {"param": int(param), "attempts": []}
+            h = _get_handle()
+            if h is None:
+                diag["error"] = "no board handle attribute found"
+                return None, diag
 
-    out["fpga"] = fpga
-    out["adc"]  = adc
+            # Try multiple channel arguments - for ATS-9352 and most boards, channel is typically 1 (CHANNEL_A)
+            chan_candidates = [1, 0]  # Try CHANNEL_A first, then 0
+            for nm in ("CHANNEL_A", "CHANNEL_ALL", "CHANNEL_B", "CHANNEL_C", "CHANNEL_D"):
+                if hasattr(ats, nm):
+                    try:
+                        chan_val = int(getattr(ats, nm))
+                        if chan_val not in chan_candidates:
+                            chan_candidates.append(chan_val)
+                    except Exception:
+                        pass
+            
+            for ch in chan_candidates:
+                ret_long = ctypes.c_long(0)
+                try:
+                    rc = ats.AlazarGetParameter(h, int(ch), int(param), ctypes.byref(ret_long))
+                except Exception as e:
+                    diag["attempts"].append({"ch": int(ch), "exception": repr(e)})
+                    continue
 
-    # Attach diagnostics for later inspection (non-fatal if user ignores it)
-    out["diag"] = {"fpga": d_fpga, "adc": d_adc}
-    try:
-        setattr(board, "_last_temp_diag", out["diag"])
-    except Exception:
-        pass
+                attempt = {"ch": int(ch), "rc": int(rc), "raw_long": int(ret_long.value)}
+                # Try to map rc to text if possible (helps debugging)
+                try:
+                    if hasattr(ats, "AlazarErrorToText"):
+                        attempt["rc_text"] = str(ats.AlazarErrorToText(int(rc)))
+                except Exception:
+                    pass
+
+                # Accept multiple success codes
+                if rc in API_SUCCESS_CODES:
+                    temp = _decode_long_as_temp(int(ret_long.value))
+                    attempt["decoded_c"] = temp
+                    diag["attempts"].append(attempt)
+                    if temp is not None:
+                        return temp, diag
+                else:
+                    diag["attempts"].append(attempt)
+
+            return None, diag
+
+        try:
+            fpga, d_fpga = _get(GET_FPGA_TEMPERATURE)
+            adc,  d_adc  = _get(GET_ADC_TEMPERATURE)
+
+            out["fpga"] = fpga
+            out["adc"]  = adc
+
+            # Attach diagnostics for later inspection (non-fatal if user ignores it)
+            out["diag"] = {"fpga": d_fpga, "adc": d_adc}
+            try:
+                setattr(board, "_last_temp_diag", out["diag"])
+            except Exception:
+                pass
+        except Exception as e:
+            out["diag"] = {"error": f"AlazarGetParameter method failed: {repr(e)}"}
+
+    else:
+        # AlazarGetParameter not available
+        out["diag"] = {"error": "atsapi module does not expose AlazarGetParameter, getBoardTemperature, or getTemperature"}
 
     return out
 def channels_mask_to_str(mask: int) -> str:
