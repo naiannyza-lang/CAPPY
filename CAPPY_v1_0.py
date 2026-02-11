@@ -391,29 +391,19 @@ class LiveRingWriter:
         import struct
         # Downsample / coerce to float32 length npts
         def to_npts(w: np.ndarray) -> np.ndarray:
+            """Resample waveform to exactly npts using linear interpolation.
+
+            This avoids the 'stair-step' / aliasing artifacts you were seeing from pure decimation.
+            """
             w = np.asarray(w, dtype=np.float32)
             if w.size == self.npts:
                 return w
             if w.size < 2:
                 return np.zeros((self.npts,), dtype=np.float32)
 
-            if w.size < self.npts:
-                # Upsample by linear interpolation to avoid flat padded tails
-                x_old = np.linspace(0.0, 1.0, num=w.size, dtype=np.float32)
-                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
-                return np.interp(x_new, x_old, w).astype(np.float32, copy=False)
-
-            # Downsample by decimation then trim
-            step = max(1, int(w.size // self.npts))
-            w2 = w[::step]
-            if w2.size > self.npts:
-                w2 = w2[: self.npts]
-            elif w2.size < self.npts:
-                # If decimation undershot (rare), interpolate to exact length
-                x_old = np.linspace(0.0, 1.0, num=w2.size, dtype=np.float32)
-                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
-                w2 = np.interp(x_new, x_old, w2).astype(np.float32, copy=False)
-            return w2
+            x_old = np.linspace(0.0, 1.0, num=w.size, dtype=np.float32)
+            x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
+            return np.interp(x_new, x_old, w).astype(np.float32, copy=False)
 
         a = to_npts(wfA)
         if wfB is None:
