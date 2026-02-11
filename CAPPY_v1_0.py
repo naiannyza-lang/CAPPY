@@ -265,8 +265,12 @@ def ats_const(prefix_or_name: str, maybe_name: str | None = None) -> int:
         print(f"[WARN] Using '{name}' instead of '{target}'")
         return int(getattr(ats, name))
 
-    opts = [a for a in dir(ats) if (a.startswith(prefix) if prefix else True)]
-    raise AttributeError(f"atsapi constant not found: {target} (prefix={prefix}). Example options: {opts[:40]} ...")
+    try:
+        opts = [a for a in dir(ats) if (a.startswith(prefix) if prefix else True)]
+        opts_msg = f". Example options: {opts[:40]} ..."
+    except (AttributeError, TypeError):
+        opts_msg = ""
+    raise AttributeError(f"atsapi constant not found: {target} (prefix={prefix}){opts_msg}")
 
 def _write_json_atomic(path: Path, obj: dict) -> None:
     """Atomic JSON write to survive crashes/power loss."""
@@ -1353,9 +1357,35 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
     ext_coupling_name = str(t.get("ext_coupling", "DC_COUPLING"))
     if not ext_coupling_name.endswith("_COUPLING"):
         ext_coupling_name = ext_coupling_name + "_COUPLING"
+    
+    # External trigger range with fallback
+    ext_range_name = str(t.get("ext_range", "ETR_5V"))
+    try:
+        ext_range_const = ats_const(ext_range_name)
+    except AttributeError as e:
+        # Common fallbacks for ATS-9462: try ETR_5V or ETR_1V
+        print(f"[WARN] {ext_range_name} not found in atsapi, trying fallbacks...")
+        fallbacks = ["ETR_5V", "ETR_1V", "ETR_2V5", "ETR_TTL"]
+        ext_range_const = None
+        for fallback in fallbacks:
+            if fallback == ext_range_name:
+                continue
+            try:
+                ext_range_const = ats_const(fallback)
+                print(f"[WARN] Using {fallback} instead of {ext_range_name}")
+                break
+            except AttributeError:
+                continue
+        if ext_range_const is None:
+            raise AttributeError(
+                f"External trigger range '{ext_range_name}' not found, and no fallbacks worked. "
+                f"Check your config file 'ext_range' setting. Run 'python3 check_etr_constants.py' "
+                f"to see available ETR constants for your board."
+            ) from e
+    
     board.setExternalTrigger(
         ats_const(ext_coupling_name),
-        ats_const(str(t.get("ext_range", "ETR_5V")))
+        ext_range_const
     )
 
     board.setTriggerDelay(int(t.get("delay_samples", 0)))
@@ -2346,9 +2376,6 @@ class LiveDashboard(ttk.Frame):
         # rolling stream buffers for true scrolling (concatenate each buffer waveform)
         self._streamA = np.empty((0,), dtype=np.float32)
         self._streamB = np.empty((0,), dtype=np.float32)
-        self._streamA_seam = None  # join index for plot-break between old/new data
-        self._streamB_seam = None
-        self._stream_detrend = True  # subtract mean from each incoming waveform before plotting (plot-only)
         self._stream_window = 20000  # points shown in scrolling mode
 
         self._started_unix: Optional[float] = None
@@ -2400,10 +2427,16 @@ class LiveDashboard(ttk.Frame):
             self.after(100, lambda: None)
 
     def _set_meta(self, s: str):
-        self.meta.configure(state=tk.NORMAL)
-        self.meta.delete("1.0", tk.END)
-        self.meta.insert(tk.END, s)
-        self.meta.configure(state=tk.DISABLED)
+        try:
+            if not self.winfo_exists():
+                return
+            self.meta.configure(state=tk.NORMAL)
+            self.meta.delete("1.0", tk.END)
+            self.meta.insert(tk.END, s)
+            self.meta.configure(state=tk.DISABLED)
+        except tk.TclError:
+            # Widget destroyed
+            pass
 
     def _read_status(self) -> Optional[dict]:
         data_dir = Path(self.data_dir_var.get()).expanduser()
@@ -2526,6 +2559,13 @@ class LiveDashboard(ttk.Frame):
         Redraw all plots with optimizations for smooth scrolling.
         Uses smart axis limits and efficient plotting for better performance.
         """
+        # Check if widget still exists before redrawing
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+            
         # Clear axes efficiently
         self.ax_wfA.clear()
         self.ax_wfB.clear()
@@ -2535,37 +2575,45 @@ class LiveDashboard(ttk.Frame):
         if self._streamA.size > 1:
             # Use downsampled view if stream is very large for better performance
             if self._streamA.size > 50000:
-                # Resample for display (avoids aliasing / staircase artifacts from plain decimation)
-                n_view = 20000
-                x_view = np.linspace(0, self._streamA.size - 1, n_view)
-                y_view = np.interp(x_view, np.arange(self._streamA.size), self._streamA.astype(np.float64, copy=False)).astype(np.float32)
-                # Break the line at the seam between old/new data to avoid a vertical 'step'
-                if self._streamA_seam is not None and self._streamA_seam > 0:
-                    seam_v = int(self._streamA_seam / max(1, (self._streamA.size - 1)) * (n_view - 1))
-                    if 0 < seam_v < y_view.size:
-                        y_view = np.array(y_view, copy=True)
-                        y_view[seam_v] = np.nan
+                # Decimate for display only - use every Nth point
+                step = max(1, self._streamA.size // 20000)
+                x_view = np.arange(0, self._streamA.size, step)
+                y_view = self._streamA[::step]
             else:
                 x_view = np.arange(self._streamA.size)
                 y_view = self._streamA
-                if self._streamA_seam is not None and 0 < int(self._streamA_seam) < y_view.size:
-                    y_view = np.array(y_view, copy=True)
-                    y_view[int(self._streamA_seam)] = np.nan
+            
             # Plot with reduced antialiasing for speed
             line_a, = self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True, rasterized=True)
-            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel("Rolling samples", color='white')
-            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK, fontsize=10)
+            self.ax_wfA.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfA.tick_params(colors='white', labelsize=9)
             self.ax_wfA.spines['left'].set_color(NEON_PINK)
             self.ax_wfA.spines['bottom'].set_color('white')
             self.ax_wfA.spines['top'].set_visible(False)
             self.ax_wfA.spines['right'].set_visible(False)
             self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
+            # Format y-axis with SI prefixes instead of floating offset
+            from matplotlib.ticker import FuncFormatter
+            def format_volts(value, tick_number):
+                if abs(value) < 1e-12:
+                    return '0'
+                elif abs(value) < 1e-9:
+                    return f'{value*1e12:.0f}p'
+                elif abs(value) < 1e-6:
+                    return f'{value*1e9:.0f}n'
+                elif abs(value) < 1e-3:
+                    return f'{value*1e6:.0f}µ'
+                elif abs(value) < 1:
+                    return f'{value*1e3:.1f}m'
+                else:
+                    return f'{value:.2f}'
+            self.ax_wfA.yaxis.set_major_formatter(FuncFormatter(format_volts))
         else:
             self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
-            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel("Rolling samples", color='white')
-            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK, fontsize=10)
+            self.ax_wfA.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfA.tick_params(colors='white', labelsize=9)
             self.ax_wfA.spines['left'].set_color(NEON_PINK)
             self.ax_wfA.spines['bottom'].set_color('white')
             self.ax_wfA.spines['top'].set_visible(False)
@@ -2584,19 +2632,35 @@ class LiveDashboard(ttk.Frame):
                 yb_view = self._streamB
             
             line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
-            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel("Rolling samples", color='white')
-            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN, fontsize=10)
+            self.ax_wfB.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfB.tick_params(colors='white', labelsize=9)
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
             self.ax_wfB.spines['top'].set_visible(False)
             self.ax_wfB.spines['right'].set_visible(False)
             self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
+            # Format y-axis with SI prefixes instead of floating offset
+            from matplotlib.ticker import FuncFormatter
+            def format_volts_b(value, tick_number):
+                if abs(value) < 1e-12:
+                    return '0'
+                elif abs(value) < 1e-9:
+                    return f'{value*1e12:.0f}p'
+                elif abs(value) < 1e-6:
+                    return f'{value*1e9:.0f}n'
+                elif abs(value) < 1e-3:
+                    return f'{value*1e6:.0f}µ'
+                elif abs(value) < 1:
+                    return f'{value*1e3:.1f}m'
+                else:
+                    return f'{value:.2f}'
+            self.ax_wfB.yaxis.set_major_formatter(FuncFormatter(format_volts_b))
         else:
             self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
-            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel("Rolling samples", color='white')
-            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN, fontsize=10)
+            self.ax_wfB.set_xlabel("Samples", color='white', fontsize=9)
+            self.ax_wfB.tick_params(colors='white', labelsize=9)
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
             self.ax_wfB.spines['top'].set_visible(False)
@@ -2616,34 +2680,53 @@ class LiveDashboard(ttk.Frame):
                 areaA_view = self.areaA
                 areaB_view = self.areaB
             
-            self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=True, rasterized=True)
+            self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="∫A dt", antialiased=True, rasterized=True)
             if areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
-                self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=True, rasterized=True)
+                self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="∫B dt", antialiased=True, rasterized=True)
             self.ax_int.set_ylabel("Integral (V·s)", color='white')
-            self.ax_int.set_xlabel("Time (s)", color='white')
-            self.ax_int.tick_params(colors='white')
+            self.ax_int.set_xlabel("Time (µs)", color='white')
+            self.ax_int.tick_params(colors='white', labelsize=9)
             self.ax_int.spines['left'].set_color('white')
             self.ax_int.spines['bottom'].set_color('white')
             self.ax_int.spines['top'].set_visible(False)
             self.ax_int.spines['right'].set_visible(False)
             self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
-            legend = self.ax_int.legend(loc="best")
+            # Use custom formatter to avoid floating offset text
+            from matplotlib.ticker import FuncFormatter
+            def format_func(value, tick_number):
+                if abs(value) < 1e-12:
+                    return '0'
+                elif abs(value) < 1e-9:
+                    return f'{value*1e12:.1f}p'  # pico
+                elif abs(value) < 1e-6:
+                    return f'{value*1e9:.1f}n'   # nano
+                elif abs(value) < 1e-3:
+                    return f'{value*1e6:.1f}µ'   # micro
+                elif abs(value) < 1:
+                    return f'{value*1e3:.1f}m'   # milli
+                else:
+                    return f'{value:.2g}'
+            self.ax_int.yaxis.set_major_formatter(FuncFormatter(format_func))
+            # Position legend in upper right, slightly transparent background
+            legend = self.ax_int.legend(loc="upper right", framealpha=0.7, fancybox=True)
+            legend.get_frame().set_facecolor('#2d2d2d')
+            legend.get_frame().set_edgecolor('white')
             for text in legend.get_texts():
                 text.set_color('white')
         else:
             self.ax_int.set_title("Integration: waiting for data…", color='white')
-            self.ax_int.set_ylabel("Integral (V·s)", color='white')
-            self.ax_int.set_xlabel("Time (s)", color='white')
-            self.ax_int.tick_params(colors='white')
+            self.ax_int.set_ylabel("Integral (V·s)", color='white', fontsize=10)
+            self.ax_int.set_xlabel("Time (µs)", color='white', fontsize=9)
+            self.ax_int.tick_params(colors='white', labelsize=9)
             self.ax_int.spines['left'].set_color('white')
             self.ax_int.spines['bottom'].set_color('white')
             self.ax_int.spines['top'].set_visible(False)
             self.ax_int.spines['right'].set_visible(False)
             self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
 
-        # Use tight layout for better spacing
+        # Use tight layout with extra padding to prevent label overlap
         try:
-            self.fig.tight_layout(pad=0.5)
+            self.fig.tight_layout(pad=1.5, h_pad=1.0, w_pad=0.5)
         except Exception:
             pass
         
@@ -2652,6 +2735,13 @@ class LiveDashboard(ttk.Frame):
         self.canvas.flush_events()
 
     def _tick(self):
+        # Check if widget still exists before updating
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+            
         snap = self._read_status()
         if snap:
             # stats
@@ -2681,8 +2771,6 @@ class LiveDashboard(ttk.Frame):
                 live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
                 if 'stream_window_points' in live_cfg:
                     self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
-                    if 'stream_detrend' in live_cfg:
-                        self._stream_detrend = bool(live_cfg.get('stream_detrend', True))
             except Exception:
                 pass
 
@@ -2702,45 +2790,29 @@ class LiveDashboard(ttk.Frame):
                     break
                 if wfA is not None:
                     try:
-                        wfA_f = wfA.astype(np.float32, copy=False)
-                        if getattr(self, "_stream_detrend", True):
-                            # Plot-only detrend to prevent DC steps between buffers (common on pure noise)
-                            wfA_f = wfA_f - float(np.nanmean(wfA_f))
-                        prev_len = int(self._streamA.size)
-                        self._streamA = np.concatenate([self._streamA, wfA_f])
-                        # seam = join point between previously kept samples and newly appended wfA
-                        self._streamA_seam = prev_len
+                        self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
                         if self._streamA.size > self._stream_window:
-                            cut = int(self._streamA.size - self._stream_window)
-                            self._streamA = self._streamA[cut:]
-                            if self._streamA_seam is not None:
-                                self._streamA_seam = max(0, int(self._streamA_seam) - cut)
+                            self._streamA = self._streamA[-self._stream_window:]
                     except Exception:
                         pass
                 if wfB is not None:
                     try:
-                        wfB_f = wfB.astype(np.float32, copy=False)
-                        if getattr(self, "_stream_detrend", True):
-                            wfB_f = wfB_f - float(np.nanmean(wfB_f))
-                        prev_len = int(self._streamB.size)
-                        self._streamB = np.concatenate([self._streamB, wfB_f])
-                        self._streamB_seam = prev_len
+                        self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
                         if self._streamB.size > self._stream_window:
-                            cut = int(self._streamB.size - self._stream_window)
-                            self._streamB = self._streamB[cut:]
-                            if self._streamB_seam is not None:
-                                self._streamB_seam = max(0, int(self._streamB_seam) - cut)
+                            self._streamB = self._streamB[-self._stream_window:]
                     except Exception:
                         pass
             self._redraw(snap)
 
             self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
-        # Schedule periodic UI updates
-        if hasattr(self, "_tick"):
-            self.after(100, self._tick)
-        else:
-            # Fallback to avoid startup crash if _tick is missing due to editing/merge issues
-            self.after(100, lambda: None)
+        
+        # Schedule periodic UI updates only if widget still exists
+        try:
+            if self.winfo_exists() and hasattr(self, "_tick"):
+                self.after(100, self._tick)
+        except tk.TclError:
+            # Widget destroyed, stop scheduling
+            pass
 
 class _ProcLogPump:
     """
