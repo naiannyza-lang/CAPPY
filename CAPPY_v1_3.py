@@ -2067,6 +2067,20 @@ def _seek_mmss(self):
 
 
 
+    # ------------------------------------------------------------------
+    # Back-compat callback aliases (some older UI code binds these names)
+    def on_session(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
+
+    def on_snip(self, *args, **kwargs):
+        return self._on_snip(*args, **kwargs)
+
+    def _on_session_(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
+
+    def _on_snip_(self, *args, **kwargs):
+        return self._on_snip(*args, **kwargs)
+
 class LiveDashboard(ttk.Frame):
     """
     Dashboard optimized for capture monitoring:
