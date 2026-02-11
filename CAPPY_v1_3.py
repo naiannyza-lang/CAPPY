@@ -13,6 +13,7 @@ import json
 import os
 import smtplib
 import subprocess
+import shutil
 from email.message import EmailMessage
 
 STOP_REQUESTED = False
@@ -184,6 +185,37 @@ SESSION_INDEX_SCHEMA = pa.schema([
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+def clear_pycache(root: Path) -> int:
+    """Delete __pycache__ folders and .pyc/.pyo files under root. Returns count removed (best-effort)."""
+    root = Path(root)
+    removed = 0
+    try:
+        # Remove __pycache__ directories
+        for d in root.rglob("__pycache__"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+            except Exception:
+                pass
+
+        # Remove stray bytecode files
+        for ext in ("*.pyc", "*.pyo"):
+            for f in root.rglob(ext):
+                try:
+                    f.unlink(missing_ok=True)  # py3.8+
+                    removed += 1
+                except Exception:
+                    try:
+                        if f.exists():
+                            f.unlink()
+                            removed += 1
+                    except Exception:
+                        pass
+    except Exception:
+        return removed
+    return removed
+
 
 def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -2709,8 +2741,16 @@ class LauncherGUI(tk.Tk):
             return
         cfg_path = Path(self.var_config.get()).expanduser()
         if not cfg_path.exists():
-            messagebox.showerror("Missing", f"Config not found:\n{cfg_path}")
+            messagebox.showerror("Missing", f"Config not found:
+{cfg_path}")
             return
+
+        # Clear Python bytecode cache to avoid stale imports and reduce startup churn
+        try:
+            removed = clear_pycache(self.script_path.parent)
+            self._append(f"[CAPPY] Cleared pycache (removed ~{removed} items)")
+        except Exception:
+            pass
 
         cmd = [sys.executable, str(self.script_path), "capture", "--config", str(cfg_path)]
         self._append("RUN: " + " ".join(cmd))
