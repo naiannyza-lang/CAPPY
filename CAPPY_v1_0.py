@@ -117,8 +117,8 @@ acquisition:
   wait_timeout_ms: 1000
 
 integration:
-  baseline_window_samples: [0, 64]
-  integral_window_samples:  [64, 128]
+  baseline_window_samples: [0, 32]
+  integral_window_samples:  [32, 256]
 
 waveforms:
   enable: true
@@ -129,7 +129,7 @@ waveforms:
   threshold_peak_V: 0.0
   max_waveforms_per_sec: 50
   store_volts: true
-  dc_offset_correction: true    # Remove DC offset from waveforms (fixes step artifacts)
+  dc_offset_correction: false   # Set to true only if you want to subtract the baseline calculated in 'baseline_window_samples'
 
 storage:
   data_dir: dataFile_ATS9462
@@ -331,27 +331,6 @@ def _send_status_email(cfg: dict, subject: str, body: str) -> None:
 class LiveRingWriter:
     """
     Rolling on-disk ring buffer for live waveform display.
-
-    Why: You want EVERY buffer's waveform captured, but you only want to *render* at a stable UI cadence.
-    The capture process writes one downsampled waveform per buffer into a fixed-size ring file.
-    The GUI reads forward at its own pace (e.g., 10–30 fps) for smooth, consistent visualization.
-
-    File format (little-endian, fixed record size):
-      header: 32 bytes
-        - magic b'CPRING1\0' (8)
-        - version u32 (4)
-        - nslots u32 (4)
-        - npts u32 (4)   (fixed points per waveform)
-        - reserved u32 (4)
-        - write_seq u64 (8)  (monotonic sequence number)
-      record slot i:
-        - seq u64
-        - t_unix f64
-        - buf_idx u64
-        - chmask u32  (bit0=A, bit1=B)
-        - reserved u32
-        - wfA float32[npts]
-        - wfB float32[npts]  (NaN if disabled)
     """
     MAGIC = b"CPRING1\0"
     VERSION = 1
@@ -503,9 +482,6 @@ class StatusNotifier:
 class ParquetRollingWriter:
     """
     Parquet writer that rolls files by time and stores them in an hourly hierarchy.
-
-    Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/<HH:00>/):
-      - reduced/<prefix>_<YYYYMMDD_HHMM>.parquet
     """
     def __init__(self, day_dir: Path, prefix: str, schema: pa.Schema, rollover_minutes: int):
         self.day_dir = day_dir
@@ -586,11 +562,6 @@ class WaveBinSqliteStore:
     Store waveform snippets as:
       - raw float32 channel-separated data appended to time-rolled .bin files inside hourly folders
       - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
-
-    Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/):
-      - index/snips_<session>.sqlite
-      - <HH:00>/waveforms/A_snips_<session>_<YYYYMMDD_HHMM>.bin
-      - <HH:00>/waveforms/B_snips_<session>_<YYYYMMDD_HHMM>.bin
     """
     def __init__(self, day_dir: Path, session_id: str, rollover_minutes: int, commit_every: int):
         self.day_dir = day_dir
@@ -1006,7 +977,7 @@ def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int
     Reduce raw uint16 waveforms into baseline (V), peak (V) and gated integral (V·s).
 
     This version converts ADC codes -> volts using the configured input range (Vpp),
-    then does baseline subtraction in volts, then integrates (sum * dt).
+    then does baseline subtraction in volts using the calculated baseline from b0:b1.
     """
     if raw.dtype != np.uint16:
         raw = raw.astype(np.uint16, copy=False)
@@ -1022,10 +993,15 @@ def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int
     if g1 <= g0:
         g0, g1 = 0, min(1, n)
 
+    # Convert to pure volts (no automatic baseline subtraction here)
     V = _codes_to_volts_u16(raw, vpp=vpp)  # float32 volts
+    
+    # Calculate baseline from specified window
     baseline_V = V[:, b0:b1].mean(axis=1, dtype=np.float32).astype(np.float64)
 
+    # Gate logic
     gate = V[:, g0:g1].astype(np.float64, copy=False)
+    # Subtract baseline explicitly
     gate_bs = gate - baseline_V[:, None]
 
     dt = 1.0 / float(sr_hz)
@@ -1078,9 +1054,6 @@ def load_config(path: Path) -> Dict[str, Any]:
 def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
     """
     Convert Alazar-style range strings like 'PM_1_V' or 'PM_200_MV' to full-scale Vpp.
-
-    NOTE: integration and plotted volts must use the actual ADC full-scale range, otherwise
-    integrals/peaks will be numerically wrong.
     """
     rn = (range_name or "").strip().upper()
     rn = rn.replace("INPUT_RANGE_", "")
@@ -1118,48 +1091,27 @@ def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
     }
     return float(COMMON.get(rn, default_vpp))
 
-def _codes_to_volts_u16(u16: np.ndarray, vpp: float, apply_offset_correction: bool = True) -> np.ndarray:
+def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
     """
     Map uint16 ADC codes to volts for a bipolar input range (mid-scale = 0 V).
-    Uses 65536 codes for correct LSB size.
+    Uses 65536 codes for correct LSB size (ATS-9462 is 16-bit).
     
-    Args:
-        u16: ADC codes as uint16 array
-        vpp: Peak-to-peak voltage range
-        apply_offset_correction: If True, removes DC offset from waveform
+    Formula:
+      Code 0     -> -Vpp/2
+      Code 32768 -> 0 V
+      Code 65535 -> +Vpp/2
     
-    Returns:
-        Voltage values in volts
+    Note: This does purely mathematical conversion. It does NOT remove DC offset.
+    Baseline subtraction should be handled explicitly by the caller using a defined window.
     """
     # Standard bipolar conversion: 0V = code 32768
-    volts = (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
-    
-    # FIX: For short records (individual triggered events), DC offset correction
-    # creates artificial discontinuities between records. Only apply for long
-    # continuous acquisitions where we can reliably estimate a global DC offset.
-    # For triggered mode with short records, it's better to keep raw ADC output.
-    if apply_offset_correction and volts.size > 1024:
-        # Only apply to long continuous waveforms (>1024 samples)
-        # Use median of entire waveform for global DC offset
-        dc_offset = np.median(volts)
-        volts = volts - dc_offset
-    
-    return volts
+    # Using float32 for speed, cast to float64 if needed later
+    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
 
 
 def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
     """
     Read FPGA/ADC temperatures if available.
-    
-    Notes:
-      - Temperature reading is not available in all atsapi Python wrapper versions
-      - The ATS-9352 board supports temperature sensing in firmware, but the Python
-        API may not expose it depending on the wrapper version
-      - This function gracefully returns None if temperature is unavailable
-    
-    Returns:
-        Dict with 'fpga' and 'adc' temperature in Celsius (or None if unavailable),
-        and 'diag' with diagnostic information
     """
     import ctypes, struct, math
 
@@ -1176,7 +1128,6 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
                     out["diag"] = {"method": method_name, "value": temp, "status": "success"}
                     return out
             except Exception as e:
-                # Method exists but failed - record it
                 out["diag"] = {"method": method_name, "error": str(e), "status": "failed"}
                 continue
 
@@ -1196,10 +1147,8 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
                 return None
 
             def _decode_long_as_temp(val_long: int) -> Optional[float]:
-                # Try as integer
                 if -40 <= val_long <= 150:
                     return float(val_long)
-                # Try low 32 bits as float
                 try:
                     u32 = val_long & 0xFFFFFFFF
                     f = struct.unpack("<f", struct.pack("<I", u32))[0]
@@ -1207,7 +1156,6 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
                         return float(f)
                 except:
                     pass
-                # Try high 32 bits as float (ATS-9352)
                 try:
                     u32_high = (val_long >> 32) & 0xFFFFFFFF
                     f = struct.unpack("<f", struct.pack("<I", u32_high))[0]
@@ -1230,18 +1178,9 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
                             out["diag"] = {"method": "AlazarGetParameter", "param": "ADC_TEMP", "value": temp, "status": "success"}
                             return out
                 except Exception as e:
-                    pass  # Silently continue if this fails
+                    pass
         except Exception:
-            pass  # Low-level API not available or failed
-
-    # Temperature reading not available
-    out["diag"] = {
-        "status": "unavailable",
-        "message": "Temperature reading not supported by this atsapi wrapper version. "
-                   "The ATS-9352 board has temperature sensors, but your Python wrapper "
-                   "does not expose getBoardTemperature(), getTemperature(), or AlazarGetParameter(). "
-                   "This is normal for some atsapi versions - temperature monitoring is optional."
-    }
+            pass
     
     return out
 def channels_mask_to_str(mask: int) -> str:
@@ -1254,12 +1193,6 @@ def channels_mask_to_str(mask: int) -> str:
 
 
 def channels_from_mask_expr(expr: str) -> int:
-    """
-    Parse channel selection expression into a bitmask.
-      - 'A' -> 1, 'B' -> 2, 'AB'/'A|B'/'A,B' -> 3
-      - integer strings like '1', '2', '3', '0x3' are accepted as-is
-    Defaults to 1 if empty/invalid.
-    """
     if expr is None:
         return 1
     e = str(expr).strip().upper()
@@ -1317,7 +1250,6 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
     else:
         board.setCaptureClock(source, ats.SAMPLE_RATE_USER_DEF, edge, int(sr_hz))
 
-    # Default Vpp fallback (only used if range parsing fails)
     vpp_default = 4.0
     vpp_A = vpp_default
     vpp_B = vpp_default
@@ -1364,7 +1296,6 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
     try:
         ext_range_const = ats_const(ext_range_name)
     except AttributeError as e:
-        # Common fallbacks for ATS-9462: try ETR_5V or ETR_1V
         print(f"[WARN] {ext_range_name} not found in atsapi, trying fallbacks...")
         fallbacks = ["ETR_5V", "ETR_1V", "ETR_2V5", "ETR_TTL"]
         ext_range_const = None
@@ -1378,11 +1309,7 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
             except AttributeError:
                 continue
         if ext_range_const is None:
-            raise AttributeError(
-                f"External trigger range '{ext_range_name}' not found, and no fallbacks worked. "
-                f"Check your config file 'ext_range' setting. Run 'python3 check_etr_constants.py' "
-                f"to see available ETR constants for your board."
-            ) from e
+            raise AttributeError(f"External trigger range '{ext_range_name}' not found.") from e
     
     board.setExternalTrigger(
         ats_const(ext_coupling_name),
@@ -1449,7 +1376,7 @@ def run_capture(cfg_path: Path) -> int:
         max_per_sec=int(waves.get("max_waveforms_per_sec", 50)),
     )
     store_volts = bool(waves.get("store_volts", True))
-    dc_offset_correction = bool(waves.get("dc_offset_correction", True))
+    dc_offset_correction = bool(waves.get("dc_offset_correction", False))
 
     binfo = cfg.get("board", {}) if isinstance(cfg, dict) else {}
     systemId = int(binfo.get("system_id", 2))
@@ -1574,7 +1501,6 @@ def run_capture(cfg_path: Path) -> int:
                         _do_rearm()
                     continue
                 if "ApiWaitCanceled" in str(ex) or "ApiWaitCancelled" in str(ex):
-                    # Normal stop path (SIGINT / abortAsyncRead)
                     break
                 raise
 
@@ -1595,24 +1521,6 @@ def run_capture(cfg_path: Path) -> int:
             if ch_count == 2:
                 A = raw[0::2].reshape(rpb, spr)
                 B = raw[1::2].reshape(rpb, spr)
-                
-                # FIX: Convert entire channel buffer to volts BEFORE processing records
-                # This prevents per-record DC offset issues that create discontinuities
-                if store_volts:
-                    A_volts = np.zeros_like(A, dtype=np.float32)
-                    B_volts = np.zeros_like(B, dtype=np.float32)
-                    for r in range(rpb):
-                        # Convert without per-record DC offset correction
-                        A_volts[r] = (A[r].astype(np.float32) - 32768.0) * (float(vppA) / 65536.0)
-                        B_volts[r] = (B[r].astype(np.float32) - 32768.0) * (float(vppB) / 65536.0)
-                    
-                    # Apply global DC offset correction to entire buffer if enabled
-                    if dc_offset_correction:
-                        dc_A = np.median(A_volts)
-                        dc_B = np.median(B_volts)
-                        A_volts -= dc_A
-                        B_volts -= dc_B
-                
                 areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
                 areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB)
                 for r in range(rpb):
@@ -1627,11 +1535,14 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = A_volts[r]
-                            wfB_V = B_volts[r]
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
+                            if dc_offset_correction: wfA_V -= baseA[r]
+                            wfB_V = _codes_to_volts_u16(B[r], vpp=vppB)
+                            if dc_offset_correction: wfB_V -= baseB[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
                             wfB_V = B[r].astype(np.float32)
+
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -1642,17 +1553,6 @@ def run_capture(cfg_path: Path) -> int:
                         )
             else:
                 A = raw.reshape(rpb, spr)
-                
-                # FIX: Convert entire channel buffer to volts BEFORE processing records
-                if store_volts:
-                    A_volts = np.zeros_like(A, dtype=np.float32)
-                    for r in range(rpb):
-                        A_volts[r] = (A[r].astype(np.float32) - 32768.0) * (float(vppA) / 65536.0)
-                    
-                    if dc_offset_correction:
-                        dc_A = np.median(A_volts)
-                        A_volts -= dc_A
-                
                 areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
                 for r in range(rpb):
                     rec_g = global_rec + r
@@ -1666,9 +1566,11 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = A_volts[r]
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
+                            if dc_offset_correction: wfA_V -= baseA[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
+
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -1678,50 +1580,44 @@ def run_capture(cfg_path: Path) -> int:
                             baseline_A_V=float(baseA[r]), baseline_B_V=0.0,
                         )
 
-            # Per-buffer summaries for live GUI plotting
+            # Live GUI updates
+            try:
+                # Use record 0 as representative; convert to volts
+                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
+                if dc_offset_correction: wfA_live -= baseA[0]
+                
+                wfB_live = None
+                chmask_live = 1
+                if ch_count == 2:
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
+                    if dc_offset_correction: wfB_live -= baseB[0]
+                    chmask_live = 3
+                
+                ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
+            except Exception:
+                pass
+
+            # Per-buffer stats for dashboard
             try:
                 if ch_count == 2:
                     notifier.update(
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA)),
                         buffer_mean_area_B=float(np.mean(areaB)), buffer_mean_peak_B=float(np.mean(peakB)),
                     )
-                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
-                        last_gui_emit_buf = buf_done
-                        try:
-                            temps = get_board_temperatures_c(board)
-                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
-                        except Exception:
-                            bt = None
-                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
-                        notifier.emit_now()
                 else:
                     notifier.update(
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA))
                     )
-                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
-                        last_gui_emit_buf = buf_done
-                        try:
-                            temps = get_board_temperatures_c(board)
-                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
-                        except Exception:
-                            bt = None
-                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
-                        notifier.emit_now()
-            except Exception:
-                pass
-
-            # Write EVERY buffer's representative waveform into the live ring for smooth GUI playback
-            try:
-                # Use record 0 as representative; convert to volts with correct per-channel Vpp
-                # FIX: Use the already-converted volts if available
-                if store_volts and 'A_volts' in locals():
-                    wfA_live = A_volts[0]
-                    wfB_live = B_volts[0] if ch_count == 2 else None
-                else:
-                    wfA_live = _codes_to_volts_u16(A[0], vpp=vppA, apply_offset_correction=False)
-                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB, apply_offset_correction=False) if ch_count == 2 else None
-                chmask_live = 3 if ch_count == 2 else 1
-                ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
+                
+                if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
+                    last_gui_emit_buf = buf_done
+                    try:
+                        temps = get_board_temperatures_c(board)
+                        bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
+                    except Exception:
+                        bt = None
+                    notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
+                    notifier.emit_now()
             except Exception:
                 pass
 
@@ -1734,13 +1630,10 @@ def run_capture(cfg_path: Path) -> int:
             now = time.time()
             if (now - last >= 1.0) or (dashboard_every_buffers > 0 and (buf_done - last_emit_buf) >= dashboard_every_buffers):
                 rate = global_rec / max(now - t0, 1e-9)
-                # status fields for GUI
                 last_capture_unix = time.time()
                 last_capture = time.strftime('%Y-%m-%d %H:%M:%S')
-                # board temperature (best-effort; may be unavailable depending on atsapi)
                 board_temp_c = None
                 try:
-                    # Some atsapi wrappers expose getBoardTemperature / getTemperature
                     if hasattr(board, 'getBoardTemperature'):
                         board_temp_c = float(board.getBoardTemperature())
                     elif hasattr(board, 'getTemperature'):
@@ -1748,24 +1641,8 @@ def run_capture(cfg_path: Path) -> int:
                 except Exception:
                     board_temp_c = None
 
-                # latest waveform for GUI (downsampled). Uses last computed wfA_V/wfB_V if available.
-                latest_wf_A = None
-                latest_wf_B = None
-                try:
-                    if 'wfA_V' in locals():
-                        w = wfA_V
-                        step = max(1, int(len(w) // 1200))
-                        latest_wf_A = w[::step].astype(float).tolist()
-                    if 'wfB_V' in locals() and wfB_V is not None:
-                        w = wfB_V
-                        step = max(1, int(len(w) // 1200))
-                        latest_wf_B = w[::step].astype(float).tolist()
-                except Exception:
-                    latest_wf_A = None
-                    latest_wf_B = None
-
                 notifier.update(state="running", time=time.strftime("%Y-%m-%d %H:%M:%S"),
-                               buffers=buf_done, records=global_rec, rate_hz=rate, last_capture=last_capture, last_capture_unix=last_capture_unix, board_temp_c=board_temp_c, latest_waveform_A=latest_wf_A, latest_waveform_B=latest_wf_B,
+                               buffers=buf_done, records=global_rec, rate_hz=rate, last_capture=last_capture, last_capture_unix=last_capture_unix, board_temp_c=board_temp_c,
                                reduced_rows=getattr(archive, "_n_reduced", 0),
                                snips=getattr(archive, "_n_snips", 0),
                                last_buffer_ago_s=(time.time_ns()-last_buffer_ns)/1e9)
@@ -2300,70 +2177,6 @@ class ArchiveBrowser(ttk.Frame):
         self.meta.configure(state=tk.DISABLED)
 
 
-
-
-
-
-    def _on_hour_wheel(self, evt):
-        # Mouse wheel scroll selects next/prev hour entry
-        if self.hlist.size() == 0:
-            return "break"
-        cur = self.hlist.curselection()
-        idx = int(cur[0]) if cur else 0
-        idx = max(0, min(self.hlist.size() - 1, idx + (-1 if evt.delta > 0 else 1)))
-        self.hlist.selection_clear(0, tk.END)
-        self.hlist.selection_set(idx)
-        self.hlist.see(idx)
-        self._on_hour()
-        return "break"
-
-    def _on_session(self, _=None):
-        sid = self._sel_sid()
-        if not sid:
-            return
-        self.snips = pd.DataFrame()
-        self._snip_db_dir = None
-
-        # Locate the snips sqlite DB for this session in any day directory
-        for ddir in self._iter_day_dirs() or []:
-            idx_dir = ddir / "index"
-            db = idx_dir / f"snips_{sid}.sqlite"
-            if db.exists():
-                conn = sqlite3.connect(db)
-                try:
-                    self.snips = pd.read_sql_query(
-                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
-                        "file,offset_bytes,nbytes,"
-                        "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
-                        "area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
-                        conn,
-                        params=(sid,),
-                    )
-                except Exception:
-                    # Legacy DB schema (no channel-separated columns)
-                    self.snips = pd.read_sql_query(
-                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
-                        "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
-                        conn,
-                        params=(sid,),
-                    )
-                conn.close()
-                self._snip_db_dir = ddir
-                break
-
-        self.wlist.delete(0, tk.END)
-        if self.snips.empty:
-            self.wlist.insert(tk.END, "(no saved waveforms)")
-            return
-
-        # Populate hour list and apply hour filter
-        self._populate_hours()
-        self._apply_hour_filter()
-        self._set_meta(f"Snips loaded: {len(self.snips):,}")
-
-
     # --- Legacy callback compatibility (older bindings may call these names) ---
     def _on_session_(self, *args, **kwargs):
         return self._on_session(*args, **kwargs)
@@ -2388,9 +2201,6 @@ class LiveDashboard(ttk.Frame):
     Dashboard optimized for capture monitoring:
       - Top stats: rate, captures, started, last capture, mean peak, board temperature
       - Plots: mean integral history + latest waveform
-    Colors:
-      - Channel A: integral RED, waveform BLUE
-      - Channel B (if enabled): PINK (dashed)
     """
     def __init__(self, master, data_dir_var: tk.StringVar):
         super().__init__(master, padding=6)
@@ -2597,37 +2407,30 @@ class LiveDashboard(ttk.Frame):
     def _redraw(self, snap: dict):
         """
         Redraw all plots with optimizations for smooth scrolling.
-        Uses smart axis limits and efficient plotting for better performance.
         """
-        # Check if widget still exists before redrawing
         try:
             if not self.winfo_exists():
                 return
         except tk.TclError:
             return
             
-        # Clear axes efficiently
         self.ax_wfA.clear()
         self.ax_wfB.clear()
         self.ax_int.clear()
 
         # --- Channel A waveform (top) - Optimized rendering ---
         if self._streamA.size > 1:
-            # Convert samples to time (microseconds)
-            dt_us = 1.0 / self._sample_rate_hz * 1e6  # time per sample in microseconds
+            dt_us = 1.0 / self._sample_rate_hz * 1e6
             
-            # Use downsampled view if stream is very large for better performance
             if self._streamA.size > 50000:
-                # Decimate for display only - use every Nth point
                 step = max(1, self._streamA.size // 20000)
                 x_indices = np.arange(0, self._streamA.size, step)
-                x_view = x_indices * dt_us  # Convert to microseconds
+                x_view = x_indices * dt_us
                 y_view = self._streamA[::step]
             else:
-                x_view = np.arange(self._streamA.size) * dt_us  # Convert to microseconds
+                x_view = np.arange(self._streamA.size) * dt_us
                 y_view = self._streamA
             
-            # Plot with reduced antialiasing for speed
             line_a, = self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True, rasterized=True)
             self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK, fontsize=10)
             self.ax_wfA.set_xlabel("Time (µs)", color='white', fontsize=9)
@@ -2637,7 +2440,6 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfA.spines['top'].set_visible(False)
             self.ax_wfA.spines['right'].set_visible(False)
             self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
-            # Format y-axis with SI prefixes instead of floating offset
             from matplotlib.ticker import FuncFormatter
             def format_volts(value, tick_number):
                 if abs(value) < 1e-12:
@@ -2666,17 +2468,15 @@ class LiveDashboard(ttk.Frame):
 
         # --- Channel B waveform (middle) - Optimized rendering ---
         if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
-            # Convert samples to time (microseconds)
-            dt_us = 1.0 / self._sample_rate_hz * 1e6  # time per sample in microseconds
+            dt_us = 1.0 / self._sample_rate_hz * 1e6
             
-            # Use downsampled view if stream is very large
             if self._streamB.size > 50000:
                 step = max(1, self._streamB.size // 20000)
                 xb_indices = np.arange(0, self._streamB.size, step)
-                xb_view = xb_indices * dt_us  # Convert to microseconds
+                xb_view = xb_indices * dt_us
                 yb_view = self._streamB[::step]
             else:
-                xb_view = np.arange(self._streamB.size) * dt_us  # Convert to microseconds
+                xb_view = np.arange(self._streamB.size) * dt_us
                 yb_view = self._streamB
             
             line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
@@ -2688,7 +2488,6 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfB.spines['top'].set_visible(False)
             self.ax_wfB.spines['right'].set_visible(False)
             self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
-            # Format y-axis with SI prefixes instead of floating offset
             from matplotlib.ticker import FuncFormatter
             def format_volts_b(value, tick_number):
                 if abs(value) < 1e-12:
@@ -2717,7 +2516,6 @@ class LiveDashboard(ttk.Frame):
 
         # --- Integration history strip (bottom) ---
         if self.t:
-            # Downsample integration history if very long for better performance
             if len(self.t) > 5000:
                 step = max(1, len(self.t) // 2000)
                 t_view = self.t[::step]
@@ -2739,7 +2537,6 @@ class LiveDashboard(ttk.Frame):
             self.ax_int.spines['top'].set_visible(False)
             self.ax_int.spines['right'].set_visible(False)
             self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
-            # Use custom formatter to avoid floating offset text
             from matplotlib.ticker import FuncFormatter
             def format_func(value, tick_number):
                 if abs(value) < 1e-12:
@@ -2755,7 +2552,6 @@ class LiveDashboard(ttk.Frame):
                 else:
                     return f'{value:.2g}'
             self.ax_int.yaxis.set_major_formatter(FuncFormatter(format_func))
-            # Position legend in upper right, slightly transparent background
             legend = self.ax_int.legend(loc="upper right", framealpha=0.7, fancybox=True)
             legend.get_frame().set_facecolor('#2d2d2d')
             legend.get_frame().set_edgecolor('white')
@@ -2772,18 +2568,15 @@ class LiveDashboard(ttk.Frame):
             self.ax_int.spines['right'].set_visible(False)
             self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
 
-        # Use tight layout with extra padding to prevent label overlap
         try:
             self.fig.tight_layout(pad=1.5, h_pad=1.0, w_pad=0.5)
         except Exception:
             pass
         
-        # Efficient canvas draw with flush
-        self.canvas.draw_idle()  # Use draw_idle() instead of draw() for better performance
+        self.canvas.draw_idle()
         self.canvas.flush_events()
 
     def _tick(self):
-        # Check if widget still exists before updating
         try:
             if not self.winfo_exists():
                 return
@@ -2792,7 +2585,6 @@ class LiveDashboard(ttk.Frame):
             
         snap = self._read_status()
         if snap:
-            # stats
             try:
                 self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
             except Exception:
@@ -2801,7 +2593,6 @@ class LiveDashboard(ttk.Frame):
             self.lbl_started.configure(text=str(snap.get("started", "—")))
             self.lbl_last.configure(text=str(snap.get("last_capture", snap.get("time", "—"))))
 
-            # mean peak stat (A [+ B])
             pA = snap.get("buffer_mean_peak_A", None)
             pB = snap.get("buffer_mean_peak_B", None)
             try:
@@ -2825,7 +2616,6 @@ class LiveDashboard(ttk.Frame):
             bt = snap.get("board_temp_c", None)
             self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
 
-            # Capture sample rate for time axis calculations
             if 'sample_rate_hz' in snap:
                 try:
                     self._sample_rate_hz = float(snap['sample_rate_hz'])
@@ -2834,7 +2624,6 @@ class LiveDashboard(ttk.Frame):
 
             self._open_ring_from_status(snap)
             self._append_point(snap)
-            # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
             try:
                 max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
             except Exception:
@@ -2845,17 +2634,6 @@ class LiveDashboard(ttk.Frame):
                     break
                 if wfA is not None:
                     try:
-                        # Remove per-waveform DC offset before concatenating to prevent steps
-                        # Calculate the DC offset from the last portion of existing stream
-                        # and the first portion of new waveform to smooth the transition
-                        if self._streamA.size > 64:
-                            # Get average of last 32 samples from existing stream
-                            tail_avg = np.mean(self._streamA[-32:])
-                            # Get average of first 32 samples from new waveform
-                            head_avg = np.mean(wfA[:min(32, wfA.size)])
-                            # Apply offset to new waveform to match existing stream
-                            wfA = wfA - head_avg + tail_avg
-                        
                         self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
                         if self._streamA.size > self._stream_window:
                             self._streamA = self._streamA[-self._stream_window:]
@@ -2863,12 +2641,6 @@ class LiveDashboard(ttk.Frame):
                         pass
                 if wfB is not None:
                     try:
-                        # Same DC continuity correction for channel B
-                        if self._streamB.size > 64:
-                            tail_avg = np.mean(self._streamB[-32:])
-                            head_avg = np.mean(wfB[:min(32, wfB.size)])
-                            wfB = wfB - head_avg + tail_avg
-                        
                         self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
                         if self._streamB.size > self._stream_window:
                             self._streamB = self._streamB[-self._stream_window:]
@@ -2878,18 +2650,15 @@ class LiveDashboard(ttk.Frame):
 
             self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
         
-        # Schedule periodic UI updates only if widget still exists
         try:
             if self.winfo_exists() and hasattr(self, "_tick"):
                 self.after(100, self._tick)
         except tk.TclError:
-            # Widget destroyed, stop scheduling
             pass
 
 class _ProcLogPump:
     """
     Reads a subprocess' stdout in a background thread and pushes lines into a Queue.
-    Prevents Tkinter freezes from blocking readline().
     """
     def __init__(self, proc):
         self.proc = proc
@@ -2952,7 +2721,7 @@ class LauncherGUI(tk.Tk):
         self.var_config = tk.StringVar(value="CAPPY_ATS9462_v1_3.yaml")
         self.var_data_dir = tk.StringVar(value="dataFile_ATS9462")
 
-        # Auto-create default config so you never need to run `init` in a terminal.
+        # Auto-create default config
         cfgp = Path(self.var_config.get())
         if not cfgp.exists():
             try:
@@ -2960,14 +2729,6 @@ class LauncherGUI(tk.Tk):
                 print(f"[CAPPY-9462] Created default config: {cfgp}")
             except Exception as ex:
                 messagebox.showerror('CAPPY-9462', f'Failed to create default config {cfgp}: {ex}')
-
-        # Auto-create default config so you never need to run `init` in a terminal.
-        cfgp = Path(self.var_config.get())
-        if not cfgp.exists():
-            try:
-                _atomic_write_text(cfgp, DEFAULT_YAML)
-            except Exception as ex:
-                messagebox.showerror('CAPPY', f'Failed to create default config {cfgp}: {ex}')
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
@@ -3057,7 +2818,6 @@ class LauncherGUI(tk.Tk):
             messagebox.showerror("Missing", f"Config not found:{cfg_path}")
             return
 
-        # Clear Python bytecode cache to avoid stale imports and reduce startup churn
         try:
             removed = clear_pycache(self.script_path.parent)
             self._append(f"[CAPPY] Cleared pycache (removed ~{removed} items)")
