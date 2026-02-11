@@ -65,7 +65,7 @@ DEFAULT_YAML = r"""# =========================
 # =========================
 
 board:
-  system_id: 0
+  system_id: 2
   board_id: 1
 
 clock:
@@ -1126,20 +1126,16 @@ def channels_mask_to_str(mask: int) -> str:
 
 def channels_from_mask_expr(expr: str) -> int:
     """
-    Parse channel selection expression into an Alazar channel bitmask.
-
-    Accepts:
-      - 'A', 'B', 'AB', 'A|B', 'A,B'
-      - 'CHANNEL_A', 'CHANNEL_B', 'CHANNEL_A|CHANNEL_B'
-      - integer strings like '1', '2', '3', '0x3'
-    Defaults to CHANNEL_A if empty/invalid.
+    Parse channel selection expression into a bitmask.
+      - 'A' -> 1, 'B' -> 2, 'AB'/'A|B'/'A,B' -> 3
+      - integer strings like '1', '2', '3', '0x3' are accepted as-is
+    Defaults to 1 if empty/invalid.
     """
     if expr is None:
-        return int(getattr(ats, "CHANNEL_A", 1))
+        return 1
     e = str(expr).strip().upper()
     if not e:
-        return int(getattr(ats, "CHANNEL_A", 1))
-
+        return 1
     # numeric
     try:
         if e.startswith("0X"):
@@ -1148,36 +1144,21 @@ def channels_from_mask_expr(expr: str) -> int:
             return int(e, 10)
     except Exception:
         pass
-
-    # normalize separators
+    # symbolic
     e = e.replace(" ", "").replace("+", "|").replace(",", "|")
-
-    A_BIT = int(getattr(ats, "CHANNEL_A", 1))
-    B_BIT = int(getattr(ats, "CHANNEL_B", 2))
-
-    # direct constant strings
-    if e in ("CHANNEL_A",):
-        return A_BIT
-    if e in ("CHANNEL_B",):
-        return B_BIT
-    if e in ("CHANNEL_A|CHANNEL_B", "CHANNEL_B|CHANNEL_A"):
-        return A_BIT | B_BIT
-
-    # shorthand
     if e in ("A",):
-        return A_BIT
+        return 1
     if e in ("B",):
-        return B_BIT
+        return 2
     if e in ("AB", "A|B", "B|A"):
-        return A_BIT | B_BIT
-
+        return 3
+    # any includes
     mask = 0
-    if ("CHANNEL_A" in e) or ("A" in e):
-        mask |= A_BIT
-    if ("CHANNEL_B" in e) or ("B" in e):
-        mask |= B_BIT
-
-    return mask if mask else A_BIT
+    if "A" in e:
+        mask |= 1
+    if "B" in e:
+        mask |= 2
+    return mask if mask else 1
 
 def infer_channel_count_from_mask(mask: int) -> int:
     mask = int(mask)
@@ -1314,8 +1295,10 @@ def run_capture(cfg_path: Path) -> int:
     )
     store_volts = bool(waves.get("store_volts", True))
 
-    bd = (cfg.get('board', {}) or {})
-    board = ats.Board(systemId=int(bd.get('system_id', 0)), boardId=int(bd.get('board_id', 1)))
+    board_cfg = cfg.get('board', {}) if isinstance(cfg, dict) else {}
+    system_id = int(board_cfg.get('system_id', 2))
+    board_id = int(board_cfg.get('board_id', 1))
+    board = ats.Board(systemId=system_id, boardId=board_id)
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
@@ -1622,20 +1605,14 @@ class ArchiveBrowser(ttk.Frame):
         self._build()
         self._refresh()
 
-    # Backward/forward-compatible aliases (some GUIs call these names)
-    def on_session(self, event=None):
-        return self._on_session(event)
+    
+    # --- Back-compat aliases (older UI code may call these without underscore) ---
+    def on_session(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
 
-    def on_date(self, event=None):
-        return self._on_date(event)
-
-    def on_hour(self, event=None):
-        return self._on_hour(event)
-
-    def on_snip(self, event=None):
-        return self._on_snip(event)
-
-    def _build(self):
+    def on_snip(self, *args, **kwargs):
+        return self._on_snip(*args, **kwargs)
+def _build(self):
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.BOTH, expand=True)
         filt = ttk.Frame(top)
@@ -2593,27 +2570,14 @@ class LauncherGUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    
     def _browse(self):
         try:
             win = tk.Toplevel(self)
-            win.title("CAPPY Archive")
-            # make sure it behaves like the old popup (front of main window)
-            try:
-                win.transient(self)
-            except Exception:
-                pass
+            win.title('CAPPY Archive')
             app = ArchiveBrowser(Path(self.var_data_dir.get()), master=win)
             app.pack(fill=tk.BOTH, expand=True)
-            try:
-                win.update_idletasks()
-                win.lift()
-                win.focus_force()
-            except Exception:
-                pass
         except Exception as e:
-            messagebox.showerror("CAPPY", str(e))
-
+            messagebox.showerror('CAPPY', str(e))
 
     def _toggle(self):
         if self.proc is None:
