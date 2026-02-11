@@ -1608,6 +1608,14 @@ class ArchiveBrowser(ttk.Frame):
         self._build()
         self._refresh()
 
+    def __getattr__(self, name):
+        # Robust back-compat for historical callback names
+        if name in ("on_session", "_on_session_", "on_session_", "_on_session__"):
+            return self._on_session
+        if name in ("on_snip", "_on_snip_", "on_snip_", "_on_snip__"):
+            return self._on_snip
+        raise AttributeError(name)
+
     def _build(self):
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.BOTH, expand=True)
@@ -2695,6 +2703,24 @@ def run_browse(data_dir: Path) -> int:
     app.pack(fill=tk.BOTH, expand=True)
     root.mainloop()
     return 0
+
+    # Back-compat callbacks for archive bindings used in older builds
+    def _on_session_(self, event=None):
+        if hasattr(self, "archive") and self.archive is not None:
+            return getattr(self.archive, "_on_session")(event)
+        return None
+
+    def _on_snip_(self, event=None):
+        if hasattr(self, "archive") and self.archive is not None:
+            return getattr(self.archive, "_on_snip")(event)
+        return None
+
+    def on_session(self, event=None):
+        return self._on_session_(event)
+
+    def on_snip(self, event=None):
+        return self._on_snip_(event)
+
 
 def main() -> int:
     argv = sys.argv[1:]
