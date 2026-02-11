@@ -1973,19 +1973,33 @@ class ArchiveBrowser(ttk.Frame):
         sel = self.wlist.curselection()
         if not sel:
             return
-        # listbox entry begins with integer id
+        # listbox entry format: "HH:MM:SS  id=123  buf=..."
         try:
-            snip_id = int(str(self.wlist.get(sel[0])).split()[0])
+            txt = str(self.wlist.get(sel[0]))
+            # Extract the id value from "id=123"
+            for part in txt.split():
+                if part.startswith("id="):
+                    snip_id = int(part.split("=")[1])
+                    break
+            else:
+                return
         except Exception:
             return
 
         df = self._snips_view if (hasattr(self, '_snips_view') and not self._snips_view.empty) else self.snips
         row = df[df["id"] == snip_id]
         if row.empty:
+            self._set_meta(f"Error: Could not find snip with id={snip_id}")
             return
         r = row.iloc[0]
 
-        wa, wb = load_waveforms_from_row(r, self._snip_db_dir)
+        try:
+            wa, wb = load_waveforms_from_row(r, self._snip_db_dir)
+        except Exception as e:
+            self._set_meta(f"Error loading waveform: {e}\nRow data: {r.to_dict()}")
+            import traceback
+            traceback.print_exc()
+            return
 
         sr = float(r.get("sample_rate_hz", np.nan))
         if not np.isfinite(sr) or sr <= 0:
