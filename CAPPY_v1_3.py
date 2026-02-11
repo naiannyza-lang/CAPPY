@@ -1125,29 +1125,77 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
     """
     Read FPGA/ADC temperatures via AlazarGetParameter.
 
-    ATS-SDK documents GET_FPGA_TEMPERATURE (0x10000080) and GET_ADC_TEMPERATURE (0x10000104)
-    as 32-bit float values (encoded in a U32). Only supported by PCIe digitizers. citeturn0search0
+    Notes:
+      - ATS9352 is a PCIe digitizer, so GET_FPGA_TEMPERATURE / GET_ADC_TEMPERATURE are expected to work
+        when supported by the installed driver/firmware.
+      - Some older drivers historically returned FPGA temperature as a long integer (°C). Newer docs describe
+        these temperature parameters as 32-bit floats. We support both encodings.
     """
-    import ctypes, struct
-    out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
-    # Parameter IDs from ATS-SDK docs
-    GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
-    GET_ADC_TEMPERATURE = getattr(ats, "GET_ADC_TEMPERATURE", 0x10000104)
+    import ctypes
+    import math
 
-    def _get(param) -> Optional[float]:
+    out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
+
+    if not ATS_AVAILABLE or ats is None:
+        return out
+
+    # Parameter IDs from ATS-SDK docs (fallback to numeric IDs if constants missing)
+    GET_FPGA_TEMPERATURE = int(getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080))
+    GET_ADC_TEMPERATURE = int(getattr(ats, "GET_ADC_TEMPERATURE", 0x10000104))
+
+    API_SUCCESS = int(getattr(ats, "ApiSuccess", 512))
+
+    def _ok(rc: int) -> bool:
+        # atsapi sometimes returns 512 for success; some wrappers return 0.
+        return int(rc) in (0, API_SUCCESS)
+
+    def _finite_c(x: float) -> Optional[float]:
+        if x is None:
+            return None
         try:
-            u32 = ctypes.c_uint32(0)
-            # board.handle is the underlying board handle in atsapi python wrapper
-            rc = ats.AlazarGetParameter(board.handle, 0, int(param), ctypes.byref(u32))
-            # success code in atsapi is often 512; treat non-zero as failure conservatively
-            if rc not in (0, 512):
-                return None
-            return struct.unpack("<f", struct.pack("<I", int(u32.value)))[0]
+            xf = float(x)
         except Exception:
             return None
+        if not math.isfinite(xf):
+            return None
+        # sanity bounds for on-board temps
+        if xf < -50.0 or xf > 200.0:
+            return None
+        return xf
 
-    out["fpga"] = _get(GET_FPGA_TEMPERATURE)
-    out["adc"] = _get(GET_ADC_TEMPERATURE)
+    def _get_temp(param: int, allow_int_fallback: bool = False) -> Optional[float]:
+        # 1) Preferred: read as float (SDK docs: encoded 32-bit float)
+        try:
+            temp_f = ctypes.c_float(0.0)
+            rc = ats.AlazarGetParameter(
+                board.handle,
+                0,
+                int(param),
+                ctypes.cast(ctypes.byref(temp_f), ctypes.POINTER(ctypes.c_long)),
+            )
+            if _ok(rc):
+                v = _finite_c(temp_f.value)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+
+        # 2) Fallback: some older drivers returned FPGA temp as a long integer (°C)
+        if allow_int_fallback:
+            try:
+                temp_l = ctypes.c_long(0)
+                rc = ats.AlazarGetParameter(board.handle, 0, int(param), ctypes.byref(temp_l))
+                if _ok(rc):
+                    v = _finite_c(float(temp_l.value))
+                    if v is not None:
+                        return v
+            except Exception:
+                pass
+
+        return None
+
+    out["fpga"] = _get_temp(GET_FPGA_TEMPERATURE, allow_int_fallback=True)
+    out["adc"] = _get_temp(GET_ADC_TEMPERATURE, allow_int_fallback=False)
     return out
 
 
@@ -2258,7 +2306,7 @@ class LiveDashboard(ttk.Frame):
         # rolling stream buffers for true scrolling (concatenate each buffer waveform)
         self._streamA = np.empty((0,), dtype=np.float32)
         self._streamB = np.empty((0,), dtype=np.float32)
-        self._stream_window = 10000  # points shown in scrolling mode (show ~10k samples for more detail)
+        self._stream_window = 20000  # points shown in scrolling mode
 
         self._started_unix: Optional[float] = None
         self._last_seen_seq: int = 0
@@ -2285,8 +2333,6 @@ class LiveDashboard(ttk.Frame):
         # --- plots ---
         self.fig = plt.Figure(figsize=(8.2, 7.2))
         self.fig.patch.set_facecolor('#1e1e1e')
-        # More vertical separation between stacked plots
-        self.fig.subplots_adjust(hspace=0.55, top=0.95, bottom=0.08)
 
         # Scope-like layout: Channel A (top), Channel B (middle), Integration history (bottom)
         self.ax_wfA = self.fig.add_subplot(311)
