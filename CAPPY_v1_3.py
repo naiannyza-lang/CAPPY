@@ -1591,6 +1591,11 @@ def run_capture(cfg_path: Path) -> int:
 class ArchiveBrowser(ttk.Frame):
     def __init__(self, data_dir: Path, master=None):
         super().__init__(master)
+        # Back-compat aliases for various callback names used across older builds
+        self.on_session = self._on_session
+        self.on_snip = self._on_snip
+        self._on_session_ = self._on_session
+        self._on_snip_ = self._on_snip
         self._tz = datetime.now().astimezone().tzinfo
         self.data_dir = data_dir
         self.captures = data_dir / "captures"
