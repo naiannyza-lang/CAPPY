@@ -2072,6 +2072,67 @@ def _seek_mmss(self):
 
 
 
+
+    def _on_hour_wheel(self, evt):
+        # Mouse wheel scroll selects next/prev hour entry
+        if self.hlist.size() == 0:
+            return "break"
+        cur = self.hlist.curselection()
+        idx = int(cur[0]) if cur else 0
+        idx = max(0, min(self.hlist.size() - 1, idx + (-1 if evt.delta > 0 else 1)))
+        self.hlist.selection_clear(0, tk.END)
+        self.hlist.selection_set(idx)
+        self.hlist.see(idx)
+        self._on_hour()
+        return "break"
+
+    def _on_session(self, _=None):
+        sid = self._sel_sid()
+        if not sid:
+            return
+        self.snips = pd.DataFrame()
+        self._snip_db_dir = None
+
+        # Locate the snips sqlite DB for this session in any day directory
+        for ddir in self._iter_day_dirs() or []:
+            idx_dir = ddir / "index"
+            db = idx_dir / f"snips_{sid}.sqlite"
+            if db.exists():
+                conn = sqlite3.connect(db)
+                try:
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,"
+                        "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+                        "area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                        params=(sid,),
+                    )
+                except Exception:
+                    # Legacy DB schema (no channel-separated columns)
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                        params=(sid,),
+                    )
+                conn.close()
+                self._snip_db_dir = ddir
+                break
+
+        self.wlist.delete(0, tk.END)
+        if self.snips.empty:
+            self.wlist.insert(tk.END, "(no saved waveforms)")
+            return
+
+        # Populate hour list and apply hour filter
+        self._populate_hours()
+        self._apply_hour_filter()
+        self._set_meta(f"Snips loaded: {len(self.snips):,}")
+
+
     # --- Legacy callback compatibility (older bindings may call these names) ---
     def _on_session_(self, *args, **kwargs):
         return self._on_session(*args, **kwargs)
