@@ -2806,16 +2806,10 @@ class LiveDashboard(ttk.Frame):
                     break
                 if wfA is not None:
                     try:
-                        # Remove per-waveform DC offset before concatenating to prevent steps
-                        # Calculate the DC offset from the last portion of existing stream
-                        # and the first portion of new waveform to smooth the transition
-                        if self._streamA.size > 64:
-                            # Get average of last 32 samples from existing stream
-                            tail_avg = np.mean(self._streamA[-32:])
-                            # Get average of first 32 samples from new waveform
-                            head_avg = np.mean(wfA[:min(32, wfA.size)])
-                            # Apply offset to new waveform to match existing stream
-                            wfA = wfA - head_avg + tail_avg
+                        # FIX: Don't apply DC stitching correction between records
+                        # Each record is a separate triggered acquisition with potential time gaps
+                        # The original stitching code was creating artificial drift by forcing
+                        # continuity between discontinuous records
                         
                         self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
                         if self._streamA.size > self._stream_window:
@@ -2824,11 +2818,7 @@ class LiveDashboard(ttk.Frame):
                         pass
                 if wfB is not None:
                     try:
-                        # Same DC continuity correction for channel B
-                        if self._streamB.size > 64:
-                            tail_avg = np.mean(self._streamB[-32:])
-                            head_avg = np.mean(wfB[:min(32, wfB.size)])
-                            wfB = wfB - head_avg + tail_avg
+                        # FIX: Don't apply DC stitching correction between records
                         
                         self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
                         if self._streamB.size > self._stream_window:
