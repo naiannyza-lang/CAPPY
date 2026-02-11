@@ -3015,8 +3015,7 @@ class LauncherGUI(tk.Tk):
             return
         cfg_path = Path(self.var_config.get()).expanduser()
         if not cfg_path.exists():
-            messagebox.showerror("Missing", f"Config not found:
-{cfg_path}")
+            messagebox.showerror("Missing", f"Config not found:{cfg_path}")
             return
 
         # Clear Python bytecode cache to avoid stale imports and reduce startup churn
