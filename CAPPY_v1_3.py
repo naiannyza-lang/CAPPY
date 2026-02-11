@@ -1125,80 +1125,70 @@ def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
     """
     Read FPGA/ADC temperatures via AlazarGetParameter.
 
-    Notes:
-      - ATS9352 is a PCIe digitizer, so GET_FPGA_TEMPERATURE / GET_ADC_TEMPERATURE are expected to work
-        when supported by the installed driver/firmware.
-      - Some older drivers historically returned FPGA temperature as a long integer (°C). Newer docs describe
-        these temperature parameters as 32-bit floats. We support both encodings.
+    For ATS9352-class PCIe digitizers, the ATS-SDK exposes temperature parameters that are
+    retrieved with AlazarGetParameter(handle, channel, parameter, long*).
+
+    Practical reality across driver versions:
+      * Many drivers return the temperature directly as an integer number of °C in retValue.
+      * Some releases/notes mention historical issues with GET_FPGA_TEMPERATURE returning bad values on ATS9352,
+        so you may see out-of-range readings if the driver/firmware combo is affected.
+
+    This helper:
+      1) Reads retValue as a signed long and uses it as °C if it looks sane.
+      2) If it looks insane, it attempts to interpret the low 32 bits as an IEEE-754 float (legacy/variant encodings).
     """
     import ctypes
     import math
+    import struct
 
     out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
 
     if not ATS_AVAILABLE or ats is None:
         return out
 
-    # Parameter IDs from ATS-SDK docs (fallback to numeric IDs if constants missing)
     GET_FPGA_TEMPERATURE = int(getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080))
-    GET_ADC_TEMPERATURE = int(getattr(ats, "GET_ADC_TEMPERATURE", 0x10000104))
+    GET_ADC_TEMPERATURE  = int(getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104))
 
-    API_SUCCESS = int(getattr(ats, "ApiSuccess", 512))
+    API_SUCCESS = int(getattr(ats, "ApiSuccess", 512))  # ApiSuccess is 512 in ATS-SDK
 
     def _ok(rc: int) -> bool:
-        # atsapi sometimes returns 512 for success; some wrappers return 0.
         return int(rc) in (0, API_SUCCESS)
 
-    def _finite_c(x: float) -> Optional[float]:
-        if x is None:
-            return None
+    def _sanitize(x: float) -> Optional[float]:
         try:
             xf = float(x)
         except Exception:
             return None
         if not math.isfinite(xf):
             return None
-        # sanity bounds for on-board temps
         if xf < -50.0 or xf > 200.0:
             return None
         return xf
 
-    def _get_temp(param: int, allow_int_fallback: bool = False) -> Optional[float]:
-        # 1) Preferred: read as float (SDK docs: encoded 32-bit float)
+    def _decode_temp(ret_long: int) -> Optional[float]:
+        v1 = _sanitize(float(ret_long))
+        if v1 is not None:
+            return v1
         try:
-            temp_f = ctypes.c_float(0.0)
-            rc = ats.AlazarGetParameter(
-                board.handle,
-                0,
-                int(param),
-                ctypes.cast(ctypes.byref(temp_f), ctypes.POINTER(ctypes.c_long)),
-            )
-            if _ok(rc):
-                v = _finite_c(temp_f.value)
-                if v is not None:
-                    return v
+            u32 = int(ret_long) & 0xFFFFFFFF
+            v2 = struct.unpack("<f", struct.pack("<I", u32))[0]
+            return _sanitize(v2)
         except Exception:
-            pass
+            return None
 
-        # 2) Fallback: some older drivers returned FPGA temp as a long integer (°C)
-        if allow_int_fallback:
-            try:
-                temp_l = ctypes.c_long(0)
-                rc = ats.AlazarGetParameter(board.handle, 0, int(param), ctypes.byref(temp_l))
-                if _ok(rc):
-                    v = _finite_c(float(temp_l.value))
-                    if v is not None:
-                        return v
-            except Exception:
-                pass
+    def _get(param: int) -> Optional[float]:
+        try:
+            ret = ctypes.c_long(0)
+            rc = ats.AlazarGetParameter(board.handle, 0, int(param), ctypes.byref(ret))
+            if not _ok(rc):
+                return None
+            return _decode_temp(int(ret.value))
+        except Exception:
+            return None
 
-        return None
-
-    out["fpga"] = _get_temp(GET_FPGA_TEMPERATURE, allow_int_fallback=True)
-    out["adc"] = _get_temp(GET_ADC_TEMPERATURE, allow_int_fallback=False)
+    out["fpga"] = _get(GET_FPGA_TEMPERATURE)
+    out["adc"]  = _get(GET_ADC_TEMPERATURE)
     return out
-
-
 
 def channels_mask_to_str(mask: int) -> str:
     parts = []
