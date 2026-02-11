@@ -129,6 +129,7 @@ waveforms:
   threshold_peak_V: 0.0
   max_waveforms_per_sec: 50
   store_volts: true
+  dc_offset_correction: true    # Remove DC offset from waveforms (fixes step artifacts)
 
 storage:
   data_dir: dataFile_ATS9462
@@ -1113,12 +1114,32 @@ def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
     }
     return float(COMMON.get(rn, default_vpp))
 
-def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
+def _codes_to_volts_u16(u16: np.ndarray, vpp: float, apply_offset_correction: bool = True) -> np.ndarray:
     """
     Map uint16 ADC codes to volts for a bipolar input range (mid-scale = 0 V).
     Uses 65536 codes for correct LSB size.
+    
+    Args:
+        u16: ADC codes as uint16 array
+        vpp: Peak-to-peak voltage range
+        apply_offset_correction: If True, removes DC offset from waveform
+    
+    Returns:
+        Voltage values in volts
     """
-    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
+    # Standard bipolar conversion: 0V = code 32768
+    volts = (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
+    
+    # Optional: Remove DC offset for cleaner plots
+    # This removes any constant offset that might cause "steps" in the display
+    if apply_offset_correction and volts.size > 16:
+        # Use first 10% of samples to estimate DC offset
+        # (assumes trigger doesn't occur in first 10%)
+        n_baseline = max(8, min(int(volts.size * 0.1), 128))
+        dc_offset = np.median(volts[:n_baseline])
+        volts = volts - dc_offset
+    
+    return volts
 
 
 def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
@@ -1397,6 +1418,7 @@ def run_capture(cfg_path: Path) -> int:
         max_per_sec=int(waves.get("max_waveforms_per_sec", 50)),
     )
     store_volts = bool(waves.get("store_volts", True))
+    dc_offset_correction = bool(waves.get("dc_offset_correction", True))
 
     binfo = cfg.get("board", {}) if isinstance(cfg, dict) else {}
     systemId = int(binfo.get("system_id", 2))
@@ -1555,8 +1577,8 @@ def run_capture(cfg_path: Path) -> int:
                         area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]), baseline_B_V=float(baseB[r]),
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
-                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
-                        wfB_V = _codes_to_volts_u16(B[r], vpp=vppB) if store_volts else B[r].astype(np.float32)
+                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, apply_offset_correction=dc_offset_correction) if store_volts else A[r].astype(np.float32)
+                        wfB_V = _codes_to_volts_u16(B[r], vpp=vppB, apply_offset_correction=dc_offset_correction) if store_volts else B[r].astype(np.float32)
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -1579,7 +1601,7 @@ def run_capture(cfg_path: Path) -> int:
                         area_B_Vs=0.0, peak_B_V=0.0, baseline_B_V=0.0,
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
-                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
+                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, apply_offset_correction=dc_offset_correction) if store_volts else A[r].astype(np.float32)
                         archive.append_snip(
                             ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
@@ -1624,11 +1646,11 @@ def run_capture(cfg_path: Path) -> int:
             # Write EVERY buffer's representative waveform into the live ring for smooth GUI playback
             try:
                 # Use record 0 as representative; convert to volts with correct per-channel Vpp
-                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
+                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA, apply_offset_correction=dc_offset_correction)
                 wfB_live = None
                 chmask_live = 1
                 if ch_count == 2:
-                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB, apply_offset_correction=dc_offset_correction)
                     chmask_live = 3
                 ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
             except Exception:
