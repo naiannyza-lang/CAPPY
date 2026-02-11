@@ -1854,61 +1854,61 @@ class ArchiveBrowser(ttk.Frame):
         self._apply_hour_filter()
 
 
+    def _seek_mmss(self):
+        """Jump to the snip closest to MM:SS within the currently selected date/hour."""
+        if getattr(self, "_snips_view", pd.DataFrame()).empty:
+            return
+        txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
+        if not txt:
+            return
+        # Parse MM:SS (allow SS or M:SS)
+        mm = 0
+        ss = 0
+        try:
+            if ":" in txt:
+                a, b = txt.split(":", 1)
+                mm = int(a)
+                ss = int(b)
+            else:
+                ss = int(txt)
+        except Exception:
+            messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
+            return
+        if ss < 0 or ss > 59 or mm < 0:
+            messagebox.showerror("Invalid time", "Seconds must be 0–59.")
+            return
+        if self._sel_date is None or self._sel_hour is None:
+            return
+        try:
+            # Build a local-time target and compare in epoch ns
+            y, m, d = map(int, str(self._sel_date).split("-"))
+            hh = int(self._sel_hour)
+            target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
+            target_ns = int(target_local.timestamp() * 1e9)
+        except Exception:
+            return
 
-def _seek_mmss(self):
-    """Jump to the snip closest to MM:SS within the currently selected date/hour."""
-    if getattr(self, "_snips_view", pd.DataFrame()).empty:
-        return
-    txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
-    if not txt:
-        return
-    # Parse MM:SS (allow SS or M:SS)
-    mm = 0
-    ss = 0
-    try:
-        if ":" in txt:
-            a, b = txt.split(":", 1)
-            mm = int(a)
-            ss = int(b)
-        else:
-            ss = int(txt)
-    except Exception:
-        messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
-        return
-    if ss < 0 or ss > 59 or mm < 0:
-        messagebox.showerror("Invalid time", "Seconds must be 0–59.")
-        return
-    if self._sel_date is None or self._sel_hour is None:
-        return
-    try:
-        # Build a local-time target and compare in epoch ns
-        y, m, d = map(int, str(self._sel_date).split("-"))
-        hh = int(self._sel_hour)
-        target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
-        target_ns = int(target_local.timestamp() * 1e9)
-    except Exception:
-        return
+        df = self._snips_view.copy()
+        # Find nearest timestamp
+        try:
+            idx_min = (df["timestamp_ns"].astype("int64") - target_ns).abs().idxmin()
+        except Exception:
+            return
+        # Position in the currently rendered order
+        try:
+            pos = df.reset_index().index[df.reset_index()["index"] == idx_min][0]
+        except Exception:
+            # fallback: brute force
+            pos = 0
+        self.wlist.selection_clear(0, tk.END)
+        self.wlist.selection_set(pos)
+        self.wlist.see(pos)
+        # trigger display
+        try:
+            self._on_snip()
+        except Exception:
+            pass
 
-    df = self._snips_view.copy()
-    # Find nearest timestamp
-    try:
-        idx_min = (df["timestamp_ns"].astype("int64") - target_ns).abs().idxmin()
-    except Exception:
-        return
-    # Position in the currently rendered order
-    try:
-        pos = df.reset_index().index[df.reset_index()["index"] == idx_min][0]
-    except Exception:
-        # fallback: brute force
-        pos = 0
-    self.wlist.selection_clear(0, tk.END)
-    self.wlist.selection_set(pos)
-    self.wlist.see(pos)
-    # trigger display
-    try:
-        self._on_snip()
-    except Exception:
-        pass
     def _on_hour_wheel(self, evt):
         # Mouse wheel scroll selects next/prev hour entry
         if self.hlist.size() == 0:
