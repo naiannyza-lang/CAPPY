@@ -2258,7 +2258,7 @@ class LiveDashboard(ttk.Frame):
         # rolling stream buffers for true scrolling (concatenate each buffer waveform)
         self._streamA = np.empty((0,), dtype=np.float32)
         self._streamB = np.empty((0,), dtype=np.float32)
-        self._stream_window = 20000  # points shown in scrolling mode
+        self._stream_window = 10000  # points shown in scrolling mode (show ~10k samples for more detail)
 
         self._started_unix: Optional[float] = None
         self._last_seen_seq: int = 0
@@ -2285,6 +2285,8 @@ class LiveDashboard(ttk.Frame):
         # --- plots ---
         self.fig = plt.Figure(figsize=(8.2, 7.2))
         self.fig.patch.set_facecolor('#1e1e1e')
+        # More vertical separation between stacked plots
+        self.fig.subplots_adjust(hspace=0.55, top=0.95, bottom=0.08)
 
         # Scope-like layout: Channel A (top), Channel B (middle), Integration history (bottom)
         self.ax_wfA = self.fig.add_subplot(311)
