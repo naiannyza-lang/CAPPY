@@ -272,6 +272,39 @@ def ats_const(prefix_or_name: str, maybe_name: str | None = None) -> int:
         opts_msg = ""
     raise AttributeError(f"atsapi constant not found: {target} (prefix={prefix}){opts_msg}")
 
+
+def get_bits_per_sample(board, default_bits: int = 16) -> int:
+    """Return ADC resolution (bits per sample) for the connected board.
+
+    ATS-SDK specifies that for 2-byte sample words, the sample code is stored in the
+    most-significant bits of the 16-bit value; the number of valid bits depends on the
+    board (e.g., 12-bit ATS9352, 16-bit ATS9462). We query the driver via
+    AlazarGetChannelInfo when available. If the wrapper doesn't expose it, we fall back
+    to the provided default.
+
+    Returns:
+        bits per sample as int (e.g., 12, 14, 16)
+    """
+    try:
+        if hasattr(ats, "AlazarGetChannelInfo"):
+            h = getattr(board, "handle", None)
+            if h is None:
+                # common wrapper handle names
+                for nm in ("hBoard", "_hBoard", "boardHandle", "_handle"):
+                    h = getattr(board, nm, None)
+                    if h is not None:
+                        break
+            if h is not None:
+                mem = ctypes.c_uint32(0)
+                bps = ctypes.c_uint8(0)
+                rc = ats.AlazarGetChannelInfo(h, ctypes.byref(mem), ctypes.byref(bps))
+                if rc in (0, 512) and int(bps.value) > 0:
+                    return int(bps.value)
+    except Exception:
+        pass
+    return int(default_bits)
+
+
 def _write_json_atomic(path: Path, obj: dict) -> None:
     """Atomic JSON write to survive crashes/power loss."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -972,7 +1005,7 @@ class CappyArchive:
         pq.write_table(pa.Table.from_pandas(df, schema=SESSION_INDEX_SCHEMA, preserve_index=False), idx, compression="snappy")
         print(f"[CAPPY] Finalized session {self.session_id} reduced={self._n_reduced} snips={self._n_snips}")
 
-def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int, vpp: float):
+def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int, vpp: float, bits_per_sample: int = 16, signed: bool = False):
     """
     Reduce raw uint16 waveforms into baseline (V), peak (V) and gated integral (V·s).
 
@@ -994,7 +1027,7 @@ def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int
         g0, g1 = 0, min(1, n)
 
     # Convert to pure volts (no automatic baseline subtraction here)
-    V = _codes_to_volts_u16(raw, vpp=vpp)  # float32 volts
+    V = _codes_to_volts_u16(raw, vpp=vpp, bits_per_sample=bits_per_sample, signed=signed)  # float32 volts
     
     # Calculate baseline from specified window
     baseline_V = V[:, b0:b1].mean(axis=1, dtype=np.float32).astype(np.float64)
@@ -1091,22 +1124,49 @@ def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
     }
     return float(COMMON.get(rn, default_vpp))
 
-def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
+def _codes_to_volts_u16(u16: np.ndarray, vpp: float, bits_per_sample: int = 16, signed: bool = False) -> np.ndarray:
+    """Convert 2-byte sample words to volts.
+
+    ATS-SDK: for 2-byte samples, the *sample code* lives in the most-significant bits of the
+    16-bit word; therefore right-shift by (16 - bits_per_sample) to extract the code. 
+
+    For unsigned (default, offset-binary): code ~= 2^(N-1) is ~0 V, code 0 is -full-scale, and
+    code (2^N-1) is +full-scale. 
+
+    For signed: code 0 is ~0 V, +max is +full-scale, -max is -full-scale. 
+
+    Args:
+        u16: numpy array of uint16 sample *words* as delivered by DMA
+        vpp: selected input range in volts peak-to-peak (Vpp)
+        bits_per_sample: ADC resolution (e.g., 12, 14, 16)
+        signed: set True if you have configured signed data format
+
+    Returns:
+        float32 volts, same shape as u16
     """
-    Map uint16 ADC codes to volts for a bipolar input range (mid-scale = 0 V).
-    Uses 65536 codes for correct LSB size (ATS-9462 is 16-bit).
-    
-    Formula:
-      Code 0     -> -Vpp/2
-      Code 32768 -> 0 V
-      Code 65535 -> +Vpp/2
-    
-    Note: This does purely mathematical conversion. It does NOT remove DC offset.
-    Baseline subtraction should be handled explicitly by the caller using a defined window.
-    """
-    # Standard bipolar conversion: 0V = code 32768
-    # Using float32 for speed, cast to float64 if needed later
-    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
+    n = int(bits_per_sample)
+    n = 16 if n <= 0 else (16 if n > 16 else n)
+    shift = 16 - n
+
+    # Extract sample code from MSBs
+    codes_u = (u16.astype(np.uint16, copy=False) >> shift).astype(np.int32, copy=False)
+
+    input_range = float(vpp) / 2.0  # +/- input_range volts
+
+    if signed:
+        # Interpret as N-bit two's complement
+        signbit = 1 << (n - 1)
+        codes_s = (codes_u ^ signbit) - signbit
+        code_zero = 0.0
+        code_range = float((1 << (n - 1)) - 1)
+        return (codes_s.astype(np.float32) - code_zero) * (input_range / code_range)
+
+    # Unsigned offset-binary calibration from ATS-SDK examples:
+    # codeZero = 2^(N-1) - 0.5 ; codeRange = 2^(N-1) - 0.5
+    code_zero = float((1 << (n - 1)) - 0.5)
+    code_range = float((1 << (n - 1)) - 0.5)
+    return (codes_u.astype(np.float32) - code_zero) * (input_range / code_range)
+
 
 
 def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
@@ -1384,6 +1444,14 @@ def run_capture(cfg_path: Path) -> int:
     board = ats.Board(systemId=systemId, boardId=boardId)
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
+    # ADC resolution (bits/sample) matters: for many boards (e.g., ATS9352 = 12-bit),
+    # the sample code is stored in the MSBs of each 16-bit word.
+    # ATS9462: fixed 16-bit sample codes in 16-bit words; no YAML knob needed.
+    # We still query the driver as a sanity check, but default to 16.
+    adc_bits = get_bits_per_sample(board, 16)
+    signed_samples = bool(((cfg.get('data_format', {}) or {}).get('signed', False)))
+
+
     ch_mask = channels_from_mask_expr(ch_expr)
     ch_count = infer_channel_count_from_mask(ch_mask)
 
@@ -1521,8 +1589,8 @@ def run_capture(cfg_path: Path) -> int:
             if ch_count == 2:
                 A = raw[0::2].reshape(rpb, spr)
                 B = raw[1::2].reshape(rpb, spr)
-                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
-                areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB)
+                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA, bits_per_sample=adc_bits, signed=signed_samples)
+                areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB, bits_per_sample=adc_bits, signed=signed_samples)
                 for r in range(rpb):
                     rec_g = global_rec + r
                     red_rows.append(dict(
@@ -1535,9 +1603,9 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
                             if dc_offset_correction: wfA_V -= baseA[r]
-                            wfB_V = _codes_to_volts_u16(B[r], vpp=vppB)
+                            wfB_V = _codes_to_volts_u16(B[r], vpp=vppB, bits_per_sample=adc_bits, signed=signed_samples)
                             if dc_offset_correction: wfB_V -= baseB[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
@@ -1553,7 +1621,7 @@ def run_capture(cfg_path: Path) -> int:
                         )
             else:
                 A = raw.reshape(rpb, spr)
-                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
+                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA, bits_per_sample=adc_bits, signed=signed_samples)
                 for r in range(rpb):
                     rec_g = global_rec + r
                     red_rows.append(dict(
@@ -1566,7 +1634,7 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
                             if dc_offset_correction: wfA_V -= baseA[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
@@ -1583,13 +1651,13 @@ def run_capture(cfg_path: Path) -> int:
             # Live GUI updates
             try:
                 # Use record 0 as representative; convert to volts
-                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
+                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
                 if dc_offset_correction: wfA_live -= baseA[0]
                 
                 wfB_live = None
                 chmask_live = 1
                 if ch_count == 2:
-                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB, bits_per_sample=adc_bits, signed=signed_samples)
                     if dc_offset_correction: wfB_live -= baseB[0]
                     chmask_live = 3
                 
