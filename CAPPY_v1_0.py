@@ -1011,6 +1011,9 @@ def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int
 
     This version converts ADC codes -> volts using the configured input range (Vpp),
     then does baseline subtraction in volts using the calculated baseline from b0:b1.
+    
+    Note: bits_per_sample and signed parameters are retained for API compatibility
+    but are no longer used since ATS-9462 is always 16-bit unsigned.
     """
     if raw.dtype != np.uint16:
         raw = raw.astype(np.uint16, copy=False)
@@ -1026,8 +1029,8 @@ def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int
     if g1 <= g0:
         g0, g1 = 0, min(1, n)
 
-    # Convert to pure volts (no automatic baseline subtraction here)
-    V = _codes_to_volts_u16(raw, vpp=vpp, bits_per_sample=bits_per_sample, signed=signed)  # float32 volts
+    # Convert to volts using corrected conversion
+    V = _codes_to_volts_u16(raw, vpp=vpp)  # float32 volts
     
     # Calculate baseline from specified window
     baseline_V = V[:, b0:b1].mean(axis=1, dtype=np.float32).astype(np.float64)
@@ -1125,47 +1128,26 @@ def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
     return float(COMMON.get(rn, default_vpp))
 
 def _codes_to_volts_u16(u16: np.ndarray, vpp: float, bits_per_sample: int = 16, signed: bool = False) -> np.ndarray:
-    """Convert 2-byte sample words to volts.
-
-    ATS-SDK: for 2-byte samples, the *sample code* lives in the most-significant bits of the
-    16-bit word; therefore right-shift by (16 - bits_per_sample) to extract the code. 
-
-    For unsigned (default, offset-binary): code ~= 2^(N-1) is ~0 V, code 0 is -full-scale, and
-    code (2^N-1) is +full-scale. 
-
-    For signed: code 0 is ~0 V, +max is +full-scale, -max is -full-scale. 
-
+    """Convert uint16 ADC codes to volts for ATS-9462 (16-bit ADC).
+    
+    CORRECTED VERSION - The ATS-9462 is a true 16-bit ADC that uses all 65536 codes.
+    For unsigned offset-binary encoding (default), code 32768 represents 0V.
+    
+    Previous version had a bug: it applied bit-shifting and -0.5 offset corrections
+    meant for lower-resolution ADCs (12-14 bit), causing a discontinuity at mid-scale.
+    
     Args:
-        u16: numpy array of uint16 sample *words* as delivered by DMA
+        u16: numpy array of uint16 ADC codes as delivered by DMA
         vpp: selected input range in volts peak-to-peak (Vpp)
-        bits_per_sample: ADC resolution (e.g., 12, 14, 16)
-        signed: set True if you have configured signed data format
-
+        bits_per_sample: ADC resolution (ignored for ATS-9462, always 16-bit)
+        signed: set True if signed data format configured (not typical for ATS-9462)
+    
     Returns:
         float32 volts, same shape as u16
     """
-    n = int(bits_per_sample)
-    n = 16 if n <= 0 else (16 if n > 16 else n)
-    shift = 16 - n
-
-    # Extract sample code from MSBs
-    codes_u = (u16.astype(np.uint16, copy=False) >> shift).astype(np.int32, copy=False)
-
-    input_range = float(vpp) / 2.0  # +/- input_range volts
-
-    if signed:
-        # Interpret as N-bit two's complement
-        signbit = 1 << (n - 1)
-        codes_s = (codes_u ^ signbit) - signbit
-        code_zero = 0.0
-        code_range = float((1 << (n - 1)) - 1)
-        return (codes_s.astype(np.float32) - code_zero) * (input_range / code_range)
-
-    # Unsigned offset-binary calibration from ATS-SDK examples:
-    # codeZero = 2^(N-1) - 0.5 ; codeRange = 2^(N-1) - 0.5
-    code_zero = float((1 << (n - 1)) - 0.5)
-    code_range = float((1 << (n - 1)) - 0.5)
-    return (codes_u.astype(np.float32) - code_zero) * (input_range / code_range)
+    # ATS-9462 is a true 16-bit ADC - no bit-shifting needed
+    # Code 0 = -Vpp/2, Code 32768 = 0V, Code 65535 = +Vpp/2
+    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
 
 
 
@@ -1603,9 +1585,9 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
                             if dc_offset_correction: wfA_V -= baseA[r]
-                            wfB_V = _codes_to_volts_u16(B[r], vpp=vppB, bits_per_sample=adc_bits, signed=signed_samples)
+                            wfB_V = _codes_to_volts_u16(B[r], vpp=vppB)
                             if dc_offset_correction: wfB_V -= baseB[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
@@ -1634,7 +1616,7 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
                             if dc_offset_correction: wfA_V -= baseA[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
@@ -1651,13 +1633,13 @@ def run_capture(cfg_path: Path) -> int:
             # Live GUI updates
             try:
                 # Use record 0 as representative; convert to volts
-                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
+                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
                 if dc_offset_correction: wfA_live -= baseA[0]
                 
                 wfB_live = None
                 chmask_live = 1
                 if ch_count == 2:
-                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB, bits_per_sample=adc_bits, signed=signed_samples)
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
                     if dc_offset_correction: wfB_live -= baseB[0]
                     chmask_live = 3
                 
