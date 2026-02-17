@@ -1,34 +1,7 @@
 #!/usr/bin/env python3
 """
 CAPPY - Capture & Archive Python for ATS-9462
-Version 1.0 - FINAL FIX
-
-CRITICAL FIXES APPLIED FOR ATS-9462 DISCONTINUITY ISSUE:
-
-1. DUAL ADC CALIBRATION (_apply_dual_adc_calibration_ats9462):
-   - ATS-9462 uses two ADCs sampling alternately (even/odd samples)
-   - Each ADC has different DC offset causing discontinuities
-   - Applied per-ADC offset correction to eliminate 638-code even/odd bias
-   
-2. CORRECT 16-BIT VOLTAGE CONVERSION (_codes_to_volts_u16):
-   - Fixed formula for true 16-bit ADC: V = (code - 32768) * (Vpp / 65536)
-   - Removed incorrect offset adjustments from 12-bit boards
-   
-3. MISSING BOARD CONFIGURATION CALLS:
-   - Added board.setBWLimit() for both channels (required for ATS-9462)
-   - Added board.configureAuxIO() for AUX connector initialization
-   
-4. YAML CONFIGURATION:
-   - Added bandwidth_limit parameter (must be 0 for full 90MHz bandwidth)
-   - Ensures bunch_spacing_samples aligns to 32-sample boundaries
-
-ROOT CAUSE ANALYSIS:
-- Diagnostic showed even samples mean=19150, odd samples mean=18512 (638 code offset)
-- AlazarDSO works fine → board has valid calibration, but code wasn't applying it
-- The "discontinuity" was actually toggling between uncalibrated ADC offsets
-- Solution: Apply per-buffer calibration to correct ADC-to-ADC offset mismatch
-
-For details, see diagnostic output and analysis documents.
+Version 1.0 - FIXED VOLTAGE SCALING
 """
 from __future__ import annotations
 
@@ -110,12 +83,10 @@ channels:
     coupling: DC               # ATS-9462 supports DC coupling
     range: PM_400_MV           # Valid ranges: 200mV, 400mV, 800mV, 2V, 4V (50Ω)
     impedance: 50_OHM          # or 1_MEGAOHM (adds ±8V, ±16V ranges)
-    bandwidth_limit: 0         # CRITICAL: 0=full BW (90MHz), 1=enable BW limiting
   B:
     coupling: DC
     range: PM_400_MV
     impedance: 50_OHM
-    bandwidth_limit: 0         # CRITICAL: 0=full BW (90MHz), 1=enable BW limiting
 
 trigger:
   operation: TRIG_ENGINE_OP_J
@@ -1060,7 +1031,7 @@ def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int
         g0, g1 = 0, min(1, n)
 
     # Convert to pure volts (no automatic baseline subtraction here)
-    V = _codes_to_volts_u16(raw, vpp=vpp, bits_per_sample=bits_per_sample, signed=signed)  # float32 volts
+    V = _codes_to_volts_u16(raw, vpp=vpp)  # float32 volts
     
     # Calculate baseline from specified window
     baseline_V = V[:, b0:b1].mean(axis=1, dtype=np.float32).astype(np.float64)
@@ -1157,112 +1128,26 @@ def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
     }
     return float(COMMON.get(rn, default_vpp))
 
-def _apply_dual_adc_calibration_ats9462(u16: np.ndarray) -> np.ndarray:
+def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
     """
-    Apply dual ADC offset calibration for ATS-9462.
+    Map uint16 ADC codes to volts for a bipolar input range (mid-scale = 0 V).
     
-    The ATS-9462 uses two ADCs sampling alternately:
-    - ADC #1: Even samples (0, 2, 4, 6, ...)
-    - ADC #2: Odd samples (1, 3, 5, 7, ...)
+    For ATS-9462 (true 16-bit ADC):
+    - Code 0     = -Vpp/2  (minimum voltage)
+    - Code 32768 = 0 V     (mid-scale, zero volts)
+    - Code 65535 = +Vpp/2  (maximum voltage)
     
-    Each ADC has a different DC offset that must be corrected.
-    This function applies per-ADC offset correction based on measured values.
-    
-    Measured offsets (from diagnostic with floating inputs):
-    - ADC #1 (even): mean = 19150 codes → offset = -13618 from mid-scale
-    - ADC #2 (odd):  mean = 18512 codes → offset = -14256 from mid-scale
-    
-    For properly terminated 50Ω inputs, these offsets should be much smaller,
-    but the relative difference between ADCs remains and must be corrected.
+    Uses 65536 codes for correct LSB size.
+    This matches the working ATS-9352 code.
     
     Args:
-        u16: Raw uint16 ADC codes from the board
-        
-    Returns:
-        Calibrated uint16 codes with per-ADC offsets corrected
-    """
-    if u16.size == 0:
-        return u16
-    
-    # Work in int32 to avoid overflow during correction
-    calibrated = u16.astype(np.int32, copy=True)
-    
-    # Separate even and odd samples
-    even_samples = calibrated[0::2]
-    odd_samples = calibrated[1::2]
-    
-    # Calculate mean offset for each ADC (assumes zero input or symmetric noise)
-    # For floating inputs, we measure the actual DC level of each ADC
-    # For terminated inputs, this removes the residual ADC-to-ADC offset
-    even_mean = even_samples.mean()
-    odd_mean = odd_samples.mean()
-    
-    # Expected mid-scale for 16-bit unsigned
-    mid_scale = 32768.0
-    
-    # Calculate corrections to bring each ADC to mid-scale
-    even_correction = int(mid_scale - even_mean)
-    odd_correction = int(mid_scale - odd_mean)
-    
-    # Apply corrections
-    calibrated[0::2] = even_samples + even_correction
-    calibrated[1::2] = odd_samples + odd_correction
-    
-    # Clip to valid uint16 range
-    calibrated = np.clip(calibrated, 0, 65535)
-    
-    return calibrated.astype(np.uint16)
-
-
-def _codes_to_volts_u16(u16: np.ndarray, vpp: float, bits_per_sample: int = 16, signed: bool = False) -> np.ndarray:
-    """Convert 2-byte sample words to volts.
-
-    ATS-SDK: for 2-byte samples, the *sample code* lives in the most-significant bits of the
-    16-bit word; therefore right-shift by (16 - bits_per_sample) to extract the code. 
-
-    For unsigned (default, offset-binary): code ~= 2^(N-1) is ~0 V, code 0 is -full-scale, and
-    code (2^N-1) is +full-scale. 
-
-    For signed: code 0 is ~0 V, +max is +full-scale, -max is -full-scale. 
-
-    Args:
-        u16: numpy array of uint16 sample *words* as delivered by DMA
+        u16: numpy array of uint16 ADC codes
         vpp: selected input range in volts peak-to-peak (Vpp)
-        bits_per_sample: ADC resolution (e.g., 12, 14, 16)
-        signed: set True if you have configured signed data format
-
+    
     Returns:
         float32 volts, same shape as u16
     """
-    n = int(bits_per_sample)
-    n = 16 if n <= 0 else (16 if n > 16 else n)
-    shift = 16 - n
-
-    # Extract sample code from MSBs
-    codes_u = (u16.astype(np.uint16, copy=False) >> shift).astype(np.int32, copy=False)
-
-    input_range = float(vpp) / 2.0  # +/- input_range volts
-
-    if signed:
-        # Interpret as N-bit two's complement
-        signbit = 1 << (n - 1)
-        codes_s = (codes_u ^ signbit) - signbit
-        code_zero = 0.0
-        code_range = float((1 << (n - 1)) - 1)
-        return (codes_s.astype(np.float32) - code_zero) * (input_range / code_range)
-
-    # Unsigned offset-binary conversion for 16-bit ATS-9462
-    # For true 16-bit ADC: code 0 = -Vpp/2, code 32768 = 0V, code 65535 = +Vpp/2
-    # Use simple linear conversion: V = (code - 32768) * (Vpp / 65536)
-    
-    if n == 16:
-        # True 16-bit conversion (ATS-9462 uses all 65536 codes)
-        return (codes_u.astype(np.float32) - 32768.0) * (vpp / 65536.0)
-    else:
-        # For < 16 bit boards, use the SDK calibration formula
-        code_zero = float((1 << (n - 1)) - 0.5)
-        code_range = float((1 << (n - 1)) - 0.5)
-        return (codes_u.astype(np.float32) - code_zero) * (input_range / code_range)
+    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
 
 
 
@@ -1428,10 +1313,11 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
             imp = ats_const("IMPEDANCE_", str(cc.get("impedance", "50_OHM")))
             board.inputControlEx(mask, coupling, rng, imp)
             
-            # CRITICAL: Set bandwidth limit for ATS-9462
-            # 0 = full bandwidth (90 MHz), 1 = enable bandwidth limiting
-            bw_limit = int(cc.get("bandwidth_limit", 0))
-            board.setBWLimit(mask, bw_limit)
+            # Set bandwidth limit (0 = full bandwidth, required for ATS-9462)
+            try:
+                board.setBWLimit(mask, 0)
+            except Exception as e:
+                print(f"[WARN] setBWLimit failed for channel {nm}: {e}")
 
     t = cfg.get("trigger", {}) or {}
     operation = ats_const(str(t.get("operation", "TRIG_ENGINE_OP_J")))
@@ -1487,12 +1373,11 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
         print(f"[CAPPY] noise_test enabled -> using trigger.timeout_ms={timeout_ms} for auto-trigger noise captures")
     board.setTriggerTimeOut(timeout_ms)
     
-    # CRITICAL: Configure AUX I/O for ATS-9462
-    # This initializes the AUX connector (required for proper board operation)
+    # Configure AUX I/O (required for proper board operation)
     try:
         board.configureAuxIO(ats.AUX_OUT_TRIGGER, 0)
     except Exception as e:
-        print(f"[WARN] configureAuxIO failed (may not be critical): {e}")
+        print(f"[WARN] configureAuxIO failed: {e}")
 
     return sr_hz, float(vpp_A), float(vpp_B)
 
@@ -1692,11 +1577,6 @@ def run_capture(cfg_path: Path) -> int:
             raw = buf.buffer
             if raw.dtype != np.uint16:
                 raw = raw.astype(np.uint16, copy=False)
-            
-            # CRITICAL FIX: Apply dual ADC calibration for ATS-9462
-            # This corrects for offset differences between the two ADCs
-            # that sample alternately (even/odd samples)
-            raw = _apply_dual_adc_calibration_ats9462(raw)
 
             red_rows: List[Dict[str, Any]] = []
 
@@ -1717,9 +1597,9 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
                             if dc_offset_correction: wfA_V -= baseA[r]
-                            wfB_V = _codes_to_volts_u16(B[r], vpp=vppB, bits_per_sample=adc_bits, signed=signed_samples)
+                            wfB_V = _codes_to_volts_u16(B[r], vpp=vppB)
                             if dc_offset_correction: wfB_V -= baseB[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
@@ -1748,7 +1628,7 @@ def run_capture(cfg_path: Path) -> int:
                     ))
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         if store_volts:
-                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
+                            wfA_V = _codes_to_volts_u16(A[r], vpp=vppA)
                             if dc_offset_correction: wfA_V -= baseA[r]
                         else:
                             wfA_V = A[r].astype(np.float32)
@@ -1765,13 +1645,13 @@ def run_capture(cfg_path: Path) -> int:
             # Live GUI updates
             try:
                 # Use record 0 as representative; convert to volts
-                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA, bits_per_sample=adc_bits, signed=signed_samples)
+                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
                 if dc_offset_correction: wfA_live -= baseA[0]
                 
                 wfB_live = None
                 chmask_live = 1
                 if ch_count == 2:
-                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB, bits_per_sample=adc_bits, signed=signed_samples)
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
                     if dc_offset_correction: wfB_live -= baseB[0]
                     chmask_live = 3
                 
