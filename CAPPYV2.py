@@ -579,13 +579,26 @@ class BoardAcquisition:
             self._log(f"Connecting to System {system_id}, Board {board_id}...")
             self.board = ats.Board(systemId=system_id, boardId=board_id)
             
-            # CRITICAL FIX: Verify board connection
+            # Verify board connection (Alazar ATSAPI Python wrapper compatibility)
+            # Older/official examples use getChannelInfo() which returns (maxSamplesPerChannel, bitsPerSample).
             try:
-                bits = self.board.bitsPerSample()
+                _, bits = self.board.getChannelInfo()
                 self._log(f"✓ Board connected: {bits} bits/sample")
             except Exception as e:
-                self._log(f"✗ Board connection failed: {e}")
-                return False
+                # Fallbacks for wrapper variants
+                bits = None
+                try:
+                    fn = getattr(self.board, "bitsPerSample", None)
+                    if callable(fn):
+                        bits = fn()
+                except Exception:
+                    bits = None
+
+                if bits is None:
+                    self._log(f"✗ Board connection failed: {e}")
+                    return False
+
+                self._log(f"✓ Board connected: {bits} bits/sample")
             
             # Configure clock
             clock_cfg = self.config.get('clock', {})
