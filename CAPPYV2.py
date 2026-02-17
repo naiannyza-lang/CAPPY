@@ -73,7 +73,7 @@ UI_COLORS = {
     'bg_medium': '#2d2d2d',
     'bg_sidebar': '#252525',
     'bg_widget': '#2a2a2a',
-    'button_bg': '#3a3a3a',
+    'button_bg': '#2f2f2f',
     'button_fg': 'white',
     'play_button_bg': '#3f3f3f',   # Grey background
     'play_button_fg': 'white',     # White text
@@ -264,6 +264,7 @@ storage:
   sqlite_commit_every_snips: 200
 
 runtime:
+  readout_mode: TR
   noise_test: false
   autotrigger_timeout_ms: 10
 """
@@ -341,6 +342,7 @@ storage:
   sqlite_commit_every_snips: 200
 
 runtime:
+  readout_mode: NPT
   noise_test: true
   autotrigger_timeout_ms: 10
 """
@@ -758,7 +760,8 @@ class BoardAcquisition:
                 buffers.append(ats.DMABuffer(self.board.handle, ctypes.c_uint16, bytes_per_buffer))
                 
             runtime_cfg = self.config.get('runtime', {})
-            use_npt_mode = self.board_type == '9462' and runtime_cfg.get('noise_test', False)
+            readout_mode = str(runtime_cfg.get('readout_mode', 'TR')).strip().upper()
+            use_npt_mode = readout_mode in ('NPT', 'NO_PRETRIGGER', 'NO-PRETRIGGER')
             
             if use_npt_mode:
                 self._log("Using NPT mode (No Pre-Trigger)")
@@ -1032,6 +1035,171 @@ class ArchiveViewer(tk.Toplevel):
         self.details.insert(tk.END, f"  - reduced/ and waveforms/ under hour folders in: {day_dir}\n")
 
 
+
+class ArchiveViewer(tk.Toplevel):
+    """Simple archive browser bound to a board's data_dir.
+
+    - Lists files under data_dir (recursive)
+    - Double-click to preview .npy/.npz waveforms
+    """
+
+    def __init__(self, master, title: str, data_dir: Path):
+        super().__init__(master)
+        self.title(title)
+        self.configure(bg=UI_COLORS['bg_dark'])
+        self.geometry("980x720")
+        self.minsize(820, 560)
+
+        self.data_dir = Path(data_dir)
+        self.filter_var = tk.StringVar(value="")
+        self._files = []
+
+        top = tk.Frame(self, bg=UI_COLORS['bg_medium'])
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Label(top, text=str(self.data_dir), bg=UI_COLORS['bg_medium'], fg='white').pack(side=tk.LEFT, padx=10, pady=8)
+
+        tk.Label(top, text="Filter:", bg=UI_COLORS['bg_medium'], fg='#ccc').pack(side=tk.LEFT, padx=(10, 4))
+        ent = tk.Entry(top, textvariable=self.filter_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=28)
+        ent.pack(side=tk.LEFT, pady=8)
+        ent.bind("<KeyRelease>", lambda _e=None: self.refresh_list())
+
+        tk.Button(
+            top, text="Refresh",
+            command=self.refresh_list,
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
+            relief=tk.FLAT, cursor='hand2', padx=10
+        ).pack(side=tk.RIGHT, padx=10, pady=6)
+
+        tk.Button(
+            top, text="Open Folder",
+            command=self.open_folder,
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
+            relief=tk.FLAT, cursor='hand2', padx=10
+        ).pack(side=tk.RIGHT, padx=6, pady=6)
+
+        body = tk.Frame(self, bg=UI_COLORS['bg_dark'])
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Left: file list
+        left = tk.Frame(body, bg=UI_COLORS['bg_dark'])
+        left.pack(side=tk.LEFT, fill=tk.Y)
+
+        self.listbox = tk.Listbox(left, bg='#1e1e1e', fg='white', width=55, activestyle='none',
+                                  selectbackground='#444', highlightthickness=0)
+        self.listbox.pack(side=tk.LEFT, fill=tk.Y, expand=False, padx=(10, 0), pady=10)
+
+        sb = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.listbox.yview)
+        sb.pack(side=tk.LEFT, fill=tk.Y, pady=10)
+        self.listbox.configure(yscrollcommand=sb.set)
+
+        self.listbox.bind("<Double-Button-1>", lambda _e=None: self.preview_selected())
+
+        # Right: preview plot
+        right = tk.Frame(body, bg=UI_COLORS['bg_dark'])
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        self.fig = plt.Figure(figsize=(6, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Preview")
+        self.ax.grid(True, alpha=0.2)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        btns = tk.Frame(right, bg=UI_COLORS['bg_dark'])
+        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        tk.Button(
+            btns, text="Preview",
+            command=self.preview_selected,
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
+            relief=tk.FLAT, cursor='hand2', padx=12
+        ).pack(side=tk.LEFT)
+
+        tk.Button(
+            btns, text="Close",
+            command=self.destroy,
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
+            relief=tk.FLAT, cursor='hand2', padx=12
+        ).pack(side=tk.RIGHT)
+
+        self.refresh_list()
+
+    def open_folder(self):
+        try:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(self.data_dir)])
+        except Exception:
+            pass
+
+    def _iter_files(self):
+        if not self.data_dir.exists():
+            return []
+        out = []
+        for p in self.data_dir.rglob("*"):
+            if p.is_file():
+                # keep common capture formats
+                if p.suffix.lower() in (".npy", ".npz", ".bin", ".dat", ".csv", ".txt"):
+                    out.append(p)
+        return sorted(out)
+
+    def refresh_list(self):
+        flt = self.filter_var.get().strip().lower()
+        self._files = self._iter_files()
+        self.listbox.delete(0, tk.END)
+
+        for p in self._files:
+            s = str(p.relative_to(self.data_dir))
+            if flt and flt not in s.lower():
+                continue
+            self.listbox.insert(tk.END, s)
+
+    def _get_selected_path(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return None
+        rel = self.listbox.get(sel[0])
+        return self.data_dir / rel
+
+    def preview_selected(self):
+        p = self._get_selected_path()
+        if p is None:
+            return
+
+        self.ax.clear()
+        self.ax.grid(True, alpha=0.2)
+
+        try:
+            if p.suffix.lower() == ".npy":
+                arr = np.load(p, allow_pickle=False)
+                y = np.ravel(arr)
+                self.ax.plot(y)
+                self.ax.set_title(str(p.name))
+
+            elif p.suffix.lower() == ".npz":
+                z = np.load(p, allow_pickle=False)
+                # Try common keys
+                for key in ("A", "B", "chA", "chB", "wfA", "wfB", "waveform", "data"):
+                    if key in z.files:
+                        y = np.ravel(z[key])
+                        self.ax.plot(y)
+                        self.ax.set_title(f"{p.name} : {key}")
+                        break
+                else:
+                    # plot first array-like
+                    y = np.ravel(z[z.files[0]])
+                    self.ax.plot(y)
+                    self.ax.set_title(f"{p.name} : {z.files[0]}")
+            else:
+                self.ax.text(0.02, 0.98, f"Preview not supported for {p.suffix}", transform=self.ax.transAxes, va='top')
+                self.ax.set_title(str(p.name))
+
+        except Exception as e:
+            self.ax.text(0.02, 0.98, f"Failed to load: {e}", transform=self.ax.transAxes, va='top')
+            self.ax.set_title(str(p.name))
+
+        self.canvas.draw_idle()
+
 class DualBoardGUI:
     """Main GUI - fully corrected with all improvements"""
     
@@ -1216,7 +1384,7 @@ class DualBoardGUI:
             )
             dock_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-                # Scroll area (with mouse wheel + width sync so popout isn't cropped)
+        # Scroll area (with mouse wheel + width sync so popout isn't cropped)
         canvas = tk.Canvas(parent, bg=UI_COLORS['bg_sidebar'], highlightthickness=0)
         scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
         scrollable_frame = tk.Frame(canvas, bg=UI_COLORS['bg_sidebar'])
@@ -1252,10 +1420,27 @@ class DualBoardGUI:
             w.bind("<Button-4>", _on_mousewheel)
             w.bind("<Button-5>", _on_mousewheel)
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        def _bind_all(_e=None):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_all(_e=None):
+            try:
+                canvas.unbind_all("<MouseWheel>")
+                canvas.unbind_all("<Button-4>")
+                canvas.unbind_all("<Button-5>")
+            except Exception:
+                pass
+
+        canvas.bind("<Enter>", _bind_all)
+        canvas.bind("<Leave>", _unbind_all)
+
+canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-# Archives
+        # Archives
         tk.Label(
             scrollable_frame, text="ARCHIVES",
             bg=UI_COLORS['bg_sidebar'], fg='white',
@@ -1519,6 +1704,18 @@ class DualBoardGUI:
         ttk.OptionMenu(
             trig_row, slope_var, slope_var.get(), *slope_labels,
             command=lambda _=None: self._apply_trigger_setting(board_type, 'slopeJ', slope_map.get(slope_var.get(), 'TRIGGER_SLOPE_POSITIVE'))
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Readout mode (TR vs NPT)
+        mode_row = tk.Frame(trigger_box, bg=UI_COLORS['bg_widget'])
+        mode_row.pack(fill=tk.X, padx=8, pady=(0, 2))
+
+        tk.Label(mode_row, text="Readout", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
+        readout_var = tk.StringVar(value="TR")
+        setattr(self, f"_readout_{board_type}", readout_var)
+        ttk.OptionMenu(
+            mode_row, readout_var, readout_var.get(), "TR", "NPT",
+            command=lambda _=None: self.update_readout_mode(board_type, readout_var.get())
         ).pack(side=tk.LEFT, padx=(6, 0))
 
         # Level as percent
@@ -2031,21 +2228,62 @@ class DualBoardGUI:
         if isinstance(dv, tk.BooleanVar):
             dv.set(not enabled)
             
-    def open_archive(self, board_type):
+    
+    def update_readout_mode(self, board_type: str, mode: str):
+        """Set TR vs NPT mode (persists to YAML; restarts board if running)."""
+        mode_u = str(mode).strip().upper()
+        if mode_u not in ("TR", "NPT"):
+            mode_u = "TR"
+
+        acq = self._ensure_acq(board_type)
+        if acq is None:
+            return
+        if acq.config is None:
+            acq.load_config()
+
+        acq.config.setdefault('runtime', {})['readout_mode'] = mode_u
+        self._write_config(board_type)
+
+        if acq.running:
+            self.log_message(f"Applying {COLORS[board_type]['name']} readout_mode={mode_u} (restart)")
+            self.stop_board(board_type)
+            time.sleep(0.2)
+            self.start_board(board_type)
+def open_archive(self, board_type):
         acq = self.acq_9352 if board_type == '9352' else self.acq_9462
         if not acq or not acq.config:
             messagebox.showwarning("Warning", "No configuration loaded for this board")
             return
-            
+
         data_dir = Path(acq.config.get('storage', {}).get('data_dir', '.'))
-        
         if not data_dir.exists():
-            messagebox.showwarning("Warning", f"Data directory does not exist: {data_dir}")
-            return
-            
-        self.log_message(f"Opening archive for {COLORS[board_type]['name']}: {data_dir}")
-        messagebox.showinfo("Archive", f"Archive viewer not yet implemented.\nData directory: {data_dir}")
-        
+            # Create if missing (matches your request)
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+                self.log_message(f"Created missing data directory: {data_dir}")
+            except Exception as e:
+                messagebox.showwarning("Warning", f"Data directory does not exist and could not be created:
+{data_dir}
+{e}")
+                return
+
+        if not hasattr(self, "_archive_windows"):
+            self._archive_windows = {}
+
+        # Reuse an existing viewer per board
+        win = self._archive_windows.get(board_type)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                win.focus_force()
+                return
+        except Exception:
+            pass
+
+        title = f"{COLORS[board_type]['name']} Archive"
+        win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
+        self._archive_windows[board_type] = win
+
     def log_message(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
@@ -2112,7 +2350,12 @@ class DualBoardGUI:
             data['intB'].pop(0)
             data['time'].pop(0)
             
-        if len(data['A']) % 10 == 0:
+        # Refresh plots more responsively (throttled)
+        now = time.time()
+        if not hasattr(self, '_last_plot_time'):
+            self._last_plot_time = 0.0
+        if (now - self._last_plot_time) >= 0.08:
+            self._last_plot_time = now
             self.refresh_plots()
             
     def refresh_plots(self):
