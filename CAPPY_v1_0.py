@@ -1,7 +1,31 @@
 #!/usr/bin/env python3
 """
 CAPPY - Capture & Archive Python for ATS-9462
-Version 1.0 - FIXED VOLTAGE SCALING
+Version 1.0 - FIXED VOLTAGE SCALING + NPT MODE
+
+FIXES APPLIED:
+1. Corrected voltage conversion formula for true 16-bit ADC
+   - Uses simple formula: V = (code - 32768) * (Vpp / 65536)
+   - Matches working ATS-9352 code
+   - Removed incorrect bits_per_sample and signed parameters
+
+2. Added missing board initialization calls:
+   - board.setBWLimit() for both channels (required)
+   - board.configureAuxIO() for AUX connector initialization
+
+3. CRITICAL FIX: NPT mode for noise testing
+   - Traditional mode produces invalid data without proper triggers
+   - When noise_test: true in config, uses NPT (No Pre-Trigger) mode
+   - NPT mode works like Continuous Streaming with record support
+   - Eliminates discontinuities with floating/terminated inputs
+
+USAGE:
+For noise testing (no signal):
+  Set runtime.noise_test: true in your YAML config
+  
+For production (with beam signals):
+  Set runtime.noise_test: false (default)
+  Traditional mode works perfectly with real triggers
 """
 from __future__ import annotations
 
@@ -155,8 +179,10 @@ notify:
   interval_minutes: 120
 
 runtime:
-  noise_test: false
-  autotrigger_timeout_ms: 10
+  noise_test: false               # CRITICAL for ATS-9462: Set to true for noise testing
+                                  # When true, uses NPT mode instead of Traditional mode
+                                  # This eliminates discontinuities with floating/terminated inputs
+  autotrigger_timeout_ms: 10      # Auto-trigger timeout when noise_test is false
 """
 
 REDUCED_SCHEMA = pa.schema([
@@ -1484,11 +1510,23 @@ def run_capture(cfg_path: Path) -> int:
     notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), started_unix=time.time(), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB, live_ring_path=str(ring_path))
     notifier.maybe_emit()
 
-    adma_flags = ats.ADMA_TRADITIONAL_MODE
-    if bool(trig.get("external_startcapture", False)):
-        adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
-
-    board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recordsPerAcq, adma_flags)
+    # CRITICAL FIX for ATS-9462: Use NPT mode for noise testing
+    # Traditional mode produces invalid data without proper triggers
+    rt = cfg.get("runtime", {}) or {}
+    use_npt_mode = bool(rt.get("noise_test", False))
+    
+    if use_npt_mode:
+        print("[CAPPY] noise_test enabled -> using NPT mode (No Pre-Trigger) for ATS-9462")
+        adma_flags = ats.ADMA_NPT
+        if bool(trig.get("external_startcapture", False)):
+            adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
+        # NPT mode: no pre-trigger offset, must use 0
+        board.beforeAsyncRead(ch_mask, 0, spr, rpb, recordsPerAcq, adma_flags)
+    else:
+        adma_flags = ats.ADMA_TRADITIONAL_MODE
+        if bool(trig.get("external_startcapture", False)):
+            adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
+        board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recordsPerAcq, adma_flags)
 
     for b in buffers:
         board.postAsyncBuffer(b.addr, b.size_bytes)
@@ -1532,7 +1570,11 @@ def run_capture(cfg_path: Path) -> int:
             except Exception:
                 pass
 
-            board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recordsPerAcq, adma_flags)
+            # Use same mode as initial setup
+            if use_npt_mode:
+                board.beforeAsyncRead(ch_mask, 0, spr, rpb, recordsPerAcq, adma_flags)
+            else:
+                board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recordsPerAcq, adma_flags)
             for b in buffers:
                 board.postAsyncBuffer(b.addr, b.size_bytes)
             board.startCapture()
