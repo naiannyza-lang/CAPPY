@@ -1420,7 +1420,6 @@ class DualBoardGUI:
             w.bind("<Button-4>", _on_mousewheel)
             w.bind("<Button-5>", _on_mousewheel)
 
-        
         def _bind_all(_e=None):
             canvas.bind_all("<MouseWheel>", _on_mousewheel)
             canvas.bind_all("<Button-4>", _on_mousewheel)
@@ -1437,7 +1436,7 @@ class DualBoardGUI:
         canvas.bind("<Enter>", _bind_all)
         canvas.bind("<Leave>", _unbind_all)
 
-canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Archives
@@ -1871,7 +1870,6 @@ canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         self.log_message("CAPPY Dual-Board System Initialized")
         self.log_message("-" * 80)
-        
 
     # ==================================================================================
     # PERSISTED PATHS (YAML + DATA DIR) AND DEFAULT CREATION
@@ -2249,11 +2247,12 @@ canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.stop_board(board_type)
             time.sleep(0.2)
             self.start_board(board_type)
-def open_archive(self, board_type):
-        acq = self.acq_9352 if board_type == '9352' else self.acq_9462
-        if not acq or not acq.config:
-            messagebox.showwarning("Warning", "No configuration loaded for this board")
-            return
+
+        def open_archive(self, board_type):
+            acq = self.acq_9352 if board_type == '9352' else self.acq_9462
+            if not acq or not acq.config:
+                messagebox.showwarning("Warning", "No configuration loaded for this board")
+                return
 
         data_dir = Path(acq.config.get('storage', {}).get('data_dir', '.'))
         if not data_dir.exists():
@@ -2262,152 +2261,150 @@ def open_archive(self, board_type):
                 data_dir.mkdir(parents=True, exist_ok=True)
                 self.log_message(f"Created missing data directory: {data_dir}")
             except Exception as e:
-                messagebox.showwarning("Warning", f"Data directory does not exist and could not be created:
-{data_dir}
-{e}")
+                messagebox.showwarning("Warning", f"Data directory does not exist and could not be created:\n{data_dir}\n{e}")
                 return
 
-        if not hasattr(self, "_archive_windows"):
-            self._archive_windows = {}
+            if not hasattr(self, "_archive_windows"):
+                self._archive_windows = {}
 
-        # Reuse an existing viewer per board
-        win = self._archive_windows.get(board_type)
-        try:
-            if win is not None and win.winfo_exists():
-                win.lift()
-                win.focus_force()
-                return
-        except Exception:
-            pass
+            # Reuse an existing viewer per board
+            win = self._archive_windows.get(board_type)
+            try:
+                if win is not None and win.winfo_exists():
+                    win.lift()
+                    win.focus_force()
+                    return
+            except Exception:
+                pass
 
-        title = f"{COLORS[board_type]['name']} Archive"
-        win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
-        self._archive_windows[board_type] = win
+            title = f"{COLORS[board_type]['name']} Archive"
+            win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
+            self._archive_windows[board_type] = win
 
-    def log_message(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
+        def log_message(self, message):
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.log_text.see(tk.END)
         
-    # ==================================================================================
-    # GUI UPDATE LOOP WITH ROLLING INTEGRALS
-    # ==================================================================================
+        # ==================================================================================
+        # GUI UPDATE LOOP WITH ROLLING INTEGRALS
+        # ==================================================================================
     
-    def update_from_queue(self):
-        try:
-            while True:
-                msg = self.gui_queue.get_nowait()
-                msg_type = msg[0]
+        def update_from_queue(self):
+            try:
+                while True:
+                    msg = self.gui_queue.get_nowait()
+                    msg_type = msg[0]
                 
-                if msg_type == 'log':
-                    self.log_message(msg[1])
+                    if msg_type == 'log':
+                        self.log_message(msg[1])
                     
-                elif msg_type == 'stats':
-                    board_type = msg[1]
-                    stats = msg[2]
-                    self.update_stats_display(board_type, stats)
+                    elif msg_type == 'stats':
+                        board_type = msg[1]
+                        stats = msg[2]
+                        self.update_stats_display(board_type, stats)
                     
-                elif msg_type == 'waveform':
-                    self.update_waveform_display(msg[1])
+                    elif msg_type == 'waveform':
+                        self.update_waveform_display(msg[1])
                     
-        except queue.Empty:
-            pass
-        finally:
-            self.root.after(50, self.update_from_queue)
+            except queue.Empty:
+                pass
+            finally:
+                self.root.after(50, self.update_from_queue)
             
-    def update_stats_display(self, board_type, stats: AcquisitionStats):
-        if board_type not in self.stats_labels:
-            return
+        def update_stats_display(self, board_type, stats: AcquisitionStats):
+            if board_type not in self.stats_labels:
+                return
             
-        labels = self.stats_labels[board_type]
+            labels = self.stats_labels[board_type]
         
-        labels['rate'].config(text=f"{stats.rate_hz:.1f} Hz")
-        labels['captures'].config(text=f"{stats.captures}")
-        labels['last'].config(text=stats.last_capture.split()[1] if stats.last_capture else "--")
-        labels['peak_a'].config(text=f"{stats.mean_peak_a:.6f} V")
-        labels['peak_b'].config(text=f"{stats.mean_peak_b:.6f} V")
-        labels['disk'].config(text=f"{stats.data_written_gb:.1f} GB written")  # CHANGED
+            labels['rate'].config(text=f"{stats.rate_hz:.1f} Hz")
+            labels['captures'].config(text=f"{stats.captures}")
+            labels['last'].config(text=stats.last_capture.split()[1] if stats.last_capture else "--")
+            labels['peak_a'].config(text=f"{stats.mean_peak_a:.6f} V")
+            labels['peak_b'].config(text=f"{stats.mean_peak_b:.6f} V")
+            labels['disk'].config(text=f"{stats.data_written_gb:.1f} GB written")  # CHANGED
         
-    def update_waveform_display(self, wf_data):
-        board_type = wf_data['board']
-        wfA = wf_data['wfA']
-        wfB = wf_data['wfB']
-        integralA = wf_data['integralA']
-        integralB = wf_data['integralB']
-        timestamp = wf_data['time']
+        def update_waveform_display(self, wf_data):
+            board_type = wf_data['board']
+            wfA = wf_data['wfA']
+            wfB = wf_data['wfB']
+            integralA = wf_data['integralA']
+            integralB = wf_data['integralB']
+            timestamp = wf_data['time']
         
-        data = self.waveform_data[board_type]
-        data['A'].append(wfA)
-        data['B'].append(wfB if wfB is not None else np.zeros_like(wfA))
-        data['intA'].append(integralA)
-        data['intB'].append(integralB)
-        data['time'].append(timestamp)
-        
-        if len(data['A']) > self.max_plot_points:
-            data['A'].pop(0)
-            data['B'].pop(0)
-            data['intA'].pop(0)
-            data['intB'].pop(0)
-            data['time'].pop(0)
-            
-        # Refresh plots more responsively (throttled)
-        now = time.time()
-        if not hasattr(self, '_last_plot_time'):
-            self._last_plot_time = 0.0
-        if (now - self._last_plot_time) >= 0.08:
-            self._last_plot_time = now
-            self.refresh_plots()
-            
-    def refresh_plots(self):
-        """Redraw plots with ROLLING TIME for integrals"""
-        for board_type in ['9352', '9462']:
             data = self.waveform_data[board_type]
+            data['A'].append(wfA)
+            data['B'].append(wfB if wfB is not None else np.zeros_like(wfA))
+            data['intA'].append(integralA)
+            data['intB'].append(integralB)
+            data['time'].append(timestamp)
+        
+            if len(data['A']) > self.max_plot_points:
+                data['A'].pop(0)
+                data['B'].pop(0)
+                data['intA'].pop(0)
+                data['intB'].pop(0)
+                data['time'].pop(0)
             
-            if not data['A']:
-                continue
-                
-            wfA = data['A'][-1]
-            wfB = data['B'][-1]
+            # Refresh plots more responsively (throttled)
+            now = time.time()
+            if not hasattr(self, '_last_plot_time'):
+                self._last_plot_time = 0.0
+            if (now - self._last_plot_time) >= 0.08:
+                self._last_plot_time = now
+                self.refresh_plots()
             
-            sample_rate = 250e6 if board_type == '9352' else 180e6
-            time_us = np.arange(len(wfA)) / sample_rate * 1e6
+        def refresh_plots(self):
+            """Redraw plots with ROLLING TIME for integrals"""
+            for board_type in ['9352', '9462']:
+                data = self.waveform_data[board_type]
             
-            prefix = f"{board_type}_"
-            self.lines[prefix + 'A'].set_data(time_us, wfA)
-            self.lines[prefix + 'B'].set_data(time_us, wfB)
+                if not data['A']:
+                    continue
+                
+                wfA = data['A'][-1]
+                wfB = data['B'][-1]
             
-            # ROLLING TIME for integrals
-            if len(data['time']) > 0:
-                if board_type not in self.integral_start_time:
-                    self.integral_start_time[board_type] = data['time'][0]
-                
-                int_times = np.array(data['time']) - self.integral_start_time[board_type]
-                
-                current_time = int_times[-1]
-                window_start = max(0, current_time - self.integral_time_window)
-                
-                mask = int_times >= window_start
-                int_times_windowed = int_times[mask]
-                intA_windowed = np.array(data['intA'])[mask]
-                intB_windowed = np.array(data['intB'])[mask]
-                
-                self.lines[prefix + 'intA'].set_data(int_times_windowed, intA_windowed)
-                self.lines[prefix + 'intB'].set_data(int_times_windowed, intB_windowed)
-                
-                ax_int = self.ax_9352_int if board_type == '9352' else self.ax_9462_int
-                ax_int.set_xlim(window_start, current_time)
-                ax_int.set_xlabel('Time (s)', color='white', fontsize=9)
+                sample_rate = 250e6 if board_type == '9352' else 180e6
+                time_us = np.arange(len(wfA)) / sample_rate * 1e6
             
-            ax_map = {
-                '9352': (self.ax_9352_A, self.ax_9352_B),
-                '9462': (self.ax_9462_A, self.ax_9462_B)
-            }
+                prefix = f"{board_type}_"
+                self.lines[prefix + 'A'].set_data(time_us, wfA)
+                self.lines[prefix + 'B'].set_data(time_us, wfB)
             
-            for ax in ax_map[board_type]:
-                ax.relim()
-                ax.autoscale_view()
+                # ROLLING TIME for integrals
+                if len(data['time']) > 0:
+                    if board_type not in self.integral_start_time:
+                        self.integral_start_time[board_type] = data['time'][0]
                 
-        self.canvas.draw_idle()
+                    int_times = np.array(data['time']) - self.integral_start_time[board_type]
+                
+                    current_time = int_times[-1]
+                    window_start = max(0, current_time - self.integral_time_window)
+                
+                    mask = int_times >= window_start
+                    int_times_windowed = int_times[mask]
+                    intA_windowed = np.array(data['intA'])[mask]
+                    intB_windowed = np.array(data['intB'])[mask]
+                
+                    self.lines[prefix + 'intA'].set_data(int_times_windowed, intA_windowed)
+                    self.lines[prefix + 'intB'].set_data(int_times_windowed, intB_windowed)
+                
+                    ax_int = self.ax_9352_int if board_type == '9352' else self.ax_9462_int
+                    ax_int.set_xlim(window_start, current_time)
+                    ax_int.set_xlabel('Time (s)', color='white', fontsize=9)
+            
+                ax_map = {
+                    '9352': (self.ax_9352_A, self.ax_9352_B),
+                    '9462': (self.ax_9462_A, self.ax_9462_B)
+                }
+            
+                for ax in ax_map[board_type]:
+                    ax.relim()
+                    ax.autoscale_view()
+                
+            self.canvas.draw_idle()
 
 
 def main() -> int:
