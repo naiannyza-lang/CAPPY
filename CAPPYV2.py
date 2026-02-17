@@ -73,12 +73,19 @@ UI_COLORS = {
     'bg_medium': '#2d2d2d',
     'bg_sidebar': '#252525',
     'bg_widget': '#2a2a2a',
-    'button_bg': '#555555',
+    'button_bg': '#3a3a3a',
     'button_fg': 'white',
-    'play_button_bg': '#666666',   # Grey background
+    'play_button_bg': '#3f3f3f',   # Grey background
     'play_button_fg': 'white',     # White text
     'separator': '#444444',
 }
+
+
+# Persistent app state (last-used YAML paths and data directories)
+APP_STATE_DIR = Path.home() / ".cappy"
+APP_STATE_PATH = APP_STATE_DIR / "cappy_state.json"
+DEFAULT_CONFIG_9352_NAME = "config_9352.yaml"
+DEFAULT_CONFIG_9462_NAME = "config_9462.yaml"
 
 STOP_REQUESTED = False
 
@@ -163,6 +170,22 @@ def format_filesize(bytes_val: float) -> str:
             return f"{bytes_val:.1f} {unit}"
         bytes_val /= 1024.0
     return f"{bytes_val:.1f} PB"
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
 
 # ==================================================================================
 # DEFAULT YAML CONFIGURATIONS
@@ -861,6 +884,141 @@ class CollapsibleFrame(tk.Frame):
             self.toggle_btn.config(text="▼")
             self.show.set(True)
 
+
+class ArchiveViewer(tk.Toplevel):
+    """Lightweight archive browser that auto-attaches to a data_dir (no file picking)."""
+
+    def __init__(self, parent, data_dir: Path, title: str = "Archive"):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=UI_COLORS['bg_dark'])
+        self.geometry("900x650")
+        self.minsize(700, 450)
+
+        self.data_dir = Path(data_dir)
+        self.captures_root = self.data_dir / "captures"
+
+        top = tk.Frame(self, bg=UI_COLORS['bg_medium'])
+        top.pack(fill=tk.X)
+
+        tk.Label(top, text=title, bg=UI_COLORS['bg_medium'], fg="white",
+                 font=("Arial", 11, "bold")).pack(side=tk.LEFT, padx=10, pady=8)
+
+        tk.Button(top, text="Open Folder",
+                  command=self._open_folder,
+                  bg=UI_COLORS['button_bg'], fg="white",
+                  activebackground="#4a4a4a", activeforeground="white",
+                  relief=tk.FLAT, cursor="hand2").pack(side=tk.RIGHT, padx=10, pady=8)
+
+        body = tk.Frame(self, bg=UI_COLORS['bg_dark'])
+        body.pack(fill=tk.BOTH, expand=True)
+
+        left = tk.Frame(body, bg=UI_COLORS['bg_dark'])
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+
+        tk.Label(left, text="Sessions", bg=UI_COLORS['bg_dark'], fg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+
+        self.session_list = tk.Listbox(left, width=42, bg="#0f0f0f", fg="white",
+                                       selectbackground="#333", activestyle="none")
+        self.session_list.pack(fill=tk.Y, expand=True, pady=(6, 0))
+        self.session_list.bind("<<ListboxSelect>>", self._on_select)
+
+        right = tk.Frame(body, bg=UI_COLORS['bg_dark'])
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
+
+        tk.Label(right, text="Details", bg=UI_COLORS['bg_dark'], fg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+
+        self.details = scrolledtext.ScrolledText(
+            right, bg="#0a0a0a", fg="#ddd", font=("Courier", 9),
+            wrap=tk.WORD
+        )
+        self.details.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        self._sessions = self._scan_sessions()
+        for s in self._sessions:
+            self.session_list.insert(tk.END, s["label"])
+
+        if not self._sessions:
+            self.details.insert(tk.END, f"No sessions found under: {self.captures_root}\n")
+
+    def _open_folder(self):
+        target = self.captures_root if self.captures_root.exists() else self.data_dir
+        try:
+            subprocess.Popen(["xdg-open", str(target)])
+        except Exception:
+            try:
+                subprocess.Popen(["gio", "open", str(target)])
+            except Exception:
+                messagebox.showinfo("Folder", f"Path: {target}")
+
+    def _scan_sessions(self) -> List[dict]:
+        sessions: List[dict] = []
+        root = self.captures_root
+        if not root.exists():
+            return sessions
+
+        for idx in sorted(root.rglob("session_index.parquet")):
+            try:
+                df = pq.read_table(idx).to_pandas()
+                day_dir = idx.parent
+                for _, row in df.iterrows():
+                    sid = str(row.get("session_id", "")).strip()
+                    if not sid:
+                        continue
+                    first_ns = int(row.get("first_timestamp_ns", 0) or 0)
+                    last_ns = int(row.get("last_timestamp_ns", 0) or 0)
+                    date_s = str(row.get("date", "")) if row.get("date", "") else day_dir.name
+                    label = f"{date_s}  {sid}"
+                    sessions.append({
+                        "label": label,
+                        "session_id": sid,
+                        "day_dir": day_dir,
+                        "meta": row.to_dict(),
+                        "first_ns": first_ns,
+                        "last_ns": last_ns,
+                    })
+            except Exception:
+                continue
+
+        if sessions:
+            sessions.sort(key=lambda x: x.get("last_ns", 0), reverse=True)
+            return sessions
+
+        for p in sorted(root.rglob("session_*.txt"), reverse=True):
+            try:
+                sid = p.stem.replace("session_", "")
+                day_dir = p.parent.parent if p.parent.name == "index" else p.parent
+                label = f"{day_dir.name}  {sid}"
+                sessions.append({"label": label, "session_id": sid, "day_dir": day_dir, "meta": {"marker": str(p)}})
+            except Exception:
+                pass
+        return sessions
+
+    def _on_select(self, _evt=None):
+        sel = self.session_list.curselection()
+        if not sel:
+            return
+        s = self._sessions[int(sel[0])]
+        self.details.delete("1.0", tk.END)
+
+        day_dir = Path(s["day_dir"])
+        sid = s["session_id"]
+        self.details.insert(tk.END, f"Data dir: {self.data_dir}\n")
+        self.details.insert(tk.END, f"Day dir:  {day_dir}\n")
+        self.details.insert(tk.END, f"Session:  {sid}\n\n")
+
+        meta = s.get("meta", {}) or {}
+        for k in sorted(meta.keys()):
+            self.details.insert(tk.END, f"{k}: {meta[k]}\n")
+
+        idx_dir = day_dir / "index"
+        self.details.insert(tk.END, "\nLikely files:\n")
+        self.details.insert(tk.END, f"  - {idx_dir / ('snips_' + sid + '.sqlite')}\n")
+        self.details.insert(tk.END, f"  - reduced/ and waveforms/ under hour folders in: {day_dir}\n")
+
+
 class DualBoardGUI:
     """Main GUI - fully corrected with all improvements"""
     
@@ -884,6 +1042,10 @@ class DualBoardGUI:
         
         self.config_path_9352 = Path("config_9352.yaml")
         self.config_path_9462 = Path("config_9462.yaml")
+
+
+        # Load persisted UI state (last YAML/data dirs) and ensure defaults exist
+        self._load_app_state_and_defaults()
         
         self.waveform_data = {
             '9352': {'A': [], 'B': [], 'intA': [], 'intB': [], 'time': []},
@@ -935,7 +1097,7 @@ class DualBoardGUI:
         tk.Button(
             toolbar, text="Controls",
             command=self.toggle_sidebar,
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'],
+            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=10, height=2
         ).pack(side=tk.LEFT, padx=(0, 10), pady=10)
         
@@ -957,14 +1119,14 @@ class DualBoardGUI:
         tk.Button(
             btn_frame_9352, text="Load YAML",
             command=lambda: self.load_yaml('9352'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'],
+            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=10
         ).pack(side=tk.LEFT, padx=2)
         
         tk.Button(
             btn_frame_9352, text="Data Dir",
             command=lambda: self.select_data_dir('9352'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'],
+            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=10
         ).pack(side=tk.LEFT, padx=2)
         
@@ -986,14 +1148,14 @@ class DualBoardGUI:
         tk.Button(
             btn_frame_9462, text="Load YAML",
             command=lambda: self.load_yaml('9462'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'],
+            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=10
         ).pack(side=tk.LEFT, padx=2)
         
         tk.Button(
             btn_frame_9462, text="Data Dir",
             command=lambda: self.select_data_dir('9462'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'],
+            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=10
         ).pack(side=tk.LEFT, padx=2)
         
@@ -1041,23 +1203,46 @@ class DualBoardGUI:
             )
             dock_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Scroll area
+                # Scroll area (with mouse wheel + width sync so popout isn't cropped)
         canvas = tk.Canvas(parent, bg=UI_COLORS['bg_sidebar'], highlightthickness=0)
         scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
         scrollable_frame = tk.Frame(canvas, bg=UI_COLORS['bg_sidebar'])
 
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        win_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        def _sync_scrollregion(_evt=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_width(_evt=None):
+            try:
+                canvas.itemconfigure(win_id, width=canvas.winfo_width())
+            except Exception:
+                pass
+
+        scrollable_frame.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_width)
+
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_mousewheel(event):
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                delta = int(-1 * (event.delta / 120)) if hasattr(event, "delta") else 0
+                if delta:
+                    canvas.yview_scroll(delta, "units")
+
+        for w in (canvas, scrollable_frame):
+            w.bind("<MouseWheel>", _on_mousewheel)
+            w.bind("<Button-4>", _on_mousewheel)
+            w.bind("<Button-5>", _on_mousewheel)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Archives
+# Archives
         tk.Label(
             scrollable_frame, text="ARCHIVES",
             bg=UI_COLORS['bg_sidebar'], fg='white',
@@ -1067,7 +1252,7 @@ class DualBoardGUI:
         tk.Button(
             scrollable_frame, text="ATS-9352 Archive",
             command=lambda: self.open_archive('9352'),
-            bg=UI_COLORS['button_bg'], fg='white',
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
             font=('Arial', 10),
             relief=tk.FLAT, cursor='hand2',
             height=2
@@ -1076,7 +1261,7 @@ class DualBoardGUI:
         tk.Button(
             scrollable_frame, text="ATS-9462 Archive",
             command=lambda: self.open_archive('9462'),
-            bg=UI_COLORS['button_bg'], fg='white',
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
             font=('Arial', 10),
             relief=tk.FLAT, cursor='hand2',
             height=2
@@ -1101,7 +1286,9 @@ class DualBoardGUI:
 
         self.sidebar_popout_win = tk.Toplevel(self.root)
         self.sidebar_popout_win.title("CAPPY Controls")
-        self.sidebar_popout_win.geometry("360x900")
+        self.sidebar_popout_win.geometry("420x950")
+        self.sidebar_popout_win.minsize(380, 600)
+        self.sidebar_popout_win.resizable(True, True)
         self.sidebar_popout_win.configure(bg=UI_COLORS['bg_sidebar'])
 
         pop_host = tk.Frame(self.sidebar_popout_win, bg=UI_COLORS['bg_sidebar'])
@@ -1161,14 +1348,14 @@ class DualBoardGUI:
         tk.Button(
             acq_row, text="Start",
             command=lambda bt=board_type: self.start_board(bt),
-            bg=UI_COLORS['button_bg'], fg='white',
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', width=8
         ).pack(side=tk.LEFT)
 
         tk.Button(
             acq_row, text="Stop",
             command=lambda bt=board_type: self.stop_board(bt),
-            bg=UI_COLORS['button_bg'], fg='white',
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', width=8
         ).pack(side=tk.LEFT, padx=(6, 0))
 
@@ -1295,7 +1482,7 @@ class DualBoardGUI:
         tk.Button(
             trig_row, text="Force",
             command=lambda: self._force_trigger(board_type),
-            bg=UI_COLORS['button_bg'], fg='white',
+            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', width=8
         ).pack(side=tk.RIGHT)
 
@@ -1475,6 +1662,65 @@ class DualBoardGUI:
         self.log_message("CAPPY Dual-Board System Initialized")
         self.log_message("-" * 80)
         
+
+    # ==================================================================================
+    # PERSISTED PATHS (YAML + DATA DIR) AND DEFAULT CREATION
+    # ==================================================================================
+
+    def _load_app_state_and_defaults(self) -> None:
+        """Load last-used YAML/data dirs and create defaults if missing."""
+        _ensure_dir(APP_STATE_DIR)
+        state = _read_json(APP_STATE_PATH)
+
+        p9352 = state.get("9352", {}).get("yaml_path")
+        p9462 = state.get("9462", {}).get("yaml_path")
+
+        self.config_path_9352 = Path(p9352) if p9352 else (APP_STATE_DIR / DEFAULT_CONFIG_9352_NAME)
+        self.config_path_9462 = Path(p9462) if p9462 else (APP_STATE_DIR / DEFAULT_CONFIG_9462_NAME)
+
+        if not self.config_path_9352.exists():
+            self.config_path_9352.write_text(DEFAULT_YAML_9352, encoding="utf-8")
+        if not self.config_path_9462.exists():
+            self.config_path_9462.write_text(DEFAULT_YAML_9462, encoding="utf-8")
+
+        # Preload configs so archive buttons work immediately
+        try:
+            if self.acq_9352 is None:
+                self.acq_9352 = BoardAcquisition('9352', self.config_path_9352, self.gui_queue)
+                self.acq_9352.load_config()
+            if self.acq_9462 is None:
+                self.acq_9462 = BoardAcquisition('9462', self.config_path_9462, self.gui_queue)
+                self.acq_9462.load_config()
+        except Exception:
+            pass
+
+        # Ensure data dirs exist
+        for bt in ("9352", "9462"):
+            acq = self._get_acq(bt)
+            if not acq or not isinstance(acq.config, dict):
+                continue
+            data_dir = Path(acq.config.get("storage", {}).get("data_dir", str(APP_STATE_DIR / f"data_{bt}")))
+            if not data_dir.is_absolute():
+                data_dir = (Path.cwd() / data_dir).resolve()
+            _ensure_dir(data_dir)
+            acq.config.setdefault("storage", {})["data_dir"] = str(data_dir)
+
+        self._save_app_state()
+
+    def _save_app_state(self) -> None:
+        state = _read_json(APP_STATE_PATH)
+        for bt in ("9352", "9462"):
+            acq = self._get_acq(bt)
+            if not acq:
+                continue
+            state.setdefault(bt, {})
+            state[bt]["yaml_path"] = str(self.config_path_9352 if bt == "9352" else self.config_path_9462)
+            try:
+                dd = Path(acq.config.get("storage", {}).get("data_dir", ""))
+                state[bt]["data_dir"] = str(dd)
+            except Exception:
+                pass
+        _write_json(APP_STATE_PATH, state)
     # ==================================================================================
     # EVENT HANDLERS
     # ==================================================================================
@@ -1483,8 +1729,9 @@ class DualBoardGUI:
         return self.acq_9352 if board_type == '9352' else self.acq_9462
 
     def _ensure_acq(self, board_type: str) -> Optional[BoardAcquisition]:
-        if not ATS_AVAILABLE:
-            return None
+        # We allow config loading / archive browsing even if the ATS driver is unavailable.
+        # Hardware access is only required when starting acquisition.
+
         if board_type == '9352':
             if self.acq_9352 is None:
                 self.acq_9352 = BoardAcquisition('9352', self.config_path_9352, self.gui_queue)
@@ -1497,9 +1744,12 @@ class DualBoardGUI:
             return self.acq_9462
 
     def start_board(self, board_type: str):
+        if not ATS_AVAILABLE:
+            messagebox.showerror("Error", "ATS API not available!")
+            return
         acq = self._ensure_acq(board_type)
         if acq is None:
-            messagebox.showerror("Error", "ATS API not available!")
+            messagebox.showerror("Error", "Failed to initialize board acquisition")
             return
         acq.start()
         self._board_running[board_type] = True
@@ -1728,6 +1978,15 @@ class DualBoardGUI:
                     self.acq_9462.load_config(self.config_path_9462)
                     
             self.log_message(f"Loaded config for {COLORS[board_type]['name']}: {filename}")
+            # Ensure storage dir exists and persist
+            acq = self._get_acq(board_type)
+            if acq and isinstance(acq.config, dict):
+                dd = Path(acq.config.get('storage', {}).get('data_dir', '.'))
+                if not dd.is_absolute():
+                    dd = (Path.cwd() / dd).resolve()
+                _ensure_dir(dd)
+                acq.config.setdefault('storage', {})['data_dir'] = str(dd)
+            self._save_app_state()
             self._sync_sidebar_from_config(board_type)
             
     def select_data_dir(self, board_type):
@@ -1741,7 +2000,10 @@ class DualBoardGUI:
             elif board_type == '9462' and self.acq_9462:
                 self.acq_9462.config['storage']['data_dir'] = directory
                 
-            self.log_message(f"Data directory for {COLORS[board_type]['name']}: {directory}")
+            dd = Path(directory)
+            _ensure_dir(dd)
+            self.log_message(f"Data directory for {COLORS[board_type]['name']}: {dd}")
+            self._save_app_state()
             
     def update_trigger_level(self, board_type, level):
         acq = self.acq_9352 if board_type == '9352' else self.acq_9462
