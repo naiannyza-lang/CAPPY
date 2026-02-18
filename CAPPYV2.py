@@ -1559,9 +1559,11 @@ class DualBoardGUI:
         self._load_app_state_and_defaults()
         
         self.waveform_data = {
-            '9352': {'A': [], 'B': [], 'intA': [], 'intB': [], 'time': []},
-            '9462': {'A': [], 'B': [], 'intA': [], 'intB': [], 'time': []}
+            '9352': {'A': [], 'B': [], 'intA': [], 'intB': [], 'time': [], 'streamA': np.empty((0,), dtype=np.float32), 'streamB': np.empty((0,), dtype=np.float32)},
+            '9462': {'A': [], 'B': [], 'intA': [], 'intB': [], 'time': [], 'streamA': np.empty((0,), dtype=np.float32), 'streamB': np.empty((0,), dtype=np.float32)}
         }
+        # Side-scrolling window (in points) for live waveform stream
+        self.stream_window_pts = 20000
         self.max_plot_points = 1000
         
         # ADDED: Rolling time window for integrals
@@ -2701,33 +2703,50 @@ class DualBoardGUI:
     def update_waveform_display(self, wf_data):
         board_type = wf_data['board']
         wfA = wf_data['wfA']
-        wfB = wf_data['wfB']
-        integralA = wf_data['integralA']
-        integralB = wf_data['integralB']
-        timestamp = wf_data['time']
-    
+        wfB = wf_data.get('wfB', None)
+        integralA = float(wf_data.get('integralA', 0.0))
+        integralB = float(wf_data.get('integralB', 0.0))
+        timestamp = float(wf_data.get('time', time.time()))
+
         data = self.waveform_data[board_type]
+
+        # Keep a short history of most recent *buffers*
         data['A'].append(wfA)
-        data['B'].append(wfB if wfB is not None else np.zeros_like(wfA))
+        data['B'].append(wfB)  # keep None if B not present
         data['intA'].append(integralA)
         data['intB'].append(integralB)
         data['time'].append(timestamp)
-    
+
         if len(data['A']) > self.max_plot_points:
             data['A'].pop(0)
             data['B'].pop(0)
             data['intA'].pop(0)
             data['intB'].pop(0)
             data['time'].pop(0)
-        
+
+        # ---- Side-scrolling live stream (concatenate each buffer's representative waveform) ----
+        try:
+            data['streamA'] = np.concatenate((data['streamA'], np.asarray(wfA, dtype=np.float32, order='C')))
+            if wfB is not None:
+                data['streamB'] = np.concatenate((data['streamB'], np.asarray(wfB, dtype=np.float32, order='C')))
+            else:
+                data['streamB'] = np.concatenate((data['streamB'], np.full((len(wfA),), np.nan, dtype=np.float32)))
+
+            if data['streamA'].size > self.stream_window_pts:
+                data['streamA'] = data['streamA'][-self.stream_window_pts:]
+            if data['streamB'].size > self.stream_window_pts:
+                data['streamB'] = data['streamB'][-self.stream_window_pts:]
+        except Exception:
+            pass
+
         # Refresh plots more responsively (throttled)
         now = time.time()
         if not hasattr(self, '_last_plot_time'):
             self._last_plot_time = 0.0
-        if (now - self._last_plot_time) >= 0.08:
+        if (now - self._last_plot_time) >= 0.05:
             self._last_plot_time = now
             self.refresh_plots()
-        
+
     def refresh_plots(self):
         """Redraw plots with ROLLING TIME for integrals"""
         for board_type in ['9352', '9462']:
@@ -2736,15 +2755,33 @@ class DualBoardGUI:
             if not data['A']:
                 continue
             
-            wfA = data['A'][-1]
-            wfB = data['B'][-1]
-        
+            # Use concatenated stream for v1_3-style side scrolling when available
             sample_rate = 250e6 if board_type == '9352' else 180e6
-            time_us = np.arange(len(wfA)) / sample_rate * 1e6
-        
+            streamA = data.get('streamA', None)
+            streamB = data.get('streamB', None)
+
+            if isinstance(streamA, np.ndarray) and streamA.size > 0:
+                wfA_plot = streamA
+                wfB_plot = streamB if isinstance(streamB, np.ndarray) and streamB.size == streamA.size else None
+            else:
+                wfA_plot = data['A'][-1]
+                wfB_plot = data['B'][-1]
+
+            # Time axis for the displayed window
+            time_us = np.arange(len(wfA_plot)) / sample_rate * 1e6
+            # Keep axis readable: show time relative to left edge of the window
+            if time_us.size > 0:
+                time_us = time_us - time_us[0]
+
             prefix = f"{board_type}_"
-            self.lines[prefix + 'A'].set_data(time_us, wfA)
-            self.lines[prefix + 'B'].set_data(time_us, wfB)
+            self.lines[prefix + 'A'].set_data(time_us, wfA_plot)
+
+            if wfB_plot is None:
+                # Hide B when not present to avoid a misleading flat line
+                self.lines[prefix + 'B'].set_data([], [])
+            else:
+                self.lines[prefix + 'B'].set_data(time_us, wfB_plot)
+
         
             # ROLLING TIME for integrals
             if len(data['time']) > 0:
