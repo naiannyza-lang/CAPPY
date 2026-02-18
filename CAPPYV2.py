@@ -431,6 +431,11 @@ class BoardAcquisition:
         
         # Statistics
         self.stats = AcquisitionStats()
+
+        # Persistent storage session (set on start)
+        self._session_dir = None
+        self._index_path = None
+        self._save_every = 0
         
         # Acquisition parameters
         self.sample_rate_hz = 0.0
@@ -780,6 +785,36 @@ class BoardAcquisition:
             self._log("Acquisition started")
             
             self.stats.started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # ---- Persistent capture storage (auto-create) ----
+            try:
+                _dd = Path(self.config.get('storage', {}).get('data_dir', f"dataFile_ATS{self.board_type}")).expanduser()
+                if not _dd.is_absolute():
+                    _dd = (Path.cwd() / _dd).resolve()
+                (_dd).mkdir(parents=True, exist_ok=True)
+                _captures_root = _dd / "captures"
+                _date = datetime.now().strftime("%Y-%m-%d")
+                _hour = datetime.now().strftime("%H%M")
+                _session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self._session_dir = _captures_root / _date / _hour / _session_id
+                self._session_dir.mkdir(parents=True, exist_ok=True)
+                self._index_path = self._session_dir / "snips.csv"
+                if not self._index_path.exists():
+                    self._index_path.write_text(
+                        "buf_index,timestamp_ns,sample_rate_hz,file,channels\n",
+                        encoding="utf-8",
+                    )
+                self._save_every = int(self.config.get('storage', {}).get('save_every_buffers', 1) or 1)
+                self._save_every = max(1, self._save_every)
+                # Persist resolved data_dir back into config for archive viewer
+                self.config.setdefault('storage', {})['data_dir'] = str(_dd)
+                self._log(f"Saving captures under: {self._session_dir}")
+            except Exception as _e:
+                self._session_dir = None
+                self._index_path = None
+                self._save_every = 0
+                self._log(f"Warning: capture saving disabled (could not init storage): {_e}")
+
             buf_count = 0
             last_stats_time = time.time()
             
@@ -808,7 +843,41 @@ class BoardAcquisition:
                     
                     integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
                     integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
-                    
+
+                    # ---- Save to disk (per buffer) ----
+                    if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
+                        try:
+                            ts_ns = time.time_ns()
+                            fname = f"buf_{buf_count:06d}.npz"
+                            fpath = self._session_dir / fname
+                            if wfB_volts is None:
+                                np.savez_compressed(
+                                    fpath,
+                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
+                                    sample_rate_hz=float(self.sample_rate_hz),
+                                    timestamp_ns=int(ts_ns),
+                                    board=str(self.board_type),
+                                    channels="A",
+                                )
+                                chs = "A"
+                            else:
+                                np.savez_compressed(
+                                    fpath,
+                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
+                                    wfB_V=wfB_volts.astype(np.float32, copy=False),
+                                    sample_rate_hz=float(self.sample_rate_hz),
+                                    timestamp_ns=int(ts_ns),
+                                    board=str(self.board_type),
+                                    channels="A|B",
+                                )
+                                chs = "A|B"
+                            if self._index_path is not None:
+                                with open(self._index_path, "a", encoding="utf-8") as _fp:
+                                    _fp.write(f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},{chs}\n")
+                        except Exception as _se:
+                            # Don't kill acquisition if disk write fails
+                            self._log(f"Save warning: {_se}")
+
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self.stats.mean_peak_a = float(np.max(np.abs(wfA_volts)))
