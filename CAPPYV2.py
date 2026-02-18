@@ -806,8 +806,8 @@ class BoardAcquisition:
                     wfA_volts = _codes_to_volts_u16(A[0], self.vpp_A)
                     wfB_volts = _codes_to_volts_u16(B[0], self.vpp_B) if B is not None else None
                     
-                    integralA = np.trapz(wfA_volts) / self.sample_rate_hz
-                    integralB = np.trapz(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
+                    integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
+                    integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
                     
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2251,39 +2251,53 @@ class DualBoardGUI:
             time.sleep(0.2)
             self.start_board(board_type)
 
-        def open_archive(self, board_type):
-            acq = self.acq_9352 if board_type == '9352' else self.acq_9462
-            if not acq or not acq.config:
-                messagebox.showwarning("Warning", "No configuration loaded for this board")
+    def open_archive(self, board_type: str):
+        """Open the archive viewer for a given board ('9352' or '9462')."""
+        board_type = str(board_type).strip()
+        if board_type not in ("9352", "9462"):
+            messagebox.showwarning("Warning", f"Unknown board type: {board_type}")
+            return
+
+        acq = self._ensure_acq(board_type)
+        if acq is None:
+            messagebox.showwarning("Warning", "Acquisition object not available for this board")
+            return
+        if acq.config is None:
+            acq.load_config()
+
+        data_dir = Path(acq.config.get('storage', {}).get('data_dir', '.')).expanduser()
+        # If relative, anchor to ~/.cappy so it is stable across launches
+        if not data_dir.is_absolute():
+            data_dir = (Path.home() / ".cappy" / data_dir).resolve()
+
+        # Ensure directory exists
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"Could not create/open data directory:\n{data_dir}\n{e}")
+            return
+
+        # Persist normalized path back into config/state so it stays attached
+        acq.config.setdefault('storage', {})['data_dir'] = str(data_dir)
+        self._write_config(board_type)
+
+        if not hasattr(self, "_archive_windows"):
+            self._archive_windows = {}
+
+        # Reuse an existing viewer per board
+        win = self._archive_windows.get(board_type)
+        try:
+            if win is not None and win.winfo_exists():
+                win.set_data_dir(data_dir) if hasattr(win, "set_data_dir") else None
+                win.lift()
+                win.focus_force()
                 return
+        except Exception:
+            pass
 
-        data_dir = Path(acq.config.get('storage', {}).get('data_dir', '.'))
-        if not data_dir.exists():
-            # Create if missing (matches your request)
-            try:
-                data_dir.mkdir(parents=True, exist_ok=True)
-                self.log_message(f"Created missing data directory: {data_dir}")
-            except Exception as e:
-                messagebox.showwarning("Warning", f"Data directory does not exist and could not be created:\n{data_dir}\n{e}")
-                return
-
-            if not hasattr(self, "_archive_windows"):
-                self._archive_windows = {}
-
-            # Reuse an existing viewer per board
-            win = self._archive_windows.get(board_type)
-            try:
-                if win is not None and win.winfo_exists():
-                    win.lift()
-                    win.focus_force()
-                    return
-            except Exception:
-                pass
-
-            title = f"{COLORS[board_type]['name']} Archive"
-            win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
-            self._archive_windows[board_type] = win
-
+        title = f"{COLORS[board_type]['name']} Archive"
+        win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
+        self._archive_windows[board_type] = win
     def log_message(self, message: str):
         """Thread-safe-ish logger: prints to terminal and writes to the Log tab if available."""
         try:
@@ -2424,6 +2438,9 @@ class DualBoardGUI:
                 self.lines[prefix + 'intB'].set_data(int_times_windowed, intB_windowed)
             
                 ax_int = self.ax_9352_int if board_type == '9352' else self.ax_9462_int
+                # Guard against identical x-limits (can happen at startup)
+                if current_time <= window_start:
+                    current_time = window_start + 1e-6
                 ax_int.set_xlim(window_start, current_time)
                 ax_int.set_xlabel('Time (s)', color='white', fontsize=9)
         
