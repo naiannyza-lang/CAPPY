@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 """
 ==================================================================================
-CAPPY DUAL-BOARD UNIFIED ACQUISITION SYSTEM - MINIMAL BUFFER OVERFLOW FIX
+CAPPY DUAL-BOARD UNIFIED ACQUISITION SYSTEM - MINIMAL BUFFER FIX
 ==================================================================================
 
 Simultaneously manages:
 - ATS-9352 (System 2, Board 1) - 250 MS/s, 2-channel
 - ATS-9462 (System 1, Board 1) - 180 MS/s, 2-channel
-
-MINIMAL CHANGES - BUFFER OVERFLOW FIXED:
-✓ Doubled buffer pool (64 → 128)
-✓ Increased timeout (1000ms → 5000ms)
-✓ Added flow control to prevent overflow
-✓ All original GUI preserved
-✓ Only acquisition loop modified
 
 ==================================================================================
 """
@@ -116,44 +109,6 @@ except Exception:
     ats = None
 
 # ==================================================================================
-# BUFFER OVERFLOW FIX - FLOW CONTROL (MINIMAL)
-# ==================================================================================
-
-class BufferFlowControl:
-    """
-    Minimal flow control to prevent ApiBufferOverflow.
-    Only tracks posted vs completed buffers.
-    """
-    def __init__(self, pool_size: int):
-        self.pool_size = pool_size
-        self.posted = 0
-        self.completed = 0
-        self.backpressure_delay = 0.001
-        self.max_delay = 0.05
-    
-    def can_post(self) -> bool:
-        """Check if safe to post next buffer"""
-        outstanding = self.posted - self.completed
-        max_allowed = self.pool_size - 8
-        
-        if outstanding >= max_allowed:
-            time.sleep(self.backpressure_delay)
-            self.backpressure_delay = min(self.max_delay, self.backpressure_delay * 1.2)
-            return False
-        else:
-            self.backpressure_delay = 0.001
-            return True
-    
-    def record_post(self):
-        self.posted += 1
-    
-    def record_complete(self):
-        self.completed += 1
-    
-    def outstanding(self) -> int:
-        return self.posted - self.completed
-
-# ==================================================================================
 # UTILITY FUNCTIONS
 # ==================================================================================
 
@@ -234,7 +189,7 @@ def _write_json(path: Path, obj: dict) -> None:
 
 
 # ==================================================================================
-# DEFAULT YAML CONFIGURATIONS - WITH BUFFER FIX
+# DEFAULT YAML CONFIGURATIONS
 # ==================================================================================
 
 DEFAULT_YAML_9352 = r"""# ATS-9352 Configuration
@@ -289,16 +244,30 @@ integration:
   baseline_window_samples: [0, 32]
   integral_window_samples: [32, 256]
 
+waveforms:
+  enable: true
+  full_record: true
+  mode: every_n
+  every_n: 1
+  threshold_integral_Vs: 0.0
+  threshold_peak_V: 0.0
+  max_waveforms_per_sec: 50
+  store_volts: true
+  dc_offset_correction: false
+
 storage:
-  data_dir: ~/daq/dataFile/captures
-  format: parquet
-  compression: snappy
+  data_dir: dataFile_ATS9352
+  session_tag: ""
+  rollover_minutes: 60
+  session_rotate_hours: 24
+  flush_every_records: 20000
+  flush_every_seconds: 2
+  sqlite_commit_every_snips: 200
 
-processing:
-  enable_live_display: true
-  enable_file_save: true
-
-readout_mode: TR
+runtime:
+  readout_mode: TR
+  noise_test: false
+  autotrigger_timeout_ms: 10
 """
 
 DEFAULT_YAML_9462 = r"""# ATS-9462 Configuration
@@ -314,11 +283,11 @@ clock:
 channels:
   A:
     coupling: DC
-    range: PM_1_V
+    range: PM_400_MV
     impedance: 50_OHM
   B:
     coupling: DC
-    range: PM_1_V
+    range: PM_400_MV
     impedance: 50_OHM
 
 trigger:
@@ -332,13 +301,13 @@ trigger:
   slopeK: TRIGGER_SLOPE_POSITIVE
   levelK: 128
   ext_coupling: DC_COUPLING
-  ext_range: ETR_5V
+  ext_range: ETR_2V5
   delay_samples: 0
   timeout_ms: 0
   external_startcapture: false
 
 timing:
-  bunch_spacing_samples: 450
+  bunch_spacing_samples: 352
 
 acquisition:
   channels_mask: CHANNEL_A|CHANNEL_B
@@ -353,47 +322,91 @@ integration:
   baseline_window_samples: [0, 32]
   integral_window_samples: [32, 256]
 
+waveforms:
+  enable: true
+  full_record: true
+  mode: every_n
+  every_n: 1
+  threshold_integral_Vs: 0.0
+  threshold_peak_V: 0.0
+  max_waveforms_per_sec: 50
+  store_volts: true
+  dc_offset_correction: false
+
 storage:
-  data_dir: ~/daq/dataFile_ATS9462/captures
-  format: parquet
-  compression: snappy
+  data_dir: dataFile_ATS9462
+  session_tag: ""
+  rollover_minutes: 60
+  session_rotate_hours: 24
+  flush_every_records: 20000
+  flush_every_seconds: 2
+  sqlite_commit_every_snips: 200
 
-processing:
-  enable_live_display: true
-  enable_file_save: true
-
-readout_mode: NPT
+runtime:
+  readout_mode: NPT
+  noise_test: true
+  autotrigger_timeout_ms: 10
 """
 
 # ==================================================================================
-# DATA STRUCTURES
+# DATA CLASSES
 # ==================================================================================
 
 @dataclass
 class LiveRingWriter:
-    fd: Any
-    size_bytes: int
-    addr: int
-    buffer: np.ndarray
+    """Circular buffer for live waveform display"""
+    path: Path
+    nslots: int
+    npts: int
+    
+    def __post_init__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.data = np.zeros((self.nslots, self.npts), dtype=np.float32)
+        self.index = 0
+        
+    def write(self, waveform: np.ndarray):
+        """Write waveform to circular buffer"""
+        if len(waveform) != self.npts:
+            from scipy.interpolate import interp1d
+            x_old = np.linspace(0, 1, len(waveform))
+            x_new = np.linspace(0, 1, self.npts)
+            f = interp1d(x_old, waveform, kind='linear')
+            waveform = f(x_new)
+        
+        self.data[self.index] = waveform
+        self.index = (self.index + 1) % self.nslots
+        
+        try:
+            np.save(str(self.path), self.data)
+        except Exception:
+            pass
 
 @dataclass
 class AcquisitionStats:
+    """Statistics for acquisition monitoring"""
     rate_hz: float = 0.0
     captures: int = 0
+    started: str = ""
     last_capture: str = ""
     mean_peak_a: float = 0.0
     mean_peak_b: float = 0.0
-    data_written_gb: float = 0.0
-    started: str = ""
+    data_written_gb: float = 0.0  # CHANGED: Amount written, not space used
+
+"""
+==================================================================================
+PART 2: BOARD ACQUISITION CLASS - FULLY CORRECTED
+==================================================================================
+BoardAcquisition class with ATS-9352 connection fix and data_written tracking.
+"""
 
 # ==================================================================================
-# BOARD ACQUISITION CLASS - MINIMAL BUFFER OVERFLOW FIX
+# BOARD ACQUISITION CLASS
 # ==================================================================================
 
 class BoardAcquisition:
     """
     Handles data acquisition for a single board (9352 or 9462).
-    MINIMAL FIX: Only acquisition loop modified, GUI unchanged.
+    Can be used for both board types with appropriate configuration.
     """
     
     def __init__(self, board_type: str, config_path: Path, gui_queue: queue.Queue):
@@ -430,7 +443,7 @@ class BoardAcquisition:
         self.vpp_B = 0.0
         self.channels_enabled = {'A': True, 'B': True}
         self.trigger_level = 128
-
+        
     def load_config(self, config_path: Path = None):
         """Load configuration from YAML file"""
         if config_path:
@@ -544,6 +557,7 @@ class BoardAcquisition:
         
     def _send_stats_update(self):
         """Send statistics update to GUI"""
+        # CHANGED: Calculate amount of data written (not disk space)
         if self.config:
             data_dir = Path(self.config.get('storage', {}).get('data_dir', '.'))
             self.stats.data_written_gb = get_disk_usage(data_dir)
@@ -562,7 +576,7 @@ class BoardAcquisition:
             'time': time.time()
         }
         self.gui_queue.put(('waveform', wf_data))
-
+        
     def _configure_board(self) -> bool:
         """Configure the board according to YAML settings"""
         try:
@@ -570,105 +584,255 @@ class BoardAcquisition:
             system_id = int(board_cfg.get('system_id', 1))
             board_id = int(board_cfg.get('board_id', 1))
             
-            self.board = ats.Board(system_id, board_id)
-            self._log(f"Board connected: {self.board.getBitsPerSample()} bits/sample")
+            self._log(f"Connecting to System {system_id}, Board {board_id}...")
+            self.board = ats.Board(systemId=system_id, boardId=board_id)
             
-            # Clock configuration
+            # Verify board connection (Alazar ATSAPI Python wrapper compatibility)
+            # Older/official examples use getChannelInfo() which returns (maxSamplesPerChannel, bitsPerSample).
+            try:
+                _, bits = self.board.getChannelInfo()
+                self._log(f"✓ Board connected: {bits} bits/sample")
+            except Exception as e:
+                # Fallbacks for wrapper variants
+                bits = None
+                try:
+                    fn = getattr(self.board, "bitsPerSample", None)
+                    if callable(fn):
+                        bits = fn()
+                except Exception:
+                    bits = None
+
+                if bits is None:
+                    self._log(f"✗ Board connection failed: {e}")
+                    return False
+
+                self._log(f"✓ Board connected: {bits} bits/sample")
+            
+            # Configure clock
             clock_cfg = self.config.get('clock', {})
-            sample_rate = float(clock_cfg.get('sample_rate_msps', 250.0))
-            self.board.setCaptureClock(ats.INTERNAL_CLOCK, int(sample_rate * 1e6), ats.CLOCK_EDGE_RISING)
+            sample_rate_id = self._get_sample_rate_id(
+                float(clock_cfg.get('sample_rate_msps', 250.0))
+            )
             
-            # Channel configuration (simplified)
+            self.board.setCaptureClock(
+                ats.INTERNAL_CLOCK,
+                sample_rate_id,
+                ats.CLOCK_EDGE_RISING,
+                0
+            )
+            
+            # Configure channels
             channels_cfg = self.config.get('channels', {})
-            for ch_name, ch_cfg in channels_cfg.items():
-                if ch_name == 'A':
-                    ch_id = ats.CHANNEL_A
-                elif ch_name == 'B':
-                    ch_id = ats.CHANNEL_B
-                else:
-                    continue
-                
-                range_str = ch_cfg.get('range', 'PM_1_V')
-                vpp = _range_name_to_vpp(range_str)
-                coupling = getattr(ats, ch_cfg.get('coupling', 'DC'), ats.DC)
-                impedance = getattr(ats, ch_cfg.get('impedance', '50_OHM'), ats.IMPEDANCE_50_OHM)
-                
-                self.board.inputControl(ch_id, coupling, getattr(ats, f'INPUT_RANGE_{vpp*1000//1:.0f}_MV', ats.INPUT_RANGE_PM_1_V), impedance)
+            for ch_name, ch_mask in [('A', ats.CHANNEL_A), ('B', ats.CHANNEL_B)]:
+                if ch_name in channels_cfg:
+                    ch_cfg = channels_cfg[ch_name]
+                    
+                    coupling_name = str(ch_cfg.get('coupling', 'DC'))
+                    if not coupling_name.endswith('_COUPLING'):
+                        coupling_name += '_COUPLING'
+                    coupling = getattr(ats, coupling_name)
+                    
+                    range_name = str(ch_cfg.get('range', 'PM_1_V'))
+                    input_range = getattr(ats, 'INPUT_RANGE_' + range_name)
+                    
+                    impedance_name = str(ch_cfg.get('impedance', '50_OHM'))
+                    impedance = getattr(ats, 'IMPEDANCE_' + impedance_name)
+                    
+                    self.board.inputControlEx(ch_mask, coupling, input_range, impedance)
+                    
+                    # Set bandwidth limit (ATS-9462 specific)
+                    if self.board_type == '9462':
+                        try:
+                            self.board.setBWLimit(ch_mask, 0)
+                        except Exception as e:
+                            self._log(f"Warning: setBWLimit failed: {e}")
+                            
+            # Configure trigger
+            self._configure_trigger()
             
+            # Configure AUX IO (ATS-9462 specific)
+            if self.board_type == '9462':
+                try:
+                    self.board.configureAuxIO(ats.AUX_OUT_TRIGGER, 0)
+                except Exception as e:
+                    self._log(f"Warning: configureAuxIO failed: {e}")
+                    
             self._log("Board configured successfully")
             return True
             
         except Exception as e:
-            self._log(f"Configuration error: {e}")
+            self._log(f"ERROR configuring board: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+            
+    def _configure_trigger(self):
+        """Configure trigger settings"""
+        trigger_cfg = self.config.get('trigger', {})
         
+        operation = getattr(ats, str(trigger_cfg.get('operation', 'TRIG_ENGINE_OP_J')))
+        engine1 = getattr(ats, str(trigger_cfg.get('engine1', 'TRIG_ENGINE_J')))
+        engine2 = getattr(ats, str(trigger_cfg.get('engine2', 'TRIG_ENGINE_K')))
+        
+        sourceJ = getattr(ats, str(trigger_cfg.get('sourceJ', 'TRIG_EXTERNAL')))
+        slopeJ = getattr(ats, str(trigger_cfg.get('slopeJ', 'TRIGGER_SLOPE_POSITIVE')))
+        levelJ = self.trigger_level
+        
+        sourceK = getattr(ats, str(trigger_cfg.get('sourceK', 'TRIG_DISABLE')))
+        slopeK = getattr(ats, str(trigger_cfg.get('slopeK', 'TRIGGER_SLOPE_POSITIVE')))
+        levelK = int(trigger_cfg.get('levelK', 128))
+        
+        self.board.setTriggerOperation(
+            operation, engine1, sourceJ, slopeJ, levelJ,
+            engine2, sourceK, slopeK, levelK
+        )
+        
+        ext_coupling = getattr(ats, str(trigger_cfg.get('ext_coupling', 'DC_COUPLING')))
+        ext_range = getattr(ats, str(trigger_cfg.get('ext_range', 'ETR_5V')))
+        self.board.setExternalTrigger(ext_coupling, ext_range)
+        
+        self.board.setTriggerDelay(int(trigger_cfg.get('delay_samples', 0)))
+        
+        timeout_ms = int(trigger_cfg.get('timeout_ms', 0))
+        runtime_cfg = self.config.get('runtime', {})
+        if runtime_cfg.get('noise_test', False) and timeout_ms == 0:
+            timeout_ms = int(runtime_cfg.get('autotrigger_timeout_ms', 10))
+            
+        self.board.setTriggerTimeOut(timeout_ms)
+        
+    def _reconfigure_trigger(self):
+        """Reconfigure trigger without stopping acquisition"""
+        if not self.board:
+            return
+        try:
+            self._configure_trigger()
+            self._log(f"Trigger level updated to {self.trigger_level}")
+        except Exception as e:
+            self._log(f"Error reconfiguring trigger: {e}")
+            
+    def _get_sample_rate_id(self, rate_msps: float) -> int:
+        """Convert sample rate in MS/s to ATS constant"""
+        rate_map = {
+            1.0: ats.SAMPLE_RATE_1MSPS,
+            2.0: ats.SAMPLE_RATE_2MSPS,
+            5.0: ats.SAMPLE_RATE_5MSPS,
+            10.0: ats.SAMPLE_RATE_10MSPS,
+            20.0: ats.SAMPLE_RATE_20MSPS,
+            50.0: ats.SAMPLE_RATE_50MSPS,
+            100.0: ats.SAMPLE_RATE_100MSPS,
+            125.0: ats.SAMPLE_RATE_125MSPS,
+            160.0: ats.SAMPLE_RATE_160MSPS,
+            180.0: ats.SAMPLE_RATE_180MSPS,
+            200.0: ats.SAMPLE_RATE_200MSPS,
+            250.0: ats.SAMPLE_RATE_250MSPS,
+            500.0: ats.SAMPLE_RATE_500MSPS,
+            1000.0: ats.SAMPLE_RATE_1000MSPS,
+        }
+        
+        if rate_msps in rate_map:
+            return rate_map[rate_msps]
+        else:
+            self._log(f"Warning: Unsupported sample rate {rate_msps} MS/s, using 250 MS/s")
+            return ats.SAMPLE_RATE_250MSPS
+            
+    def _disk_writer_thread(self, write_queue: queue.Queue):
+        """
+        Background thread that handles all disk I/O so the acquisition loop
+        is never blocked by storage latency.
+        """
+        while True:
+            item = write_queue.get()
+            if item is None:          # sentinel: shut down
+                write_queue.task_done()
+                break
+            try:
+                fpath, save_kwargs, index_path, index_line = item
+                np.savez_compressed(fpath, **save_kwargs)
+                if index_path is not None:
+                    with open(index_path, "a", encoding="utf-8") as _fp:
+                        _fp.write(index_line)
+            except Exception as _se:
+                self._log(f"Save warning (disk writer): {_se}")
+            finally:
+                write_queue.task_done()
+
     def _acquisition_loop(self):
         """
-        Main acquisition loop with MINIMAL buffer overflow fix.
-        ONLY CHANGES:
-        - buffers_allocated: 64 → 128 (doubled)
-        - wait_timeout_ms: 1000 → 5000 (increased)
-        - Flow control check before posting
-        - Proper buffer recycling
+        Main acquisition loop - runs in background thread.
+
+        KEY CHANGE vs original:
+          • postAsyncBuffer() is called IMMEDIATELY after the raw copy so the
+            board gets its buffer back before any processing or disk I/O.
+          • All disk writes are handed off to a dedicated background thread via
+            a bounded queue, so compression/fsync never stalls the loop.
+          • buffers_allocated defaults to 64 (was 16) for extra headroom.
         """
-        if not self.config:
-            self.load_config()
-            
-        if not self._configure_board():
-            self.running = False
-            return
-            
+        # Background disk-writer
+        _write_queue: queue.Queue = queue.Queue(maxsize=256)
+        _writer = threading.Thread(
+            target=self._disk_writer_thread,
+            args=(_write_queue,),
+            daemon=True,
+            name=f"DiskWriter-{self.board_type}",
+        )
+        _writer.start()
+
         try:
+            if not self._configure_board():
+                return
+                
             acq_cfg = self.config.get('acquisition', {})
-            buffers_allocated = int(acq_cfg.get('buffers_allocated', 128))  # CHANGED: 64 → 128
             pre_trigger = int(acq_cfg.get('pre_trigger_samples', 0))
             post_trigger = int(acq_cfg.get('post_trigger_samples', 256))
-            records_per_buffer = int(acq_cfg.get('records_per_buffer', 128))
-            wait_timeout_ms = int(acq_cfg.get('wait_timeout_ms', 5000))  # CHANGED: 1000 → 5000
-            
-            # Flow control for buffer overflow prevention (NEW)
-            flow_control = BufferFlowControl(buffers_allocated)
-            
             samples_per_record = pre_trigger + post_trigger
-            ch_count = sum([self.channels_enabled['A'], self.channels_enabled['B']])
-            buffer_size = records_per_buffer * samples_per_record * ch_count * 2
+            records_per_buffer = int(acq_cfg.get('records_per_buffer', 128))
+            # Default bumped from 16 → 64; override in YAML via buffers_allocated
+            buffers_allocated = int(acq_cfg.get('buffers_allocated', 64))
             
-            # Allocate DMA buffers
+            channels_mask_str = str(acq_cfg.get('channels_mask', 'CHANNEL_A|CHANNEL_B'))
+            ch_mask = 0
+            ch_count = 0
+            if 'CHANNEL_A' in channels_mask_str:
+                ch_mask |= ats.CHANNEL_A
+                ch_count += 1
+            if 'CHANNEL_B' in channels_mask_str and self.channels_enabled['B']:
+                ch_mask |= ats.CHANNEL_B
+                ch_count += 1
+                
+            bytes_per_sample = 2
+            bytes_per_buffer = bytes_per_sample * samples_per_record * records_per_buffer * ch_count
+            
             buffers = []
             for i in range(buffers_allocated):
-                buf = self.board.allocateBuffer(buffer_size)
-                buffers.append(buf)
+                buffers.append(ats.DMABuffer(self.board.handle, ctypes.c_uint16, bytes_per_buffer))
                 
-            self._log(f"Allocated {buffers_allocated} buffers ({buffer_size} bytes each)")
+            runtime_cfg = self.config.get('runtime', {})
+            readout_mode = str(runtime_cfg.get('readout_mode', 'TR')).strip().upper()
+            use_npt_mode = readout_mode in ('NPT', 'NO_PRETRIGGER', 'NO-PRETRIGGER')
             
-            # Configure acquisition mode
-            ch_mask = 0
-            if self.channels_enabled['A']:
-                ch_mask |= ats.CHANNEL_A
-            if self.channels_enabled['B']:
-                ch_mask |= ats.CHANNEL_B
-                
-            readout_mode = self.config.get('runtime', {}).get('readout_mode', 'TR')
-            if readout_mode == 'NPT':
+            if use_npt_mode:
                 self._log("Using NPT mode (No Pre-Trigger)")
-                adma_flags = ats.ADMA_NPT
+                adma_flags = ats.ADMA_NPT | ats.ADMA_EXTERNAL_STARTCAPTURE
+                self.board.beforeAsyncRead(ch_mask, 0, samples_per_record, records_per_buffer, 0x7FFFFFFF, adma_flags)
             else:
                 self._log("Using Traditional mode")
+                # records_per_acquisition = 0x7FFFFFFF → run indefinitely.
+                # Traditional mode arms itself via startCapture() below;
+                # do NOT add ADMA_EXTERNAL_STARTCAPTURE here or the board
+                # waits for a software arm signal that never comes.
                 adma_flags = ats.ADMA_TRADITIONAL_MODE
+                self.board.beforeAsyncRead(ch_mask, -pre_trigger, samples_per_record,
+                                           records_per_buffer, 0x7FFFFFFF, adma_flags)
                 
-            self.board.beforeAsyncRead(ch_mask, -pre_trigger, samples_per_record,
-                                      records_per_buffer, 0x7FFFFFFF, adma_flags)
-            
             for buf in buffers:
                 self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
-                flow_control.record_post()  # Track initial posts
                 
             self.board.startCapture()
             self._log("Acquisition started")
             
             self.stats.started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Persistent capture storage (auto-create)
+            # ---- Persistent capture storage (auto-create) ----
             try:
                 _dd = Path(self.config.get('storage', {}).get('data_dir', f"dataFile_ATS{self.board_type}")).expanduser()
                 if not _dd.is_absolute():
@@ -688,6 +852,7 @@ class BoardAcquisition:
                     )
                 self._save_every = int(self.config.get('storage', {}).get('save_every_buffers', 1) or 1)
                 self._save_every = max(1, self._save_every)
+                # Persist resolved data_dir back into config for archive viewer
                 self.config.setdefault('storage', {})['data_dir'] = str(_dd)
                 self._log(f"Saving captures under: {self._session_dir}")
             except Exception as _e:
@@ -699,38 +864,22 @@ class BoardAcquisition:
             buf_count = 0
             last_stats_time = time.time()
             
-            # ===== MAIN ACQUISITION LOOP WITH BUFFER OVERFLOW FIX =====
             while self.running:
                 if self.paused:
                     time.sleep(0.1)
                     continue
                     
                 try:
-                    # BUFFER OVERFLOW FIX: Flow control check (NEW)
-                    if not flow_control.can_post():
-                        continue  # Wait before posting
-                    
                     buf_index = buf_count % buffers_allocated
                     buf = buffers[buf_index]
                     
-                    try:
-                        self.board.waitAsyncBufferComplete(buf.addr, wait_timeout_ms)
-                    except Exception as wait_err:
-                        if "ApiWaitTimeout" in str(wait_err):
-                            continue
-                        elif "ApiBufferOverflow" in str(wait_err):
-                            self._log(f"OVERFLOW WARNING: {wait_err}")
-                            time.sleep(0.05)
-                            continue
-                        else:
-                            raise
-
+                    self.board.waitAsyncBufferComplete(buf.addr, 1000)
+                    
                     # ── CRITICAL: copy raw data first, then immediately recycle
                     # the buffer back to the board BEFORE doing any processing.
+                    # This is the primary fix for ApiBufferOverflow.
                     raw = buf.buffer.copy()
-                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
-                    flow_control.record_post()  # Track post (NEW)
-                    flow_control.record_complete()  # Track completion (NEW)
+                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)  # ← moved up
 
                     # ── Process the copy (board is free to fill the buffer again)
                     if ch_count == 2:
@@ -740,27 +889,35 @@ class BoardAcquisition:
                         A = raw.reshape(records_per_buffer, samples_per_record)
                         B = None
 
-                    # ── Stale-buffer guard
-                    _floor_code = 0
+                    # ── Stale-buffer guard ─────────────────────────────────────────
+                    # An uninitialized DMA buffer contains all-zero uint16 words.
+                    # After volt conversion, ADC code 0x0000 maps to exactly -Vpp/2
+                    # (e.g. -0.4 V for PM_400_MV).  If every sample in record[0]
+                    # equals that floor value the buffer hasn't been written by the
+                    # board yet; skip it rather than saving garbage.
+                    _floor_code = 0          # uint16 value for uninitialized memory
                     _stale = bool(np.all(A[0] == _floor_code))
                     if _stale:
                         buf_count += 1
                         continue
+                    # ──────────────────────────────────────────────────────────────
 
                     wfA_volts = _codes_to_volts_u16(A[0], self.vpp_A)
                     wfB_volts = _codes_to_volts_u16(B[0], self.vpp_B) if B is not None else None
 
-                    A_volts_all = _codes_to_volts_u16(A, self.vpp_A)
+                    # Convert all records (needed for stats and optionally disk save)
+                    A_volts_all = _codes_to_volts_u16(A, self.vpp_A)      # shape (R, S)
                     B_volts_all = _codes_to_volts_u16(B, self.vpp_B) if B is not None else None
                     
                     integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
                     integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
 
-                    # Enqueue disk save (non-blocking)
+                    # ── Enqueue disk save (non-blocking; handled by background thread)
                     if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
                         ts_ns = time.time_ns()
                         fname = f"buf_{buf_count:06d}.npz"
                         fpath = self._session_dir / fname
+                        # Save ALL records in this buffer (shape: [records_per_buffer, samples])
                         if B_volts_all is None:
                             save_kwargs = dict(
                                 wfA_V=A_volts_all.astype(np.float32, copy=False),
@@ -792,6 +949,7 @@ class BoardAcquisition:
 
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # Peak over ALL records in the buffer for a meaningful reading
                     self.stats.mean_peak_a = float(np.max(np.abs(A_volts_all)))
                     if B_volts_all is not None:
                         self.stats.mean_peak_b = float(np.max(np.abs(B_volts_all)))
@@ -808,7 +966,7 @@ class BoardAcquisition:
                     buf_count += 1
                     
                 except Exception as e:
-                    if "ApiBufferOverflow" in str(e) or "ApiWaitTimeout" in str(e):
+                    if "ApiWaitTimeout" in str(e):
                         continue
                     else:
                         self._log(f"Error in acquisition loop: {e}")
@@ -827,12 +985,26 @@ class BoardAcquisition:
                 pass
             self.running = False
             self._log("Acquisition stopped")
+            # Gracefully drain and stop the disk writer
             try:
-                _write_queue.put(None)
-                _write_queue.join()
+                _write_queue.put(None)   # sentinel
+                _write_queue.join()      # wait for all pending writes to finish
             except Exception:
                 pass
 
+"""
+==================================================================================
+PART 3: GUI IMPLEMENTATION - FULLY CORRECTED
+==================================================================================
+Complete GUI with ALL improvements:
+- Streamlined design
+- White play button on grey
+- Board names once at top
+- Simplified titles
+- Rolling integrals
+- Trigger as percentage
+- Disk as "GB written"
+"""
 
 # ==================================================================================
 # GUI CLASSES
