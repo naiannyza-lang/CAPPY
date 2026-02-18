@@ -403,6 +403,251 @@ BoardAcquisition class with ATS-9352 connection fix and data_written tracking.
 # BOARD ACQUISITION CLASS
 # ==================================================================================
 
+
+# ==================================================================================
+# Legacy-compatible archive writer (v1.x format)
+#   Layout under <data_dir>/captures/YYYY/YYYY-MM/YYYY-MM-DD/:
+#     index/snips_<session>.sqlite
+#     session_index.parquet
+#     <HH:00>/waveforms/A_snips_<session>_<YYYYMMDD_HHMM>.bin (+ B_...)
+# ==================================================================================
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _captures_day_dir(data_dir: Path, ts_ns: int) -> Path:
+    dt = datetime.fromtimestamp(ts_ns / 1e9)
+    y = dt.strftime("%Y")
+    ym = dt.strftime("%Y-%m")
+    ymd = dt.strftime("%Y-%m-%d")
+    return data_dir / "captures" / y / ym / ymd
+
+class WaveBinSqliteStore:
+    """Write waveform snippets to time-rolled .bin files + SQLite index (WAL)."""
+
+    def __init__(self, day_dir: Path, session_id: str, rollover_minutes: int = 10, commit_every: int = 200):
+        self.day_dir = Path(day_dir)
+        self.session_id = str(session_id)
+        self.rollover_minutes = max(1, int(rollover_minutes))
+        self.commit_every = max(1, int(commit_every))
+        _ensure_dir(self.day_dir)
+
+        idx_dir = self.day_dir / "index"
+        _ensure_dir(idx_dir)
+        self.db_path = idx_dir / f"snips_{self.session_id}.sqlite"
+
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS snips (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT,
+              timestamp_ns INTEGER,
+              buffer_index INTEGER,
+              record_in_buffer INTEGER,
+              record_global INTEGER,
+              channels_mask TEXT,
+              sample_rate_hz REAL,
+              n_samples INTEGER,
+
+              n_channels INTEGER,
+              file TEXT,
+              offset_bytes INTEGER,
+              nbytes INTEGER,
+
+              file_A TEXT,
+              offset_A INTEGER,
+              nbytes_A INTEGER,
+              file_B TEXT,
+              offset_B INTEGER,
+              nbytes_B INTEGER,
+
+              area_A_Vs REAL,
+              peak_A_V REAL,
+              baseline_A_V REAL,
+              area_B_Vs REAL,
+              peak_B_V REAL,
+              baseline_B_V REAL
+            );
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_snips_session_time ON snips(session_id, timestamp_ns);")
+        self.conn.commit()
+
+        self._fhA = None
+        self._fhB = None
+        self._bin_key = None
+        self._bin_hour = None
+        self._rows_since_commit = 0
+
+        self._n_snips = 0
+
+    def _hour_dir(self, ts_ns: int):
+        dt = datetime.fromtimestamp(ts_ns / 1e9)
+        hour = dt.strftime("%H:00")
+        p = self.day_dir / hour / "waveforms"
+        _ensure_dir(p)
+        return hour, p
+
+    def _minute_key(self, ts_ns: int) -> str:
+        return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
+
+    def _open_bins(self, ts_ns: int, key: str):
+        hour, base = self._hour_dir(ts_ns)
+        pathA = base / f"A_snips_{self.session_id}_{key}.bin"
+        pathB = base / f"B_snips_{self.session_id}_{key}.bin"
+        self._fhA = open(pathA, "ab", buffering=0)
+        self._fhB = open(pathB, "ab", buffering=0)
+        self._bin_key = key
+        self._bin_hour = hour
+
+    def _close_bins(self):
+        for fh in (self._fhA, self._fhB):
+            try:
+                if fh:
+                    fh.close()
+            except Exception:
+                pass
+        self._fhA = None
+        self._fhB = None
+        self._bin_key = None
+        self._bin_hour = None
+
+    def _maybe_roll(self, ts_ns: int):
+        key = self._minute_key(ts_ns)
+        hour, _ = self._hour_dir(ts_ns)
+
+        if self._bin_key is None or self._fhA is None or self._fhB is None or self._bin_hour is None:
+            self._open_bins(ts_ns, key)
+            return
+
+        if hour != self._bin_hour:
+            self._close_bins()
+            self._open_bins(ts_ns, key)
+            return
+
+        try:
+            t0 = datetime.strptime(self._bin_key, "%Y%m%d_%H%M")
+            t1 = datetime.strptime(key, "%Y%m%d_%H%M")
+            if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
+                self._close_bins()
+                self._open_bins(ts_ns, key)
+        except Exception:
+            self._close_bins()
+            self._open_bins(ts_ns, key)
+
+    def append(self,
+               ts_ns: int,
+               buffer_index: int,
+               record_in_buffer: int,
+               record_global: int,
+               channels_mask: str,
+               sample_rate_hz: float,
+               wfA_V: np.ndarray,
+               wfB_V: Optional[np.ndarray],
+               area_A_Vs: float,
+               peak_A_V: float,
+               baseline_A_V: float,
+               area_B_Vs: float,
+               peak_B_V: float,
+               baseline_B_V: float):
+
+        self._maybe_roll(ts_ns)
+        assert self._fhA is not None and self._fhB is not None
+
+        wfA = np.asarray(wfA_V, dtype=np.float32)
+        offA = self._fhA.tell()
+        bA = wfA.tobytes(order="C")
+        self._fhA.write(bA)
+
+        fileA = str((Path(self._bin_hour) / "waveforms" / Path(self._fhA.name).name))
+
+        if wfB_V is not None:
+            wfB = np.asarray(wfB_V, dtype=np.float32)
+            offB = self._fhB.tell()
+            bB = wfB.tobytes(order="C")
+            self._fhB.write(bB)
+            fileB = str((Path(self._bin_hour) / "waveforms" / Path(self._fhB.name).name))
+            n_channels = 2
+            n_samples = int(wfA.size)
+        else:
+            offB = None
+            bB = b""
+            fileB = None
+            n_channels = 1
+            n_samples = int(wfA.size)
+
+        # Legacy combined payload fields left NULL/0 (we store channel-separated)
+        self.conn.execute(
+            "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,"
+            "sample_rate_hz,n_samples,n_channels,"
+            "file,offset_bytes,nbytes,"
+            "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+            "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                self.session_id, int(ts_ns), int(buffer_index), int(record_in_buffer), int(record_global),
+                str(channels_mask),
+                float(sample_rate_hz), int(n_samples), int(n_channels),
+                None, None, None,
+                fileA, int(offA), int(len(bA)),
+                fileB, (int(offB) if offB is not None else None), (int(len(bB)) if wfB_V is not None else None),
+                float(area_A_Vs), float(peak_A_V), float(baseline_A_V),
+                float(area_B_Vs), float(peak_B_V), float(baseline_B_V),
+            )
+        )
+        self._rows_since_commit += 1
+        self._n_snips += 1
+
+        if self._rows_since_commit >= self.commit_every:
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+            self._rows_since_commit = 0
+
+    def finalize(self):
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
+        try:
+            self._close_bins()
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+def _update_session_index(day_dir: Path, session_id: str, first_ns: int, last_ns: int, waveform_snips: int):
+    """Append/update session_index.parquet inside the day_dir."""
+    try:
+        idx = Path(day_dir) / "session_index.parquet"
+        row = {
+            "date": Path(day_dir).name,
+            "session_id": str(session_id),
+            "first_timestamp_ns": int(first_ns),
+            "last_timestamp_ns": int(last_ns),
+            "waveform_snips": int(waveform_snips),
+        }
+        if idx.exists():
+            try:
+                df = pd.read_parquet(idx)
+            except Exception:
+                df = pd.DataFrame()
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        # Keep newest first
+        df = df.sort_values("first_timestamp_ns", ascending=False)
+        df.to_parquet(idx, index=False)
+    except Exception:
+        # Don't break acquisition if parquet writing fails
+        pass
+
+
 class BoardAcquisition:
     """
     Handles data acquisition for a single board (9352 or 9462).
@@ -786,36 +1031,48 @@ class BoardAcquisition:
             
             self.stats.started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # ---- Persistent capture storage (auto-create) ----
+            # ---- Legacy-compatible archive storage (auto-create) ----
+            self._data_dir = None
+            self._day_dir = None
+            self._session_id = None
+            self._snip_store = None
+            self._session_first_ns = None
+            self._session_last_ns = None
+
             try:
-                _dd = Path(self.config.get('storage', {}).get('data_dir', f"dataFile_ATS{self.board_type}")).expanduser()
-                if not _dd.is_absolute():
-                    _dd = (Path.cwd() / _dd).resolve()
-                (_dd).mkdir(parents=True, exist_ok=True)
-                _captures_root = _dd / "captures"
-                _date = datetime.now().strftime("%Y-%m-%d")
-                _hour = datetime.now().strftime("%H%M")
-                _session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-                self._session_dir = _captures_root / _date / _hour / _session_id
-                self._session_dir.mkdir(parents=True, exist_ok=True)
-                self._index_path = self._session_dir / "snips.csv"
-                if not self._index_path.exists():
-                    self._index_path.write_text(
-                        "buf_index,timestamp_ns,sample_rate_hz,file,channels\n",
-                        encoding="utf-8",
-                    )
+                dd = Path(self.config.get('storage', {}).get('data_dir', f"dataFile_ATS{self.board_type}")).expanduser()
+                if not dd.is_absolute():
+                    dd = (Path.cwd() / dd).resolve()
+                _ensure_dir(dd)
+
+                ts0 = time.time_ns()
+                day_dir = _captures_day_dir(dd, ts0)
+                _ensure_dir(day_dir)
+
+                session_id = datetime.fromtimestamp(ts0 / 1e9).strftime("%Y%m%d_%H%M%S")
+                rollover = int(self.config.get('storage', {}).get('rollover_minutes', 10) or 10)
+                commit_every = int(self.config.get('storage', {}).get('commit_every', 200) or 200)
+
+                self._data_dir = dd
+                self._day_dir = day_dir
+                self._session_id = session_id
+                self._snip_store = WaveBinSqliteStore(day_dir, session_id, rollover_minutes=rollover, commit_every=commit_every)
+                self._session_first_ns = ts0
+                self._session_last_ns = ts0
+
+                # Persist resolved data_dir back into config for archive viewer
+                self.config.setdefault('storage', {})['data_dir'] = str(dd)
+
                 self._save_every = int(self.config.get('storage', {}).get('save_every_buffers', 1) or 1)
                 self._save_every = max(1, self._save_every)
-                # Persist resolved data_dir back into config for archive viewer
-                self.config.setdefault('storage', {})['data_dir'] = str(_dd)
-                self._log(f"Saving captures under: {self._session_dir}")
-            except Exception as _e:
-                self._session_dir = None
-                self._index_path = None
-                self._save_every = 0
-                self._log(f"Warning: capture saving disabled (could not init storage): {_e}")
 
+                self._log(f"Archive day dir: {day_dir}")
+                self._log(f"Archive session: {session_id} (save_every={self._save_every})")
+            except Exception as _e:
+                self._save_every = 0
+                self._log(f"Warning: archive saving disabled (could not init storage): {_e}")
             buf_count = 0
+
             last_stats_time = time.time()
             
             while self.running:
@@ -844,40 +1101,41 @@ class BoardAcquisition:
                     integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
                     integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
 
-                    # ---- Save to disk (per buffer) ----
-                    if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
+                    # ---- Save to legacy archive (snips sqlite + bin files) ----
+                    if self._snip_store is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
                         try:
                             ts_ns = time.time_ns()
-                            fname = f"buf_{buf_count:06d}.npz"
-                            fpath = self._session_dir / fname
-                            if wfB_volts is None:
-                                np.savez_compressed(
-                                    fpath,
-                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
-                                    sample_rate_hz=float(self.sample_rate_hz),
-                                    timestamp_ns=int(ts_ns),
-                                    board=str(self.board_type),
-                                    channels="A",
-                                )
-                                chs = "A"
-                            else:
-                                np.savez_compressed(
-                                    fpath,
-                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
-                                    wfB_V=wfB_volts.astype(np.float32, copy=False),
-                                    sample_rate_hz=float(self.sample_rate_hz),
-                                    timestamp_ns=int(ts_ns),
-                                    board=str(self.board_type),
-                                    channels="A|B",
-                                )
-                                chs = "A|B"
-                            if self._index_path is not None:
-                                with open(self._index_path, "a", encoding="utf-8") as _fp:
-                                    _fp.write(f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},{chs}\n")
-                        except Exception as _se:
-                            # Don't kill acquisition if disk write fails
-                            self._log(f"Save warning: {_se}")
+                            self._session_last_ns = ts_ns
 
+                            # Basic baseline estimate (first 16 samples)
+                            nbase = min(16, len(wfA_volts))
+                            baseline_A = float(np.mean(wfA_volts[:nbase])) if nbase > 0 else 0.0
+                            baseline_B = float(np.mean(wfB_volts[:nbase])) if (wfB_volts is not None and nbase > 0) else 0.0
+
+                            area_A = float(integralA)
+                            area_B = float(integralB) if wfB_volts is not None else 0.0
+                            peak_A = float(np.max(np.abs(wfA_volts))) if wfA_volts is not None else 0.0
+                            peak_B = float(np.max(np.abs(wfB_volts))) if wfB_volts is not None else 0.0
+
+                            chmask_txt = "CHANNEL_A|CHANNEL_B" if wfB_volts is not None else "CHANNEL_A"
+                            self._snip_store.append(
+                                ts_ns=int(ts_ns),
+                                buffer_index=int(buf_count),
+                                record_in_buffer=0,
+                                record_global=int(buf_count),
+                                channels_mask=chmask_txt,
+                                sample_rate_hz=float(self.sample_rate_hz),
+                                wfA_V=wfA_volts,
+                                wfB_V=wfB_volts,
+                                area_A_Vs=area_A,
+                                peak_A_V=peak_A,
+                                baseline_A_V=baseline_A,
+                                area_B_Vs=area_B,
+                                peak_B_V=peak_B,
+                                baseline_B_V=baseline_B,
+                            )
+                        except Exception as _se:
+                            self._log(f"Save warning: {_se}")
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self.stats.mean_peak_a = float(np.max(np.abs(wfA_volts)))
@@ -909,6 +1167,31 @@ class BoardAcquisition:
             traceback.print_exc()
             
         finally:
+            # Flush archive writers (do not raise)
+            try:
+                store = getattr(self, "_snip_store", None)
+                n_snips = int(getattr(store, "_n_snips", 0) or 0) if store is not None else 0
+                if store is not None:
+                    try:
+                        store.finalize()
+                    finally:
+                        self._snip_store = None
+            except Exception:
+                n_snips = int(getattr(self.stats, "captures", 0) or 0)
+            except Exception:
+                pass
+            try:
+                if getattr(self, "_day_dir", None) is not None and getattr(self, "_session_id", None) is not None:
+                    first_ns = int(getattr(self, "_session_first_ns", 0) or 0)
+                    last_ns = int(getattr(self, "_session_last_ns", 0) or first_ns)
+                    n_snips = int(locals().get('n_snips', 0) or 0)
+                    # If store already cleared, attempt to infer from stats
+                    if n_snips <= 0:
+                        n_snips = int(getattr(self.stats, "captures", 0) or 0)
+                    _update_session_index(Path(self._day_dir), str(self._session_id), first_ns, last_ns, n_snips)
+            except Exception:
+                pass
+
             try:
                 if self.board:
                     self.board.abortAsyncRead()
