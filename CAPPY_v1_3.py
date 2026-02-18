@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-==================================================================================
-CAPPY DUAL-BOARD UNIFIED ACQUISITION SYSTEM - MINIMAL BUFFER FIX
-==================================================================================
-
-Simultaneously manages:
-- ATS-9352 (System 2, Board 1) - 250 MS/s, 2-channel
-- ATS-9462 (System 1, Board 1) - 180 MS/s, 2-channel
-
-==================================================================================
-"""
 from __future__ import annotations
 
 import argparse
@@ -26,67 +15,6 @@ import smtplib
 import subprocess
 import shutil
 from email.message import EmailMessage
-from dataclasses import dataclass
-from datetime import datetime, date
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-import numpy as np
-import pandas as pd
-import yaml
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-# GUI
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, font as tkfont, scrolledtext
-
-# Plotting
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-import re
-plt.style.use('dark_background')
-
-# ==================================================================================
-# GLOBAL CONFIGURATION
-# ==================================================================================
-
-# Color schemes - used ONLY for plot lines (not UI elements)
-COLORS = {
-    '9352': {
-        'A': '#FF00EE',      # Pink for Channel A plots
-        'B': '#26FF00',      # Green for Channel B plots
-        'name': 'ATS-9352'
-    },
-    '9462': {
-        'A': '#00BFFF',      # Blue for Channel A plots
-        'B': '#FF8C00',      # Orange for Channel B plots
-        'name': 'ATS-9462'
-    }
-}
-
-# UI Theme - Clean and streamlined (NEW)
-UI_COLORS = {
-    'bg_dark': '#1e1e1e',
-    'bg_medium': '#2d2d2d',
-    'bg_sidebar': '#252525',
-    'bg_widget': '#2a2a2a',
-    'button_bg': '#2f2f2f',
-    'button_fg': 'white',
-    'play_button_bg': '#3f3f3f',   # Grey background
-    'play_button_fg': 'white',     # White text
-    'separator': '#444444',
-}
-
-
-# Persistent app state (last-used YAML paths and data directories)
-APP_STATE_DIR = Path.home() / ".cappy"
-APP_STATE_PATH = APP_STATE_DIR / "cappy_state.json"
-DEFAULT_CONFIG_9352_NAME = "config_9352.yaml"
-DEFAULT_CONFIG_9462_NAME = "config_9462.yaml"
 
 STOP_REQUESTED = False
 
@@ -96,106 +24,50 @@ def _signal_handler(_sig, _frame):
 
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
+from dataclasses import dataclass
+from datetime import datetime, date
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-# ATS API
+import numpy as np
+import pandas as pd
+import yaml
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# GUI + plotting (optional)
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+plt.style.use('dark_background')
+
+# Define neon colors
+NEON_PINK = "#FF00EE"
+NEON_GREEN = "#26FF00"
+
 ATS_AVAILABLE = False
 ats = None
 try:
     sys.path.append('/usr/local/AlazarTech/samples/Samples_Python/Library/')
-    import atsapi as ats
+    import atsapi as ats  # type: ignore
     ATS_AVAILABLE = True
 except Exception:
     ATS_AVAILABLE = False
     ats = None
 
-# ==================================================================================
-# UTILITY FUNCTIONS
-# ==================================================================================
-
-def get_disk_usage(path: Union[str, Path]) -> float:
-    """
-    Get total size of all files in directory (amount written to disk).
-    Returns: size in GB
-    """
-    try:
-        path = Path(path)
-        if not path.exists():
-            return 0.0
-        total_bytes = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
-        return total_bytes / (1024**3)
-    except Exception:
-        return 0.0
-
-def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
-    """
-    Convert uint16 ADC codes to volts.
-    Universal formula for true 16-bit ADCs (both 9352 and 9462).
-    """
-    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
-
-def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
-    """
-    Convert Alazar range strings to Vpp.
-    Examples: 'PM_1_V' → 2.0, 'PM_400_MV' → 0.8
-    """
-    rn = (range_name or "").strip().upper().replace("INPUT_RANGE_", "")
-    
-    if rn.startswith("PM_") and rn.endswith("_MV"):
-        try:
-            mv = float(rn[3:-3])
-            return 2.0 * (mv / 1000.0)
-        except Exception:
-            return default_vpp
-            
-    if rn.startswith("PM_") and rn.endswith("_V"):
-        try:
-            v = float(rn[3:-2])
-            return 2.0 * v
-        except Exception:
-            return default_vpp
-    
-    RANGES = {
-        "PM_20_MV": 0.04, "PM_40_MV": 0.08, "PM_50_MV": 0.10,
-        "PM_80_MV": 0.16, "PM_100_MV": 0.20, "PM_200_MV": 0.40,
-        "PM_400_MV": 0.80, "PM_500_MV": 1.00, "PM_800_MV": 1.60,
-        "PM_1_V": 2.00, "PM_2_V": 4.00, "PM_4_V": 8.00,
-        "PM_5_V": 10.00, "PM_8_V": 16.00, "PM_10_V": 20.00,
-        "PM_20_V": 40.00, "PM_40_V": 80.00,
-    }
-    return float(RANGES.get(rn, default_vpp))
-
-def format_filesize(bytes_val: float) -> str:
-    """Format bytes as human-readable"""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_val < 1024.0:
-            return f"{bytes_val:.1f} {unit}"
-        bytes_val /= 1024.0
-    return f"{bytes_val:.1f} PB"
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def _read_json(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def _write_json(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
-
-
-# ==================================================================================
-# DEFAULT YAML CONFIGURATIONS
-# ==================================================================================
-
-DEFAULT_YAML_9352 = r"""# ATS-9352 Configuration
+DEFAULT_YAML = r"""# =========================
+# CAPPY v1.3 Configuration
+# Proton beam default: 250 MS/s
+# Use *samples* where possible
+# =========================
 board:
   system_id: 2
   board_id: 1
+
 
 clock:
   source: INTERNAL_CLOCK
@@ -205,7 +77,7 @@ clock:
 channels:
   A:
     coupling: DC
-    range: PM_1_V
+    range: PM_1_V          # maps to INPUT_RANGE_PM_1_V (old-script style)
     impedance: 50_OHM
   B:
     coupling: DC
@@ -216,33 +88,37 @@ trigger:
   operation: TRIG_ENGINE_OP_J
   engine1: TRIG_ENGINE_J
   engine2: TRIG_ENGINE_K
+
   sourceJ: TRIG_EXTERNAL
   slopeJ: TRIGGER_SLOPE_POSITIVE
   levelJ: 128
+
   sourceK: TRIG_DISABLE
   slopeK: TRIGGER_SLOPE_POSITIVE
   levelK: 128
+
   ext_coupling: DC_COUPLING
   ext_range: ETR_5V
   delay_samples: 0
-  timeout_ms: 0
+  timeout_ms: 0                   # 0 = wait forever (unless runtime.noise_test=true)
+
   external_startcapture: false
 
 timing:
-  bunch_spacing_samples: 450
+  bunch_spacing_samples: 424      # adjust to your bunch spacing
 
 acquisition:
   channels_mask: CHANNEL_A|CHANNEL_B
   pre_trigger_samples: 0
-  post_trigger_samples: 256
+  post_trigger_samples: 256       # full record = pre + post
   records_per_buffer: 128
-  buffers_allocated: 128
-  buffers_per_acquisition: 0
-  wait_timeout_ms: 5000
+  buffers_allocated: 16
+  buffers_per_acquisition: 0      # 0 = run forever (until stop)
+  wait_timeout_ms: 1000           # DMA wait timeout; timeouts are handled (no crash)
 
 integration:
-  baseline_window_samples: [0, 32]
-  integral_window_samples: [32, 256]
+  baseline_window_samples: [0, 64]
+  integral_window_samples:  [64, 128]
 
 waveforms:
   enable: true
@@ -253,10 +129,9 @@ waveforms:
   threshold_peak_V: 0.0
   max_waveforms_per_sec: 50
   store_volts: true
-  dc_offset_correction: false
 
 storage:
-  data_dir: dataFile_ATS9352
+  data_dir: dataFile
   session_tag: ""
   rollover_minutes: 60
   session_rotate_hours: 24
@@ -264,2540 +139,2832 @@ storage:
   flush_every_seconds: 2
   sqlite_commit_every_snips: 200
 
+notify:
+  enabled: false
+  to: "user@example.com"
+  from: "cappy@localhost"
+  method: "sendmail"
+  sendmail_path: "/usr/sbin/sendmail"
+  subject_prefix: "[CAPPY]"
+  heartbeat_seconds: 1
+  interval_minutes: 120
+
 runtime:
-  readout_mode: TR
   noise_test: false
   autotrigger_timeout_ms: 10
 """
 
-DEFAULT_YAML_9462 = r"""# ATS-9462 Configuration
-board:
-  system_id: 1
-  board_id: 1
+REDUCED_SCHEMA = pa.schema([
+    ("session_id", pa.string()),
+    ("buffer_index", pa.int32()),
+    ("record_in_buffer", pa.int32()),
+    ("record_global", pa.int64()),
+    ("timestamp_ns", pa.int64()),
+    ("sample_rate_hz", pa.float64()),
+    ("samples_per_record", pa.int32()),
+    ("records_per_buffer", pa.int32()),
+    ("channels_mask", pa.string()),
+    ("bunch_spacing_samples", pa.int32()),
+    ("area_A_Vs", pa.float64()),
+    ("peak_A_V", pa.float64()),
+    ("baseline_A_V", pa.float64()),
+    ("area_B_Vs", pa.float64()),
+    ("peak_B_V", pa.float64()),
+    ("baseline_B_V", pa.float64()),
+])
 
-clock:
-  source: INTERNAL_CLOCK
-  sample_rate_msps: 180.0
-  edge: CLOCK_EDGE_RISING
+SESSION_INDEX_SCHEMA = pa.schema([
+    ("session_id", pa.string()),
+    ("date", pa.string()),
+    ("first_timestamp_ns", pa.int64()),
+    ("last_timestamp_ns", pa.int64()),
+    ("reduced_rows", pa.int64()),
+    ("waveform_snips", pa.int64()),
+    ("channels_mask", pa.string()),
+])
 
-channels:
-  A:
-    coupling: DC
-    range: PM_400_MV
-    impedance: 50_OHM
-  B:
-    coupling: DC
-    range: PM_400_MV
-    impedance: 50_OHM
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-trigger:
-  operation: TRIG_ENGINE_OP_J
-  engine1: TRIG_ENGINE_J
-  engine2: TRIG_ENGINE_K
-  sourceJ: TRIG_EXTERNAL
-  slopeJ: TRIGGER_SLOPE_POSITIVE
-  levelJ: 128
-  sourceK: TRIG_DISABLE
-  slopeK: TRIGGER_SLOPE_POSITIVE
-  levelK: 128
-  ext_coupling: DC_COUPLING
-  ext_range: ETR_2V5
-  delay_samples: 0
-  timeout_ms: 0
-  external_startcapture: false
+def clear_pycache(root: Path) -> int:
+    """Delete __pycache__ folders and .pyc/.pyo files under root. Returns count removed (best-effort)."""
+    root = Path(root)
+    removed = 0
+    try:
+        # Remove __pycache__ directories
+        for d in root.rglob("__pycache__"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+            except Exception:
+                pass
 
-timing:
-  bunch_spacing_samples: 352
+        # Remove stray bytecode files FUUUUU-
+        for ext in ("*.pyc", "*.pyo"):
+            for f in root.rglob(ext):
+                try:
+                    f.unlink(missing_ok=True)  # py3.8+
+                    removed += 1
+                except Exception:
+                    try:
+                        if f.exists():
+                            f.unlink()
+                            removed += 1
+                    except Exception:
+                        pass
+    except Exception:
+        return removed
+    return removed
 
-acquisition:
-  channels_mask: CHANNEL_A|CHANNEL_B
-  pre_trigger_samples: 0
-  post_trigger_samples: 256
-  records_per_buffer: 128
-  buffers_allocated: 128
-  buffers_per_acquisition: 0
-  wait_timeout_ms: 5000
 
-integration:
-  baseline_window_samples: [0, 32]
-  integral_window_samples: [32, 256]
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
-waveforms:
-  enable: true
-  full_record: true
-  mode: every_n
-  every_n: 1
-  threshold_integral_Vs: 0.0
-  threshold_peak_V: 0.0
-  max_waveforms_per_sec: 50
-  store_volts: true
-  dc_offset_correction: false
 
-storage:
-  data_dir: dataFile_ATS9462
-  session_tag: ""
-  rollover_minutes: 60
-  session_rotate_hours: 24
-  flush_every_records: 20000
-  flush_every_seconds: 2
-  sqlite_commit_every_snips: 200
+def _auto_time_axis(n: int, sample_rate_hz: float) -> Tuple[np.ndarray, str]:
+    """Return (t, unit) for n samples at sample_rate_hz, using a human scale (ns/us/ms/s)."""
+    sr = float(sample_rate_hz) if sample_rate_hz else 1.0
+    dt = 1.0 / sr
+    t = np.arange(int(n), dtype=np.float64) * dt
+    tmax = float(t[-1]) if t.size else 0.0
+    if tmax < 1e-6:
+        return t * 1e9, "ns"
+    if tmax < 1e-3:
+        return t * 1e6, "µs"
+    if tmax < 1.0:
+        return t * 1e3, "ms"
+    return t, "s"
 
-runtime:
-  readout_mode: NPT
-  noise_test: true
-  autotrigger_timeout_ms: 10
-"""
+def _parse_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
 
-# ==================================================================================
-# DATA CLASSES
-# ==================================================================================
+def ats_const(prefix_or_name: str, maybe_name: str | None = None) -> int:
+    """Resolve atsapi constants with the same prefix-mapping style as your old script."""
+    if not ATS_AVAILABLE or ats is None:
+        raise RuntimeError("atsapi not available.")
 
-@dataclass
+    if maybe_name is None:
+        prefix = ""
+        name = prefix_or_name
+    else:
+        prefix = prefix_or_name
+        name = maybe_name
+
+    if prefix and name.startswith(prefix):
+        target = name
+    else:
+        target = f"{prefix}{name}"
+
+    if hasattr(ats, target):
+        return int(getattr(ats, target))
+
+    if prefix == "INPUT_RANGE_" and hasattr(ats, name):
+        print(f"[WARN] Using '{name}' instead of '{target}'")
+        return int(getattr(ats, name))
+
+    opts = [a for a in dir(ats) if (a.startswith(prefix) if prefix else True)]
+    raise AttributeError(f"atsapi constant not found: {target} (prefix={prefix}). Example options: {opts[:40]} ...")
+
+def _write_json_atomic(path: Path, obj: dict) -> None:
+    """Atomic JSON write to survive crashes/power loss."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+def _send_status_email(cfg: dict, subject: str, body: str) -> None:
+    """Send status email. Supports sendmail (local MTA) or SMTP."""
+    notify = (cfg.get("notify", {}) or {})
+    if not bool(notify.get("enabled", False)):
+        return
+
+    to_addr = str(notify.get("to", "")).strip()
+    if not to_addr:
+        return
+    from_addr = str(notify.get("from", "cappy@localhost")).strip() or "cappy@localhost"
+    method = str(notify.get("method", "sendmail")).strip().lower()
+
+    msg = EmailMessage()
+    msg["To"] = to_addr
+    msg["From"] = from_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if method == "sendmail":
+            sendmail_path = str(notify.get("sendmail_path", "/usr/sbin/sendmail"))
+            p = subprocess.Popen([sendmail_path, "-t", "-i"], stdin=subprocess.PIPE)
+            p.communicate(msg.as_bytes())
+        elif method == "smtp":
+            host = str(notify.get("smtp_host", "")).strip()
+            port = int(notify.get("smtp_port", 587))
+            user = str(notify.get("smtp_user", "")).strip()
+            pwd_env = str(notify.get("smtp_password_env", "CAPPY_SMTP_PASSWORD")).strip() or "CAPPY_SMTP_PASSWORD"
+            password = os.environ.get(pwd_env, "")
+            starttls = bool(notify.get("smtp_starttls", True))
+
+            if not host:
+                print("[WARN] SMTP host not configured, skipping email")
+                return
+
+            with smtplib.SMTP(host, port, timeout=20) as s:
+                s.ehlo()
+                if starttls:
+                    s.starttls()
+                    s.ehlo()
+                if user:
+                    if not password:
+                        raise RuntimeError(f"SMTP password env var not set: {pwd_env}")
+                    s.login(user, password)
+                s.send_message(msg)
+    except Exception as e:
+        print(f"[WARN] Failed to send status email: {e}")
+
+
 class LiveRingWriter:
-    """Circular buffer for live waveform display"""
-    path: Path
-    nslots: int
-    npts: int
-    
-    def __post_init__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.data = np.zeros((self.nslots, self.npts), dtype=np.float32)
-        self.index = 0
-        
-    def write(self, waveform: np.ndarray):
-        """Write waveform to circular buffer"""
-        if len(waveform) != self.npts:
-            from scipy.interpolate import interp1d
-            x_old = np.linspace(0, 1, len(waveform))
-            x_new = np.linspace(0, 1, self.npts)
-            f = interp1d(x_old, waveform, kind='linear')
-            waveform = f(x_new)
-        
-        self.data[self.index] = waveform
-        self.index = (self.index + 1) % self.nslots
-        
+    """
+    Rolling on-disk ring buffer for live waveform display.
+    """
+    MAGIC = b"CPRING1\0"
+    VERSION = 1
+
+    def __init__(self, path: Path, nslots: int = 4096, npts: int = 1024):
+        self.path = path
+        self.nslots = int(nslots)
+        self.npts = int(npts)
+        self._lock = threading.Lock()
+        self._seq = 0
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._rec_bytes = (8 + 8 + 8 + 4 + 4) + (self.npts * 4) + (self.npts * 4)
+        self._hdr_bytes = 32
+        total = self._hdr_bytes + self.nslots * self._rec_bytes
+
+        # create/size file
+        if not path.exists() or path.stat().st_size != total:
+            with open(path, "wb") as f:
+                f.truncate(total)
+            self._write_header()
+
+        # open for random access writes
+        self._fh = open(path, "r+b", buffering=0)
+
+    def close(self):
         try:
-            np.save(str(self.path), self.data)
+            self._fh.close()
         except Exception:
             pass
 
-@dataclass
-class AcquisitionStats:
-    """Statistics for acquisition monitoring"""
-    rate_hz: float = 0.0
-    captures: int = 0
-    started: str = ""
-    last_capture: str = ""
-    mean_peak_a: float = 0.0
-    mean_peak_b: float = 0.0
-    data_written_gb: float = 0.0  # CHANGED: Amount written, not space used
+    def _write_header(self):
+        # write initial header with seq=0
+        import struct
+        hdr = struct.pack("<8sIIIIQ", self.MAGIC, self.VERSION, self.nslots, self.npts, 0, 0)
+        with open(self.path, "r+b", buffering=0) as f:
+            f.seek(0)
+            f.write(hdr)
 
-"""
-==================================================================================
-PART 2: BOARD ACQUISITION CLASS - FULLY CORRECTED
-==================================================================================
-BoardAcquisition class with ATS-9352 connection fix and data_written tracking.
-"""
+    def write(self, wfA: np.ndarray, wfB: Optional[np.ndarray], buf_idx: int, chmask: int):
+        import struct
+        # Downsample / coerce to float32 length npts
+        def to_npts(w: np.ndarray) -> np.ndarray:
+            w = np.asarray(w, dtype=np.float32)
+            if w.size == self.npts:
+                return w
+            if w.size < 2:
+                return np.zeros((self.npts,), dtype=np.float32)
 
-# ==================================================================================
-# BOARD ACQUISITION CLASS
-# ==================================================================================
+            if w.size < self.npts:
+                # Upsample by linear interpolation to avoid flat padded tails
+                x_old = np.linspace(0.0, 1.0, num=w.size, dtype=np.float32)
+                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
+                return np.interp(x_new, x_old, w).astype(np.float32, copy=False)
 
-class BoardAcquisition:
-    """
-    Handles data acquisition for a single board (9352 or 9462).
-    Can be used for both board types with appropriate configuration.
-    """
-    
-    def __init__(self, board_type: str, config_path: Path, gui_queue: queue.Queue):
-        """
-        Args:
-            board_type: '9352' or '9462'
-            config_path: Path to YAML configuration
-            gui_queue: Queue for sending updates to GUI
-        """
-        self.board_type = board_type
-        self.config_path = config_path
-        self.gui_queue = gui_queue
-        
-        # State
-        self.running = False
-        self.paused = False
-        self.thread = None
-        
-        # Configuration
-        self.config = None
-        self.board = None
-        
-        # Statistics
-        self.stats = AcquisitionStats()
+            # Downsample by decimation then trim
+            step = max(1, int(w.size // self.npts))
+            w2 = w[::step]
+            if w2.size > self.npts:
+                w2 = w2[: self.npts]
+            elif w2.size < self.npts:
+                # If decimation undershot (rare), interpolate to exact length
+                x_old = np.linspace(0.0, 1.0, num=w2.size, dtype=np.float32)
+                x_new = np.linspace(0.0, 1.0, num=self.npts, dtype=np.float32)
+                w2 = np.interp(x_new, x_old, w2).astype(np.float32, copy=False)
+            return w2
 
-        # Persistent storage session (set on start)
-        self._session_dir = None
-        self._index_path = None
-        self._save_every = 0
-        
-        # Acquisition parameters
-        self.sample_rate_hz = 0.0
-        self.vpp_A = 0.0
-        self.vpp_B = 0.0
-        self.channels_enabled = {'A': True, 'B': True}
-        self.trigger_level = 128
-        
-    def load_config(self, config_path: Path = None):
-        """Load configuration from YAML file"""
-        if config_path:
-            self.config_path = config_path
-            
-        if not self.config_path.exists():
-            default_yaml = DEFAULT_YAML_9352 if self.board_type == '9352' else DEFAULT_YAML_9462
-            self.config_path.write_text(default_yaml)
-            
-        self.config = yaml.safe_load(self.config_path.read_text())
-        self._extract_parameters()
-        
-    def _extract_parameters(self):
-        """Extract key parameters from config"""
-        if not self.config:
-            return
-            
-        clock_cfg = self.config.get('clock', {})
-        self.sample_rate_hz = float(clock_cfg.get('sample_rate_msps', 250.0)) * 1e6
-        
-        channels_cfg = self.config.get('channels', {})
-        if 'A' in channels_cfg:
-            range_A = channels_cfg['A'].get('range', 'PM_1_V')
-            self.vpp_A = _range_name_to_vpp(range_A)
-        if 'B' in channels_cfg:
-            range_B = channels_cfg['B'].get('range', 'PM_1_V')
-            self.vpp_B = _range_name_to_vpp(range_B)
-            
-        trigger_cfg = self.config.get('trigger', {})
-        self.trigger_level = int(trigger_cfg.get('levelJ', 128))
-        
-        acq_cfg = self.config.get('acquisition', {})
-        channels_mask = str(acq_cfg.get('channels_mask', 'CHANNEL_A|CHANNEL_B'))
-        self.channels_enabled['A'] = 'CHANNEL_A' in channels_mask
-        self.channels_enabled['B'] = 'CHANNEL_B' in channels_mask
-        
-    def update_trigger_level(self, level: int):
-        """Update trigger level dynamically"""
-        self.trigger_level = max(0, min(255, level))
-        
-        if self.config:
-            if 'trigger' not in self.config:
-                self.config['trigger'] = {}
-            self.config['trigger']['levelJ'] = self.trigger_level
-            
-        if self.board and self.running:
-            try:
-                self._reconfigure_trigger()
-            except Exception as e:
-                self._log(f"Error updating trigger level: {e}")
-                
-    def update_channel_b_enabled(self, enabled: bool):
-        """Enable or disable Channel B"""
-        self.channels_enabled['B'] = enabled
-        
-        if self.config:
-            acq_cfg = self.config.get('acquisition', {})
-            if enabled:
-                acq_cfg['channels_mask'] = 'CHANNEL_A|CHANNEL_B'
-            else:
-                acq_cfg['channels_mask'] = 'CHANNEL_A'
-                
-        if self.running:
-            self._log(f"Channel B {'enabled' if enabled else 'disabled'} - restarting acquisition...")
-            self.stop()
-            time.sleep(0.5)
-            self.start()
-            
-    def start(self):
-        """Start acquisition in background thread"""
-        if self.running:
-            self._log("Already running")
-            return
-            
-        if not ATS_AVAILABLE:
-            self._log("ERROR: ATS API not available")
-            return
-            
-        self.running = True
-        self.thread = threading.Thread(target=self._acquisition_loop, daemon=True)
-        self.thread.start()
-        self._log(f"Started acquisition for {COLORS[self.board_type]['name']}")
-        
-    def stop(self):
-        """Stop acquisition"""
-        if not self.running:
-            return
-            
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=2.0)
-        self._log(f"Stopped acquisition for {COLORS[self.board_type]['name']}")
-        
-    def pause(self):
-        """Pause acquisition"""
-        self.paused = True
-        self._log("Paused")
-        
-    def resume(self):
-        """Resume acquisition"""
-        self.paused = False
-        self._log("Resumed")
-        
-    def _log(self, message: str):
-        """Send log message to GUI"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        board_name = COLORS[self.board_type]['name']
-        log_msg = f"[{timestamp}] [{board_name}] {message}"
-        self.gui_queue.put(('log', log_msg))
-        print(log_msg)
-        
-    def _send_stats_update(self):
-        """Send statistics update to GUI"""
-        # CHANGED: Calculate amount of data written (not disk space)
-        if self.config:
-            data_dir = Path(self.config.get('storage', {}).get('data_dir', '.'))
-            self.stats.data_written_gb = get_disk_usage(data_dir)
-            
-        self.gui_queue.put(('stats', self.board_type, self.stats))
-        
-    def _send_waveform_update(self, wfA: np.ndarray, wfB: np.ndarray = None, 
-                              integralA: float = 0.0, integralB: float = 0.0):
-        """Send waveform data to GUI for live plotting"""
-        wf_data = {
-            'board': self.board_type,
-            'wfA': wfA,
-            'wfB': wfB,
-            'integralA': integralA,
-            'integralB': integralB,
-            'time': time.time()
-        }
-        self.gui_queue.put(('waveform', wf_data))
-        
-    def _configure_board(self) -> bool:
-        """Configure the board according to YAML settings"""
-        try:
-            board_cfg = self.config.get('board', {})
-            system_id = int(board_cfg.get('system_id', 1))
-            board_id = int(board_cfg.get('board_id', 1))
-            
-            self._log(f"Connecting to System {system_id}, Board {board_id}...")
-            self.board = ats.Board(systemId=system_id, boardId=board_id)
-            
-            # Verify board connection (Alazar ATSAPI Python wrapper compatibility)
-            # Older/official examples use getChannelInfo() which returns (maxSamplesPerChannel, bitsPerSample).
-            try:
-                _, bits = self.board.getChannelInfo()
-                self._log(f"✓ Board connected: {bits} bits/sample")
-            except Exception as e:
-                # Fallbacks for wrapper variants
-                bits = None
-                try:
-                    fn = getattr(self.board, "bitsPerSample", None)
-                    if callable(fn):
-                        bits = fn()
-                except Exception:
-                    bits = None
-
-                if bits is None:
-                    self._log(f"✗ Board connection failed: {e}")
-                    return False
-
-                self._log(f"✓ Board connected: {bits} bits/sample")
-            
-            # Configure clock
-            clock_cfg = self.config.get('clock', {})
-            sample_rate_id = self._get_sample_rate_id(
-                float(clock_cfg.get('sample_rate_msps', 250.0))
-            )
-            
-            self.board.setCaptureClock(
-                ats.INTERNAL_CLOCK,
-                sample_rate_id,
-                ats.CLOCK_EDGE_RISING,
-                0
-            )
-            
-            # Configure channels
-            channels_cfg = self.config.get('channels', {})
-            for ch_name, ch_mask in [('A', ats.CHANNEL_A), ('B', ats.CHANNEL_B)]:
-                if ch_name in channels_cfg:
-                    ch_cfg = channels_cfg[ch_name]
-                    
-                    coupling_name = str(ch_cfg.get('coupling', 'DC'))
-                    if not coupling_name.endswith('_COUPLING'):
-                        coupling_name += '_COUPLING'
-                    coupling = getattr(ats, coupling_name)
-                    
-                    range_name = str(ch_cfg.get('range', 'PM_1_V'))
-                    input_range = getattr(ats, 'INPUT_RANGE_' + range_name)
-                    
-                    impedance_name = str(ch_cfg.get('impedance', '50_OHM'))
-                    impedance = getattr(ats, 'IMPEDANCE_' + impedance_name)
-                    
-                    self.board.inputControlEx(ch_mask, coupling, input_range, impedance)
-                    
-                    # Set bandwidth limit (ATS-9462 specific)
-                    if self.board_type == '9462':
-                        try:
-                            self.board.setBWLimit(ch_mask, 0)
-                        except Exception as e:
-                            self._log(f"Warning: setBWLimit failed: {e}")
-                            
-            # Configure trigger
-            self._configure_trigger()
-            
-            # Configure AUX IO (ATS-9462 specific)
-            if self.board_type == '9462':
-                try:
-                    self.board.configureAuxIO(ats.AUX_OUT_TRIGGER, 0)
-                except Exception as e:
-                    self._log(f"Warning: configureAuxIO failed: {e}")
-                    
-            self._log("Board configured successfully")
-            return True
-            
-        except Exception as e:
-            self._log(f"ERROR configuring board: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-            
-    def _configure_trigger(self):
-        """Configure trigger settings"""
-        trigger_cfg = self.config.get('trigger', {})
-        
-        operation = getattr(ats, str(trigger_cfg.get('operation', 'TRIG_ENGINE_OP_J')))
-        engine1 = getattr(ats, str(trigger_cfg.get('engine1', 'TRIG_ENGINE_J')))
-        engine2 = getattr(ats, str(trigger_cfg.get('engine2', 'TRIG_ENGINE_K')))
-        
-        sourceJ = getattr(ats, str(trigger_cfg.get('sourceJ', 'TRIG_EXTERNAL')))
-        slopeJ = getattr(ats, str(trigger_cfg.get('slopeJ', 'TRIGGER_SLOPE_POSITIVE')))
-        levelJ = self.trigger_level
-        
-        sourceK = getattr(ats, str(trigger_cfg.get('sourceK', 'TRIG_DISABLE')))
-        slopeK = getattr(ats, str(trigger_cfg.get('slopeK', 'TRIGGER_SLOPE_POSITIVE')))
-        levelK = int(trigger_cfg.get('levelK', 128))
-        
-        self.board.setTriggerOperation(
-            operation, engine1, sourceJ, slopeJ, levelJ,
-            engine2, sourceK, slopeK, levelK
-        )
-        
-        ext_coupling = getattr(ats, str(trigger_cfg.get('ext_coupling', 'DC_COUPLING')))
-        ext_range = getattr(ats, str(trigger_cfg.get('ext_range', 'ETR_5V')))
-        self.board.setExternalTrigger(ext_coupling, ext_range)
-        
-        self.board.setTriggerDelay(int(trigger_cfg.get('delay_samples', 0)))
-        
-        timeout_ms = int(trigger_cfg.get('timeout_ms', 0))
-        runtime_cfg = self.config.get('runtime', {})
-        if runtime_cfg.get('noise_test', False) and timeout_ms == 0:
-            timeout_ms = int(runtime_cfg.get('autotrigger_timeout_ms', 10))
-            
-        self.board.setTriggerTimeOut(timeout_ms)
-        
-    def _reconfigure_trigger(self):
-        """Reconfigure trigger without stopping acquisition"""
-        if not self.board:
-            return
-        try:
-            self._configure_trigger()
-            self._log(f"Trigger level updated to {self.trigger_level}")
-        except Exception as e:
-            self._log(f"Error reconfiguring trigger: {e}")
-            
-    def _get_sample_rate_id(self, rate_msps: float) -> int:
-        """Convert sample rate in MS/s to ATS constant"""
-        rate_map = {
-            1.0: ats.SAMPLE_RATE_1MSPS,
-            2.0: ats.SAMPLE_RATE_2MSPS,
-            5.0: ats.SAMPLE_RATE_5MSPS,
-            10.0: ats.SAMPLE_RATE_10MSPS,
-            20.0: ats.SAMPLE_RATE_20MSPS,
-            50.0: ats.SAMPLE_RATE_50MSPS,
-            100.0: ats.SAMPLE_RATE_100MSPS,
-            125.0: ats.SAMPLE_RATE_125MSPS,
-            160.0: ats.SAMPLE_RATE_160MSPS,
-            180.0: ats.SAMPLE_RATE_180MSPS,
-            200.0: ats.SAMPLE_RATE_200MSPS,
-            250.0: ats.SAMPLE_RATE_250MSPS,
-            500.0: ats.SAMPLE_RATE_500MSPS,
-            1000.0: ats.SAMPLE_RATE_1000MSPS,
-        }
-        
-        if rate_msps in rate_map:
-            return rate_map[rate_msps]
+        a = to_npts(wfA)
+        if wfB is None:
+            b = np.full((self.npts,), np.nan, dtype=np.float32)
         else:
-            self._log(f"Warning: Unsupported sample rate {rate_msps} MS/s, using 250 MS/s")
-            return ats.SAMPLE_RATE_250MSPS
-            
-    def _disk_writer_thread(self, write_queue: queue.Queue):
-        """
-        Background thread that handles all disk I/O so the acquisition loop
-        is never blocked by storage latency.
-        """
-        while True:
-            item = write_queue.get()
-            if item is None:          # sentinel: shut down
-                write_queue.task_done()
-                break
+            b = to_npts(wfB)
+
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
+            slot = (seq - 1) % self.nslots
+            off = self._hdr_bytes + slot * self._rec_bytes
+
+            t_unix = time.time()
+            rec_hdr = struct.pack("<QdQII", seq, t_unix, int(buf_idx), int(chmask), 0)
+
             try:
-                fpath, save_kwargs, index_path, index_line = item
-                np.savez_compressed(fpath, **save_kwargs)
-                if index_path is not None:
-                    with open(index_path, "a", encoding="utf-8") as _fp:
-                        _fp.write(index_line)
-            except Exception as _se:
-                self._log(f"Save warning (disk writer): {_se}")
+                self._fh.seek(off)
+                self._fh.write(rec_hdr)
+                self._fh.write(a.tobytes(order="C"))
+                self._fh.write(b.tobytes(order="C"))
+                # also update header write_seq for reader to know latest
+                self._fh.seek(24)  # write_seq offset in header
+                self._fh.write(struct.pack("<Q", seq))
+            except Exception:
+                pass
+
+
+class StatusNotifier:
+    """Heartbeat file + periodic status email, non-blocking."""
+    def __init__(self, cfg: dict, data_dir: Path):
+        self.cfg = cfg
+        self.data_dir = data_dir
+        self.notify = (cfg.get("notify", {}) or {})
+        self.hb_seconds = float(self.notify.get("heartbeat_seconds", 1.0))
+        self.email_seconds = float(self.notify.get("interval_minutes", 120)) * 60.0
+        self._last_hb = 0.0
+        self._last_email = 0.0
+        self._lock = threading.Lock()
+        self._latest: dict = {}
+        self._seq = 0
+
+    def update(self, **kw) -> None:
+        with self._lock:
+            self._latest.update(kw)
+
+    def _snapshot(self):
+        self._seq += 1
+        self._latest["status_seq"] = self._seq
+        self._latest["status_unix"] = time.time()
+        return dict(self._latest)
+
+    def emit_now(self) -> None:
+        with self._lock:
+            snap = self._snapshot()
+        try:
+            _write_json_atomic(self.data_dir / "status" / "cappy_status.json", snap)
+        except Exception:
+            pass
+
+    def maybe_emit(self) -> None:
+        now = time.time()
+        if now - self._last_hb >= self.hb_seconds:
+            self._last_hb = now
+            with self._lock:
+                snap = self._snapshot()
+            try:
+                _write_json_atomic(self.data_dir / "status" / "cappy_status.json", snap)
+            except Exception:
+                pass
+
+        if bool(self.notify.get("enabled", False)) and (now - self._last_email >= self.email_seconds):
+            self._last_email = now
+            try:
+                to_addr = str(self.notify.get("to_email", "")).strip()
+                if to_addr:
+                    with self._lock:
+                        snap = dict(self._latest)
+                    send_status_email(cfg=self.cfg, snap=snap)
+            except Exception:
+                pass
+
+class ParquetRollingWriter:
+    """
+    Parquet writer that rolls files by time and stores them in an hourly hierarchy.
+
+    Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/<HH:00>/):
+      - reduced/<prefix>_<YYYYMMDD_HHMM>.parquet
+    """
+    def __init__(self, day_dir: Path, prefix: str, schema: pa.Schema, rollover_minutes: int):
+        self.day_dir = day_dir
+        self.prefix = prefix
+        self.schema = schema
+        self.rollover_minutes = max(1, int(rollover_minutes))
+        _ensure_dir(day_dir)
+        self._writer: Optional[pq.ParquetWriter] = None
+        self._open_key: Optional[str] = None  # YYYYMMDD_HHMM
+        self._open_hour: Optional[str] = None  # HH:00
+
+    def _hour_dir(self, ts_ns: int) -> Tuple[str, Path]:
+        dt = datetime.fromtimestamp(ts_ns / 1e9)
+        hour = dt.strftime("%H:00")
+        p = self.day_dir / hour / "reduced"
+        _ensure_dir(p)
+        return hour, p
+
+    def _minute_key(self, ts_ns: int) -> str:
+        return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
+
+    def _open_new(self, ts_ns: int, key: str) -> None:
+        hour, base = self._hour_dir(ts_ns)
+        path = base / f"{self.prefix}_{key}.parquet"
+        self._writer = pq.ParquetWriter(path, self.schema, compression="snappy", use_dictionary=True)
+        self._open_key = key
+        self._open_hour = hour
+
+    def _maybe_roll(self, ts_ns: int) -> None:
+        key = self._minute_key(ts_ns)
+        hour, _ = self._hour_dir(ts_ns)
+
+        if self._open_key is None or self._writer is None or self._open_hour is None:
+            self._open_new(ts_ns, key)
+            return
+
+        # roll if hour changed
+        if hour != self._open_hour:
+            self.close()
+            self._open_new(ts_ns, key)
+            return
+
+        # roll if minutes exceeded rollover window
+        t0 = datetime.strptime(self._open_key, "%Y%m%d_%H%M")
+        t1 = datetime.strptime(key, "%Y%m%d_%H%M")
+        if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
+            self.close()
+            self._open_new(ts_ns, key)
+
+    def write_rows(self, rows: List[Dict[str, Any]], ts_ns: int) -> int:
+        if not rows:
+            return 0
+        self._maybe_roll(ts_ns)
+        assert self._writer is not None
+
+        df = pd.DataFrame(rows)
+        for name in self.schema.names:
+            if name not in df.columns:
+                df[name] = np.nan
+        df = df[self.schema.names]
+        tbl = pa.Table.from_pandas(df, schema=self.schema, preserve_index=False)
+        self._writer.write_table(tbl)
+        return int(tbl.num_rows)
+
+    def close(self) -> None:
+        if self._writer is not None:
+            try:
+                self._writer.close()
             finally:
-                write_queue.task_done()
-
-    def _acquisition_loop(self):
-        """
-        Main acquisition loop - runs in background thread.
-
-        KEY CHANGE vs original:
-          • postAsyncBuffer() is called IMMEDIATELY after the raw copy so the
-            board gets its buffer back before any processing or disk I/O.
-          • All disk writes are handed off to a dedicated background thread via
-            a bounded queue, so compression/fsync never stalls the loop.
-          • buffers_allocated defaults to 64 (was 16) for extra headroom.
-        """
-        # Background disk-writer
-        _write_queue: queue.Queue = queue.Queue(maxsize=256)
-        _writer = threading.Thread(
-            target=self._disk_writer_thread,
-            args=(_write_queue,),
-            daemon=True,
-            name=f"DiskWriter-{self.board_type}",
-        )
-        _writer.start()
-
-        try:
-            if not self._configure_board():
-                return
-                
-            acq_cfg = self.config.get('acquisition', {})
-            pre_trigger = int(acq_cfg.get('pre_trigger_samples', 0))
-            post_trigger = int(acq_cfg.get('post_trigger_samples', 256))
-            samples_per_record = pre_trigger + post_trigger
-            records_per_buffer = int(acq_cfg.get('records_per_buffer', 128))
-            # Default bumped from 16 → 64; override in YAML via buffers_allocated
-            buffers_allocated = int(acq_cfg.get('buffers_allocated', 64))
-            
-            channels_mask_str = str(acq_cfg.get('channels_mask', 'CHANNEL_A|CHANNEL_B'))
-            ch_mask = 0
-            ch_count = 0
-            if 'CHANNEL_A' in channels_mask_str:
-                ch_mask |= ats.CHANNEL_A
-                ch_count += 1
-            if 'CHANNEL_B' in channels_mask_str and self.channels_enabled['B']:
-                ch_mask |= ats.CHANNEL_B
-                ch_count += 1
-                
-            bytes_per_sample = 2
-            bytes_per_buffer = bytes_per_sample * samples_per_record * records_per_buffer * ch_count
-            
-            buffers = []
-            for i in range(buffers_allocated):
-                buffers.append(ats.DMABuffer(self.board.handle, ctypes.c_uint16, bytes_per_buffer))
-                
-            runtime_cfg = self.config.get('runtime', {})
-            readout_mode = str(runtime_cfg.get('readout_mode', 'TR')).strip().upper()
-            use_npt_mode = readout_mode in ('NPT', 'NO_PRETRIGGER', 'NO-PRETRIGGER')
-            
-            if use_npt_mode:
-                self._log("Using NPT mode (No Pre-Trigger)")
-                adma_flags = ats.ADMA_NPT | ats.ADMA_EXTERNAL_STARTCAPTURE
-                self.board.beforeAsyncRead(ch_mask, 0, samples_per_record, records_per_buffer, 0x7FFFFFFF, adma_flags)
-            else:
-                self._log("Using Traditional mode")
-                # records_per_acquisition = 0x7FFFFFFF → run indefinitely.
-                # Traditional mode arms itself via startCapture() below;
-                # do NOT add ADMA_EXTERNAL_STARTCAPTURE here or the board
-                # waits for a software arm signal that never comes.
-                adma_flags = ats.ADMA_TRADITIONAL_MODE
-                self.board.beforeAsyncRead(ch_mask, -pre_trigger, samples_per_record,
-                                           records_per_buffer, 0x7FFFFFFF, adma_flags)
-                
-            for buf in buffers:
-                self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
-                
-            self.board.startCapture()
-            self._log("Acquisition started")
-            
-            self.stats.started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # ---- Persistent capture storage (auto-create) ----
-            try:
-                _dd = Path(self.config.get('storage', {}).get('data_dir', f"dataFile_ATS{self.board_type}")).expanduser()
-                if not _dd.is_absolute():
-                    _dd = (Path.cwd() / _dd).resolve()
-                (_dd).mkdir(parents=True, exist_ok=True)
-                _captures_root = _dd / "captures"
-                _date = datetime.now().strftime("%Y-%m-%d")
-                _hour = datetime.now().strftime("%H%M")
-                _session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-                self._session_dir = _captures_root / _date / _hour / _session_id
-                self._session_dir.mkdir(parents=True, exist_ok=True)
-                self._index_path = self._session_dir / "snips.csv"
-                if not self._index_path.exists():
-                    self._index_path.write_text(
-                        "buf_index,timestamp_ns,sample_rate_hz,file,channels\n",
-                        encoding="utf-8",
-                    )
-                self._save_every = int(self.config.get('storage', {}).get('save_every_buffers', 1) or 1)
-                self._save_every = max(1, self._save_every)
-                # Persist resolved data_dir back into config for archive viewer
-                self.config.setdefault('storage', {})['data_dir'] = str(_dd)
-                self._log(f"Saving captures under: {self._session_dir}")
-            except Exception as _e:
-                self._session_dir = None
-                self._index_path = None
-                self._save_every = 0
-                self._log(f"Warning: capture saving disabled (could not init storage): {_e}")
-
-            buf_count = 0
-            last_stats_time = time.time()
-            
-            while self.running:
-                if self.paused:
-                    time.sleep(0.1)
-                    continue
-                    
-                try:
-                    buf_index = buf_count % buffers_allocated
-                    buf = buffers[buf_index]
-                    
-                    self.board.waitAsyncBufferComplete(buf.addr, 1000)
-                    
-                    # ── CRITICAL: copy raw data first, then immediately recycle
-                    # the buffer back to the board BEFORE doing any processing.
-                    # This is the primary fix for ApiBufferOverflow.
-                    raw = buf.buffer.copy()
-                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)  # ← moved up
-
-                    # ── Process the copy (board is free to fill the buffer again)
-                    if ch_count == 2:
-                        A = raw[0::2].reshape(records_per_buffer, samples_per_record)
-                        B = raw[1::2].reshape(records_per_buffer, samples_per_record)
-                    else:
-                        A = raw.reshape(records_per_buffer, samples_per_record)
-                        B = None
-
-                    # ── Stale-buffer guard ─────────────────────────────────────────
-                    # An uninitialized DMA buffer contains all-zero uint16 words.
-                    # After volt conversion, ADC code 0x0000 maps to exactly -Vpp/2
-                    # (e.g. -0.4 V for PM_400_MV).  If every sample in record[0]
-                    # equals that floor value the buffer hasn't been written by the
-                    # board yet; skip it rather than saving garbage.
-                    _floor_code = 0          # uint16 value for uninitialized memory
-                    _stale = bool(np.all(A[0] == _floor_code))
-                    if _stale:
-                        buf_count += 1
-                        continue
-                    # ──────────────────────────────────────────────────────────────
-
-                    wfA_volts = _codes_to_volts_u16(A[0], self.vpp_A)
-                    wfB_volts = _codes_to_volts_u16(B[0], self.vpp_B) if B is not None else None
-
-                    # Convert all records (needed for stats and optionally disk save)
-                    A_volts_all = _codes_to_volts_u16(A, self.vpp_A)      # shape (R, S)
-                    B_volts_all = _codes_to_volts_u16(B, self.vpp_B) if B is not None else None
-                    
-                    integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
-                    integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
-
-                    # ── Enqueue disk save (non-blocking; handled by background thread)
-                    if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
-                        ts_ns = time.time_ns()
-                        fname = f"buf_{buf_count:06d}.npz"
-                        fpath = self._session_dir / fname
-                        # Save ALL records in this buffer (shape: [records_per_buffer, samples])
-                        if B_volts_all is None:
-                            save_kwargs = dict(
-                                wfA_V=A_volts_all.astype(np.float32, copy=False),
-                                sample_rate_hz=float(self.sample_rate_hz),
-                                timestamp_ns=int(ts_ns),
-                                board=str(self.board_type),
-                                channels="A",
-                            )
-                            chs = "A"
-                        else:
-                            save_kwargs = dict(
-                                wfA_V=A_volts_all.astype(np.float32, copy=False),
-                                wfB_V=B_volts_all.astype(np.float32, copy=False),
-                                sample_rate_hz=float(self.sample_rate_hz),
-                                timestamp_ns=int(ts_ns),
-                                board=str(self.board_type),
-                                channels="A|B",
-                            )
-                            chs = "A|B"
-                        index_line = (
-                            f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},{chs}\n"
-                            if self._index_path is not None else None
-                        )
-                        try:
-                            _write_queue.put_nowait((fpath, save_kwargs, self._index_path, index_line))
-                        except queue.Full:
-                            self._log(f"Save warning: disk writer queue full at buf {buf_count}; "
-                                      "disk too slow – increase save_every_buffers or use faster storage")
-
-                    self.stats.captures = buf_count + 1
-                    self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    # Peak over ALL records in the buffer for a meaningful reading
-                    self.stats.mean_peak_a = float(np.max(np.abs(A_volts_all)))
-                    if B_volts_all is not None:
-                        self.stats.mean_peak_b = float(np.max(np.abs(B_volts_all)))
-                        
-                    now = time.time()
-                    if buf_count > 0 and now > last_stats_time:
-                        self.stats.rate_hz = records_per_buffer / (now - last_stats_time)
-                    last_stats_time = now
-                    
-                    self._send_waveform_update(wfA_volts, wfB_volts, integralA, integralB)
-                    if buf_count % 10 == 0:
-                        self._send_stats_update()
-                        
-                    buf_count += 1
-                    
-                except Exception as e:
-                    if "ApiWaitTimeout" in str(e):
-                        continue
-                    else:
-                        self._log(f"Error in acquisition loop: {e}")
-                        break
-                        
-        except Exception as e:
-            self._log(f"Fatal error in acquisition: {e}")
-            import traceback
-            traceback.print_exc()
-            
-        finally:
-            try:
-                if self.board:
-                    self.board.abortAsyncRead()
-            except Exception:
-                pass
-            self.running = False
-            self._log("Acquisition stopped")
-            # Gracefully drain and stop the disk writer
-            try:
-                _write_queue.put(None)   # sentinel
-                _write_queue.join()      # wait for all pending writes to finish
-            except Exception:
-                pass
-
-"""
-==================================================================================
-PART 3: GUI IMPLEMENTATION - FULLY CORRECTED
-==================================================================================
-Complete GUI with ALL improvements:
-- Streamlined design
-- White play button on grey
-- Board names once at top
-- Simplified titles
-- Rolling integrals
-- Trigger as percentage
-- Disk as "GB written"
-"""
-
-# ==================================================================================
-# GUI CLASSES
-# ==================================================================================
-
-class CollapsibleFrame(tk.Frame):
-    """A frame that can be collapsed/expanded"""
-    def __init__(self, parent, title="", **kwargs):
-        super().__init__(parent, **kwargs)
-        
-        self.show = tk.BooleanVar(value=True)
-        
-        title_frame = tk.Frame(self, bg='#333')
-        title_frame.pack(fill=tk.X)
-        
-        self.toggle_btn = tk.Button(
-            title_frame, text="▼", width=2,
-            command=self.toggle,
-            bg='#333', fg='white', relief=tk.FLAT, cursor='hand2'
-        )
-        self.toggle_btn.pack(side=tk.LEFT)
-        
-        tk.Label(
-            title_frame, text=title,
-            bg='#333', fg='white', font=('Arial', 10, 'bold')
-        ).pack(side=tk.LEFT, padx=5)
-        
-        self.content = tk.Frame(self, bg=self['bg'])
-        self.content.pack(fill=tk.BOTH, expand=True)
-        
-    def toggle(self):
-        if self.show.get():
-            self.content.pack_forget()
-            self.toggle_btn.config(text="▶")
-            self.show.set(False)
-        else:
-            self.content.pack(fill=tk.BOTH, expand=True)
-            self.toggle_btn.config(text="▼")
-            self.show.set(True)
+                self._writer = None
+                self._open_key = None
+                self._open_hour = None
 
 
 
-
-
-class ArchiveViewer(tk.Toplevel):
-    """Archive browser with A/B waveform plots + integral + metadata (scope-like).
-
-    Expected on-disk layout (from this program):
-      <data_dir>/captures/YYYY-MM-DD/HHMM/YYYYMMDD_HHMMSS/buf_000123.npz
-    Each .npz should contain:
-      - wfA_V (N,)
-      - wfB_V (N,) optional
-      - sample_rate_hz (scalar)
-      - timestamp_ns (scalar) optional
-      - board (str) optional
-      - channels (str) optional
+class WaveBinSqliteStore:
     """
+    Store waveform snippets as:
+      - raw float32 channel-separated data appended to time-rolled .bin files inside hourly folders
+      - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
 
-    def __init__(self, master, title: str, data_dir: Path):
+    Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/):
+      - index/snips_<session>.sqlite
+      - <HH:00>/waveforms/A_snips_<session>_<YYYYMMDD_HHMM>.bin
+      - <HH:00>/waveforms/B_snips_<session>_<YYYYMMDD_HHMM>.bin
+    """
+    def __init__(self, day_dir: Path, session_id: str, rollover_minutes: int, commit_every: int):
+        self.day_dir = day_dir
+        self.session_id = session_id
+        self.rollover_minutes = max(1, int(rollover_minutes))
+        self.commit_every = max(1, int(commit_every))
+        _ensure_dir(day_dir)
+
+        idx_dir = day_dir / "index"
+        _ensure_dir(idx_dir)
+        self.db_path = idx_dir / f"snips_{session_id}.sqlite"
+
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS snips (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT,
+              timestamp_ns INTEGER,
+              buffer_index INTEGER,
+              record_in_buffer INTEGER,
+              record_global INTEGER,
+              channels_mask TEXT,
+              sample_rate_hz REAL,
+              n_samples INTEGER,
+
+              -- legacy combined payload (kept for backward compatibility)
+              n_channels INTEGER,
+              file TEXT,
+              offset_bytes INTEGER,
+              nbytes INTEGER,
+
+              -- channel-separated payload (preferred)
+              file_A TEXT,
+              offset_A INTEGER,
+              nbytes_A INTEGER,
+              file_B TEXT,
+              offset_B INTEGER,
+              nbytes_B INTEGER,
+
+              area_A_Vs REAL,
+              peak_A_V REAL,
+              baseline_A_V REAL,
+              area_B_Vs REAL,
+              peak_B_V REAL,
+              baseline_B_V REAL
+            );
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_snips_session_time ON snips(session_id, timestamp_ns);")
+        self.conn.commit()
+
+        # Migration: add new columns if the DB already existed without them
+        try:
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(snips);").fetchall()}
+            need = {
+                "file_A": "ALTER TABLE snips ADD COLUMN file_A TEXT",
+                "offset_A": "ALTER TABLE snips ADD COLUMN offset_A INTEGER",
+                "nbytes_A": "ALTER TABLE snips ADD COLUMN nbytes_A INTEGER",
+                "file_B": "ALTER TABLE snips ADD COLUMN file_B TEXT",
+                "offset_B": "ALTER TABLE snips ADD COLUMN offset_B INTEGER",
+                "nbytes_B": "ALTER TABLE snips ADD COLUMN nbytes_B INTEGER",
+                "baseline_A_V": "ALTER TABLE snips ADD COLUMN baseline_A_V REAL",
+                "baseline_B_V": "ALTER TABLE snips ADD COLUMN baseline_B_V REAL",
+            }
+            for c, ddl in need.items():
+                if c not in cols:
+                    self.conn.execute(ddl)
+            self.conn.commit()
+        except Exception:
+            pass
+
+        self._fhA = None
+        self._fhB = None
+        self._bin_key = None
+        self._bin_hour = None
+        self._rows_since_commit = 0
+
+    def _hour_dir(self, ts_ns: int) -> Tuple[str, Path]:
+        dt = datetime.fromtimestamp(ts_ns / 1e9)
+        hour = dt.strftime("%H:00")
+        p = self.day_dir / hour / "waveforms"
+        _ensure_dir(p)
+        return hour, p
+
+    def _minute_key(self, ts_ns: int) -> str:
+        return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
+
+    def _open_bins(self, ts_ns: int, key: str):
+        hour, base = self._hour_dir(ts_ns)
+        pathA = base / f"A_snips_{self.session_id}_{key}.bin"
+        pathB = base / f"B_snips_{self.session_id}_{key}.bin"
+        self._fhA = open(pathA, "ab", buffering=0)
+        self._fhB = open(pathB, "ab", buffering=0)
+        self._bin_key = key
+        self._bin_hour = hour
+
+    def _maybe_roll(self, ts_ns: int):
+        key = self._minute_key(ts_ns)
+        hour, _ = self._hour_dir(ts_ns)
+
+        if self._bin_key is None or self._fhA is None or self._fhB is None or self._bin_hour is None:
+            self._open_bins(ts_ns, key)
+            return
+
+        # roll on hour boundary
+        if hour != self._bin_hour:
+            self.close_bin()
+            self._open_bins(ts_ns, key)
+            return
+
+        # roll on rollover window
+        try:
+            t0 = datetime.strptime(self._bin_key, "%Y%m%d_%H%M")
+            t1 = datetime.strptime(key, "%Y%m%d_%H%M")
+            if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
+                self.close_bin()
+                self._open_bins(ts_ns, key)
+        except Exception:
+            # if parsing fails, reopen
+            self.close_bin()
+            self._open_bins(ts_ns, key)
+
+    def append(self, *, ts_ns: int, buffer_index: int, record_in_buffer: int, record_global: int,
+               channels_mask: str, sample_rate_hz: float, wfA_V: np.ndarray, wfB_V: Optional[np.ndarray],
+               area_A_Vs: float, peak_A_V: float, area_B_Vs: float, peak_B_V: float,
+               baseline_A_V: float = 0.0, baseline_B_V: float = 0.0):
+        self._maybe_roll(ts_ns)
+        assert self._fhA is not None and self._fhB is not None
+
+        wfA = wfA_V.astype(np.float32, copy=False)
+        payloadA = wfA.tobytes(order="C")
+
+        offA = self._fhA.tell()
+        self._fhA.write(payloadA)
+
+        if wfB_V is not None:
+            wfB = wfB_V.astype(np.float32, copy=False)
+            payloadB = wfB.tobytes(order="C")
+            offB = self._fhB.tell()
+            self._fhB.write(payloadB)
+            n_channels = 2
+        else:
+            payloadB = b""
+            offB = 0
+            n_channels = 1
+
+        # Store file paths relative to day_dir so the archive can relocate the root
+        try:
+            fileA = str(Path(self._fhA.name).relative_to(self.day_dir))
+        except Exception:
+            fileA = str(Path(self._fhA.name).name)
+        try:
+            fileB = str(Path(self._fhB.name).relative_to(self.day_dir))
+        except Exception:
+            fileB = str(Path(self._fhB.name).name)
+
+        # Legacy combined fields: keep pointing at A only (so old viewers still show A)
+        file_legacy = fileA
+        off_legacy = offA
+        nbytes_legacy = len(payloadA)
+
+        self.conn.execute(
+            "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+            "file,offset_bytes,nbytes,file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.session_id, int(ts_ns), int(buffer_index), int(record_in_buffer), int(record_global),
+             str(channels_mask), float(sample_rate_hz), int(wfA.shape[0]), int(n_channels),
+             file_legacy, int(off_legacy), int(nbytes_legacy),
+             fileA, int(offA), int(len(payloadA)),
+             (fileB if wfB_V is not None else None),
+             (int(offB) if wfB_V is not None else None),
+             (int(len(payloadB)) if wfB_V is not None else None),
+             float(area_A_Vs), float(peak_A_V), float(baseline_A_V), float(area_B_Vs), float(peak_B_V), float(baseline_B_V))
+        )
+
+        self._rows_since_commit += 1
+        if self._rows_since_commit >= self.commit_every:
+            self.conn.commit()
+            self._rows_since_commit = 0
+
+    def close_bin(self):
+        for fh_name in ("_fhA", "_fhB"):
+            fh = getattr(self, fh_name, None)
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                setattr(self, fh_name, None)
+        self._bin_key = None
+        self._bin_hour = None
+
+    def close(self):
+        try:
+            if self._rows_since_commit:
+                self.conn.commit()
+                self._rows_since_commit = 0
+        except Exception:
+            pass
+        try:
+            self.close_bin()
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def load_waveforms(self, row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Load channel-separated waveforms if available; otherwise fall back to legacy combined payload.
+        """
+        n_samples = int(row.get("n_samples", 0))
+
+        # Prefer channel-separated fields when present and non-null
+        fileA = row.get("file_A", None)
+        offA = row.get("offset_A", None)
+        nbytesA = row.get("nbytes_A", None)
+
+        if isinstance(fileA, str) and fileA and pd.notna(offA) and pd.notna(nbytesA):
+            binA = day_dir / str(fileA)
+            with open(binA, "rb") as fh:
+                fh.seek(int(offA))
+                payloadA = fh.read(int(nbytesA))
+            a = np.frombuffer(payloadA, dtype=np.float32)[:n_samples]
+
+            fileB = row.get("file_B", None)
+            offB = row.get("offset_B", None)
+            nbytesB = row.get("nbytes_B", None)
+            if isinstance(fileB, str) and fileB and pd.notna(offB) and pd.notna(nbytesB):
+                binB = day_dir / str(fileB)
+                with open(binB, "rb") as fh:
+                    fh.seek(int(offB))
+                    payloadB = fh.read(int(nbytesB))
+                b = np.frombuffer(payloadB, dtype=np.float32)[:n_samples]
+                return a, b
+            return a, None
+
+        # Legacy fallback
+        bin_path = day_dir / str(row["file"])
+        offset = int(row["offset_bytes"])
+        nbytes = int(row["nbytes"])
+        n_channels = int(row.get("n_channels", 1))
+        with open(bin_path, "rb") as fh:
+            fh.seek(offset)
+            payload = fh.read(nbytes)
+        arr = np.frombuffer(payload, dtype=np.float32)
+        if n_channels == 2:
+            return arr[:n_samples], arr[n_samples:2*n_samples]
+        return arr[:n_samples], None
+
+
+def load_waveforms_from_row(row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Read waveform payloads referenced by a snip row WITHOUT opening/creating any SQLite DB."""
+    n_samples = int(row.get("n_samples", 0))
+
+    # Prefer channel-separated fields when present and non-null
+    fileA = row.get("file_A", None)
+    offA = row.get("offset_A", None)
+    nbytesA = row.get("nbytes_A", None)
+
+    if isinstance(fileA, str) and fileA and pd.notna(offA) and pd.notna(nbytesA):
+        binA = day_dir / str(fileA)
+        with open(binA, "rb") as fh:
+            fh.seek(int(offA))
+            payloadA = fh.read(int(nbytesA))
+        a = np.frombuffer(payloadA, dtype=np.float32)[:n_samples]
+
+        fileB = row.get("file_B", None)
+        offB = row.get("offset_B", None)
+        nbytesB = row.get("nbytes_B", None)
+        if isinstance(fileB, str) and fileB and pd.notna(offB) and pd.notna(nbytesB):
+            binB = day_dir / str(fileB)
+            with open(binB, "rb") as fh:
+                fh.seek(int(offB))
+                payloadB = fh.read(int(nbytesB))
+            b = np.frombuffer(payloadB, dtype=np.float32)[:n_samples]
+            return a, b
+        return a, None
+
+    # Legacy fallback
+    bin_path = day_dir / str(row["file"])
+    offset = int(row["offset_bytes"])
+    nbytes = int(row["nbytes"])
+    n_channels = int(row.get("n_channels", 1))
+    with open(bin_path, "rb") as fh:
+        fh.seek(offset)
+        payload = fh.read(nbytes)
+    arr = np.frombuffer(payload, dtype=np.float32)
+    if n_channels == 2:
+        return arr[:n_samples], arr[n_samples:2*n_samples]
+    return arr[:n_samples], None
+
+
+
+class CappyArchive:
+
+    def __init__(self, data_dir: Path, rollover_minutes: int, flush_every_records: int,
+                 session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0):
+        self.data_dir = data_dir
+        self.captures = data_dir / "captures"
+        _ensure_dir(self.captures)
+        self.rollover_minutes = int(rollover_minutes)
+        self.flush_every_records = int(flush_every_records)
+        self.flush_every_seconds = float(flush_every_seconds or 0.0)
+        self._last_flush_unix = 0.0
+        self.session_rotate_hours = float(session_rotate_hours or 0.0)
+        self.sqlite_commit_every_snips = int(sqlite_commit_every_snips)
+        self.session_id = ""
+        self.day_dir: Optional[Path] = None
+        self.reduced_writer: Optional[ParquetRollingWriter] = None
+        self.wave_store: Optional[WaveBinSqliteStore] = None
+        self._reduced_buf: List[Dict[str, Any]] = []
+        self._first_ts = 0
+        self._last_ts = 0
+        self._n_reduced = 0
+        self._n_snips = 0
+        self.session_start_ns = 0
+
+    def start(self, tag: str, channels_mask: str) -> str:
+        sid = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if tag:
+            sid = f"{sid}_{tag}"
+        self.session_id = sid
+        self.session_start_ns = time.time_ns()
+
+        # Hierarchical capture layout:
+        # captures/YYYY/YYYY-MM/YYYY-MM-DD/HH:00/{reduced,waveforms}/...
+        now = datetime.now()
+        year = now.strftime("%Y")
+        ym = now.strftime("%Y-%m")
+        ymd = now.strftime("%Y-%m-%d")
+        self.day_dir = self.captures / year / ym / ymd
+        _ensure_dir(self.day_dir)
+
+        idx_dir = self.day_dir / "index"
+        _ensure_dir(idx_dir)
+
+        self.reduced_writer = ParquetRollingWriter(self.day_dir, f"reduced_{sid}", REDUCED_SCHEMA, self.rollover_minutes)
+        self.wave_store = WaveBinSqliteStore(self.day_dir, sid, self.rollover_minutes, self.sqlite_commit_every_snips)
+
+        _atomic_write_text(idx_dir / f"session_{sid}.txt", f"CAPPY v1.3 session {sid}\nchannels={channels_mask}\n")
+        print(f"[CAPPY] Started session {sid} in {self.day_dir}")
+        return sid
+
+    def should_rotate(self) -> bool:
+        if self.session_rotate_hours <= 0:
+            return False
+        return (time.time_ns() - self.session_start_ns) >= int(self.session_rotate_hours * 3600 * 1e9)
+
+    def _touch(self, ts: int) -> None:
+        if self._first_ts == 0:
+            self._first_ts = ts
+        self._last_ts = max(self._last_ts, ts)
+
+    def append_reduced(self, rows: List[Dict[str, Any]], ts: int) -> None:
+        if not rows:
+            return
+        self._reduced_buf.extend(rows)
+        self._touch(ts)
+        now = time.time()
+        if self.flush_every_seconds > 0 and (now - self._last_flush_unix) >= self.flush_every_seconds:
+            self._last_flush_unix = now
+            self.flush_reduced(ts)
+            return
+        if len(self._reduced_buf) >= self.flush_every_records:
+            self.flush_reduced(ts)
+
+    def flush_reduced(self, ts: int) -> None:
+        if not self._reduced_buf:
+            return
+        assert self.reduced_writer is not None
+        self._n_reduced += self.reduced_writer.write_rows(self._reduced_buf, ts)
+        self._reduced_buf.clear()
+
+    def append_snip(self, **kw) -> None:
+        assert self.wave_store is not None
+        self.wave_store.append(**kw)
+        self._n_snips += 1
+
+    def finalize(self, channels_mask: str) -> None:
+        if not self.day_dir:
+            return
+        ts = self._last_ts or time.time_ns()
+        self.flush_reduced(ts)
+        if self.reduced_writer:
+            self.reduced_writer.close()
+        if self.wave_store:
+            self.wave_store.close()
+        idx = self.day_dir / "session_index.parquet"
+        row = dict(
+            session_id=self.session_id,
+            date=self.day_dir.name,
+            first_timestamp_ns=int(self._first_ts or ts),
+            last_timestamp_ns=int(self._last_ts or ts),
+            reduced_rows=int(self._n_reduced),
+            waveform_snips=int(self._n_snips),
+            channels_mask=str(channels_mask),
+        )
+        if idx.exists():
+            df = pd.read_parquet(idx)
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        df = df.drop_duplicates(subset=["session_id"], keep="last")
+        pq.write_table(pa.Table.from_pandas(df, schema=SESSION_INDEX_SCHEMA, preserve_index=False), idx, compression="snappy")
+        print(f"[CAPPY] Finalized session {self.session_id} reduced={self._n_reduced} snips={self._n_snips}")
+
+def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int, vpp: float):
+    """
+    Reduce raw uint16 waveforms into baseline (V), peak (V) and gated integral (V·s).
+
+    This version converts ADC codes -> volts using the configured input range (Vpp),
+    then does baseline subtraction in volts, then integrates (sum * dt).
+    """
+    if raw.dtype != np.uint16:
+        raw = raw.astype(np.uint16, copy=False)
+
+    n = int(raw.shape[1])
+    b0 = max(0, min(int(b0), n))
+    b1 = max(0, min(int(b1), n))
+    g0 = max(0, min(int(g0), n))
+    g1 = max(0, min(int(g1), n))
+
+    if b1 <= b0:
+        b0, b1 = 0, min(1, n)
+    if g1 <= g0:
+        g0, g1 = 0, min(1, n)
+
+    V = _codes_to_volts_u16(raw, vpp=vpp)  # float32 volts
+    baseline_V = V[:, b0:b1].mean(axis=1, dtype=np.float32).astype(np.float64)
+
+    gate = V[:, g0:g1].astype(np.float64, copy=False)
+    gate_bs = gate - baseline_V[:, None]
+
+    dt = 1.0 / float(sr_hz)
+    area = gate_bs.sum(axis=1) * dt
+    peak = gate_bs.max(axis=1)
+    return area.astype(np.float64), peak.astype(np.float64), baseline_V.astype(np.float64)
+
+
+@dataclass
+class WfPolicy:
+    mode: str
+    every_n: int
+    thr_area: float
+    thr_peak: float
+    max_per_sec: int
+
+    def __post_init__(self):
+        self.mode = (self.mode or "every_n").lower()
+        self.every_n = max(1, int(self.every_n))
+        self.max_per_sec = max(1, int(self.max_per_sec))
+        self._sec = int(time.time())
+        self._count = 0
+
+    def _ok(self) -> bool:
+        s = int(time.time())
+        if s != self._sec:
+            self._sec = s
+            self._count = 0
+        if self._count >= self.max_per_sec:
+            return False
+        self._count += 1
+        return True
+
+    def want(self, rec_global: int, area: float, peak: float) -> bool:
+        every = (self.mode in ("every_n", "both")) and (rec_global % self.every_n == 0)
+        event = (self.mode in ("event", "both")) and (
+            (self.thr_area > 0 and abs(area) >= self.thr_area) or (self.thr_peak > 0 and abs(peak) >= self.thr_peak)
+        )
+        return (every or event) and self._ok()
+
+def load_config(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        _atomic_write_text(path, DEFAULT_YAML)
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        raise ValueError("YAML must be a dict.")
+    return cfg
+
+
+def _range_name_to_vpp(range_name: str, default_vpp: float = 4.0) -> float:
+    """
+    Convert Alazar-style range strings to full-scale Vpp.
+
+    NOTE: integration and plotted volts must use the actual ADC full-scale range, otherwise
+    integrals/peaks will be numerically wrong.
+    """
+    rn = (range_name or "").strip().upper()
+    rn = rn.replace("INPUT_RANGE_", "")
+    if rn.startswith("PM_") and rn.endswith("_MV"):
+        try:
+            mv = float(rn[3:-3])
+            return 2.0 * (mv / 1000.0)
+        except Exception:
+            return float(default_vpp)
+    if rn.startswith("PM_") and rn.endswith("_V"):
+        try:
+            v = float(rn[3:-2])
+            return 2.0 * v
+        except Exception:
+            return float(default_vpp)
+
+    COMMON = {
+        "PM_20_MV": 0.04,
+        "PM_40_MV": 0.08,
+        "PM_50_MV": 0.10,
+        "PM_80_MV": 0.16,
+        "PM_100_MV": 0.20,
+        "PM_200_MV": 0.40,
+        "PM_400_MV": 0.80,
+        "PM_500_MV": 1.00,
+        "PM_800_MV": 1.60,
+        "PM_1_V": 2.00,
+        "PM_2_V": 4.00,
+        "PM_4_V": 8.00,
+        "PM_5_V": 10.00,
+        "PM_8_V": 16.00,
+        "PM_10_V": 20.00,
+        "PM_20_V": 40.00,
+        "PM_40_V": 80.00,
+    }
+    return float(COMMON.get(rn, default_vpp))
+
+def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
+    """
+    Map uint16 ADC codes to volts for a bipolar input range (mid-scale = 0 V).
+    Uses 65536 codes for correct LSB size.
+    """
+    return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
+
+
+def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
+    """
+    Read FPGA/ADC temperatures if available.
+    
+    Notes:
+      - Temperature reading is not available in all atsapi Python wrapper versions
+      - The ATS-9352 board supports temperature sensing in firmware, but the Python
+        API may not expose it depending on the wrapper version
+      - This function gracefully returns None if temperature is unavailable
+    
+    Returns:
+        Dict with 'fpga' and 'adc' temperature in Celsius (or None if unavailable),
+        and 'diag' with diagnostic information
+    """
+    import ctypes, struct, math
+
+    out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
+
+    # Strategy 1: Try high-level board methods (if exposed by wrapper)
+    for method_name in ['getBoardTemperature', 'getTemperature', 'get_temperature']:
+        if hasattr(board, method_name):
+            try:
+                method = getattr(board, method_name)
+                temp = float(method())
+                if -40.0 <= temp <= 150.0:
+                    out["adc"] = temp  # Usually returns ADC temp
+                    out["diag"] = {"method": method_name, "value": temp, "status": "success"}
+                    return out
+            except Exception as e:
+                # Method exists but failed - record it
+                out["diag"] = {"method": method_name, "error": str(e), "status": "failed"}
+                continue
+
+    # Strategy 2: Try ctypes-based low-level API (if AlazarGetParameter exists)
+    if hasattr(ats, 'AlazarGetParameter'):
+        try:
+            # Parameter IDs from ATS-SDK docs
+            GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
+            GET_ADC_TEMPERATURE  = getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104)
+            API_SUCCESS_CODES = [0, 512, 200]
+            
+            def _get_handle():
+                for name in ("handle", "boardHandle", "_handle", "_board_handle", "hBoard", "_hBoard"):
+                    h = getattr(board, name, None)
+                    if h is not None:
+                        return h
+                return None
+
+            def _decode_long_as_temp(val_long: int) -> Optional[float]:
+                # Try as integer
+                if -40 <= val_long <= 150:
+                    return float(val_long)
+                # Try low 32 bits as float
+                try:
+                    u32 = val_long & 0xFFFFFFFF
+                    f = struct.unpack("<f", struct.pack("<I", u32))[0]
+                    if math.isfinite(f) and (-40.0 <= f <= 150.0):
+                        return float(f)
+                except:
+                    pass
+                # Try high 32 bits as float (ATS-9352)
+                try:
+                    u32_high = (val_long >> 32) & 0xFFFFFFFF
+                    f = struct.unpack("<f", struct.pack("<I", u32_high))[0]
+                    if math.isfinite(f) and (-40.0 <= f <= 150.0):
+                        return float(f)
+                except:
+                    pass
+                return None
+
+            h = _get_handle()
+            if h is not None:
+                # Try to get ADC temperature (channel 1)
+                ret_long = ctypes.c_long(0)
+                try:
+                    rc = ats.AlazarGetParameter(h, 1, GET_ADC_TEMPERATURE, ctypes.byref(ret_long))
+                    if rc in API_SUCCESS_CODES:
+                        temp = _decode_long_as_temp(int(ret_long.value))
+                        if temp is not None:
+                            out["adc"] = temp
+                            out["diag"] = {"method": "AlazarGetParameter", "param": "ADC_TEMP", "value": temp, "status": "success"}
+                            return out
+                except Exception as e:
+                    pass  # Silently continue if this fails
+        except Exception:
+            pass  # Low-level API not available or failed
+
+    # Temperature reading not available
+    out["diag"] = {
+        "status": "unavailable",
+        "message": "Temperature reading not supported by this atsapi wrapper version. "
+                   "The ATS-9352 board has temperature sensors, but your Python wrapper "
+                   "does not expose getBoardTemperature(), getTemperature(), or AlazarGetParameter(). "
+                   "This is normal for some atsapi versions - temperature monitoring is optional."
+    }
+    
+    return out
+def channels_mask_to_str(mask: int) -> str:
+    parts = []
+    if mask & ats.CHANNEL_A:
+        parts.append("CHANNEL_A")
+    if mask & ats.CHANNEL_B:
+        parts.append("CHANNEL_B")
+    return "|".join(parts) if parts else "0"
+
+
+def channels_from_mask_expr(expr: str) -> int:
+    """
+    Parse channel selection expression into a bitmask.
+      - 'A' -> 1, 'B' -> 2, 'AB'/'A|B'/'A,B' -> 3
+      - integer strings like '1', '2', '3', '0x3' are accepted as-is
+    Defaults to 1 if empty/invalid. leafn the hard way
+    """
+    if expr is None:
+        return 1
+    e = str(expr).strip().upper()
+    if not e:
+        return 1
+    # numeric
+    try:
+        if e.startswith("0X"):
+            return int(e, 16)
+        if e.isdigit():
+            return int(e, 10)
+    except Exception:
+        pass
+    # symbolic
+    e = e.replace(" ", "").replace("+", "|").replace(",", "|")
+    if e in ("A",):
+        return 1
+    if e in ("B",):
+        return 2
+    if e in ("AB", "A|B", "B|A"):
+        return 3
+    # any includes
+    mask = 0
+    if "A" in e:
+        mask |= 1
+    if "B" in e:
+        mask |= 2
+    return mask if mask else 1
+
+def infer_channel_count_from_mask(mask: int) -> int:
+    mask = int(mask)
+    return 2 if (mask & 3) == 3 else 1
+
+def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, float]:
+    c = cfg.get("clock", {}) or {}
+    sr_hz = float(c.get("sample_rate_msps", 250.0)) * 1e6
+    source = ats_const(str(c.get("source", "INTERNAL_CLOCK")))
+    edge = ats_const(str(c.get("edge", "CLOCK_EDGE_RISING")))
+
+    RATE_MAP = {
+        20e6: "SAMPLE_RATE_20MSPS",
+        50e6: "SAMPLE_RATE_50MSPS",
+        100e6: "SAMPLE_RATE_100MSPS",
+        125e6: "SAMPLE_RATE_125MSPS",
+        160e6: "SAMPLE_RATE_160MSPS",
+        180e6: "SAMPLE_RATE_180MSPS",
+        200e6: "SAMPLE_RATE_200MSPS",
+        250e6: "SAMPLE_RATE_250MSPS",
+        500e6: "SAMPLE_RATE_500MSPS",
+        1000e6: "SAMPLE_RATE_1000MSPS",
+    }
+
+    if int(source) == int(getattr(ats, "INTERNAL_CLOCK", source)) and sr_hz in RATE_MAP and hasattr(ats, RATE_MAP[sr_hz]):
+        board.setCaptureClock(source, getattr(ats, RATE_MAP[sr_hz]), edge, 0)
+    else:
+        board.setCaptureClock(source, ats.SAMPLE_RATE_USER_DEF, edge, int(sr_hz))
+
+    # Default Vpp fallback (only used if range parsing fails)
+    vpp_default = 4.0
+    vpp_A = vpp_default
+    vpp_B = vpp_default
+
+    ch_cfg = cfg.get("channels", {}) or {}
+    for nm, mask in [("A", ats.CHANNEL_A), ("B", ats.CHANNEL_B)]:
+        if nm in ch_cfg:
+            cc = ch_cfg[nm] or {}
+            coupling_name = str(cc.get('coupling', 'DC'))
+            if not coupling_name.endswith('_COUPLING'):
+                coupling_name = coupling_name + '_COUPLING'
+            coupling = ats_const(coupling_name)
+            rng_name = str(cc.get('range', 'PM_1_V'))
+            rng = ats_const('INPUT_RANGE_', rng_name)
+            if nm == 'A':
+                vpp_A = _range_name_to_vpp(rng_name, default_vpp=vpp_default)
+            elif nm == 'B':
+                vpp_B = _range_name_to_vpp(rng_name, default_vpp=vpp_default)
+            imp = ats_const("IMPEDANCE_", str(cc.get("impedance", "50_OHM")))
+            board.inputControlEx(mask, coupling, rng, imp)
+
+    t = cfg.get("trigger", {}) or {}
+    operation = ats_const(str(t.get("operation", "TRIG_ENGINE_OP_J")))
+    engine1 = ats_const(str(t.get("engine1", "TRIG_ENGINE_J")))
+    engine2 = ats_const(str(t.get("engine2", "TRIG_ENGINE_K")))
+
+    board.setTriggerOperation(
+        operation,
+        engine1,
+        ats_const(str(t.get("sourceJ", "TRIG_EXTERNAL"))),
+        ats_const(str(t.get("slopeJ", "TRIGGER_SLOPE_POSITIVE"))),
+        int(t.get("levelJ", 128)),
+        engine2,
+        ats_const(str(t.get("sourceK", "TRIG_DISABLE"))),
+        ats_const(str(t.get("slopeK", "TRIGGER_SLOPE_POSITIVE"))),
+        int(t.get("levelK", 128)),
+    )
+    ext_coupling_name = str(t.get("ext_coupling", "DC_COUPLING"))
+    if not ext_coupling_name.endswith("_COUPLING"):
+        ext_coupling_name = ext_coupling_name + "_COUPLING"
+    board.setExternalTrigger(
+        ats_const(ext_coupling_name),
+        ats_const(str(t.get("ext_range", "ETR_5V")))
+    )
+
+    board.setTriggerDelay(int(t.get("delay_samples", 0)))
+
+    timeout_ms = int(t.get("timeout_ms", 0))
+    rt = cfg.get("runtime", {}) or {}
+    if bool(rt.get("noise_test", False)) and timeout_ms == 0:
+        timeout_ms = int(rt.get("autotrigger_timeout_ms", 10))
+        print(f"[CAPPY] noise_test enabled -> using trigger.timeout_ms={timeout_ms} for auto-trigger noise captures")
+    board.setTriggerTimeOut(timeout_ms)
+
+    return sr_hz, float(vpp_A), float(vpp_B)
+
+def _should_stop() -> bool:
+    if STOP_REQUESTED:
+        return True
+    try:
+        if sys.stdin is not None and hasattr(sys.stdin, 'isatty') and sys.stdin.isatty():
+            return bool(ats.enter_pressed())
+    except Exception:
+        pass
+    return False
+
+def run_capture(cfg_path: Path) -> int:
+    if not ATS_AVAILABLE or ats is None:
+        print("[CAPPY] atsapi not available on this machine.")
+        return 2
+
+    cfg = load_config(cfg_path)
+
+    acq = cfg.get("acquisition", {})
+    timing = cfg.get("timing", {}) or {}
+    integ = cfg.get("integration", {}) or {}
+    waves = cfg.get("waveforms", {}) or {}
+    storage = cfg.get("storage", {}) or {}
+    trig = cfg.get("trigger", {}) or {}
+
+    pre = int(acq.get("pre_trigger_samples", 0))
+    post = int(acq.get("post_trigger_samples", 256))
+    spr = pre + post
+    rpb = int(acq.get("records_per_buffer", 128))
+    bufN = int(acq.get("buffers_allocated", 16))
+    bpa = int(acq.get("buffers_per_acquisition", 0))
+    wait_timeout_ms = int(acq.get("wait_timeout_ms", 1000))
+    ch_expr = str(acq.get("channels_mask", "CHANNEL_A"))
+    bunch_spacing = int(timing.get("bunch_spacing_samples", spr))
+
+    b0, b1 = map(int, integ.get("baseline_window_samples", [0, min(64, spr)]))
+    g0, g1 = map(int, integ.get("integral_window_samples", [min(64, spr), min(128, spr)]))
+
+    if spr > bunch_spacing:
+        raise ValueError("samples_per_record must be <= bunch_spacing_samples")
+
+    wf_enable = bool(waves.get("enable", True))
+    wf = WfPolicy(
+        mode=str(waves.get("mode", "every_n")),
+        every_n=int(waves.get("every_n", 20000)),
+        thr_area=float(waves.get("threshold_integral_Vs", 0.0)),
+        thr_peak=float(waves.get("threshold_peak_V", 0.0)),
+        max_per_sec=int(waves.get("max_waveforms_per_sec", 50)),
+    )
+    store_volts = bool(waves.get("store_volts", True))
+
+    binfo = cfg.get("board", {}) if isinstance(cfg, dict) else {}
+    systemId = int(binfo.get("system_id", 2))
+    boardId = int(binfo.get("board_id", 1))
+    board = ats.Board(systemId=systemId, boardId=boardId)
+    sr_hz, vppA, vppB = configure_board(board, cfg)
+
+    ch_mask = channels_from_mask_expr(ch_expr)
+    ch_count = infer_channel_count_from_mask(ch_mask)
+
+    _, bps = board.getChannelInfo()
+    bytesPerSample = (bps.value + 7) // 8
+    sample_type = ctypes.c_uint8 if bytesPerSample == 1 else ctypes.c_uint16
+    bytesPerBuffer = bytesPerSample * spr * rpb * ch_count
+
+    buffers = [ats.DMABuffer(board.handle, sample_type, bytesPerBuffer) for _ in range(bufN)]
+    board.setRecordSize(pre, post)
+
+    if bpa <= 0:
+        recordsPerAcq = 0
+        buf_target = 2**31 - 1
+    else:
+        recordsPerAcq = rpb * bpa
+        buf_target = bpa
+
+    archive = CappyArchive(
+        data_dir=Path(str(storage.get("data_dir", "dataFile"))),
+        rollover_minutes=int(storage.get("rollover_minutes", 60)),
+        flush_every_records=int(storage.get("flush_every_records", 200000)),
+        session_rotate_hours=float(storage.get("session_rotate_hours", 0) or 0),
+        sqlite_commit_every_snips=int(storage.get("sqlite_commit_every_snips", 2000)),
+        flush_every_seconds=float(storage.get("flush_every_seconds", 10.0) or 0.0),
+    )
+    sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
+    notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
+    # Live waveform ring (writes one downsampled waveform per buffer)
+    live_cfg = (cfg.get('live', {}) or {})
+    ring_nslots = int(live_cfg.get('ring_slots', 4096))
+    ring_npts = int(live_cfg.get('ring_points', 512))
+    ring_path = Path(str(storage.get('data_dir', 'dataFile'))) / 'status' / 'live_waveforms.ring'
+    ring = LiveRingWriter(ring_path, nslots=ring_nslots, npts=ring_npts)
+
+    notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), started_unix=time.time(), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB, live_ring_path=str(ring_path))
+    notifier.maybe_emit()
+
+    adma_flags = ats.ADMA_TRADITIONAL_MODE
+    if bool(trig.get("external_startcapture", False)):
+        adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
+
+    board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recordsPerAcq, adma_flags)
+
+    for b in buffers:
+        board.postAsyncBuffer(b.addr, b.size_bytes)
+
+    print(f"[CAPPY] Running session {sid}. " + ("Press <enter> to stop." if (sys.stdin is not None and hasattr(sys.stdin,"isatty") and sys.stdin.isatty()) else "Use Stop (GUI) or Ctrl+C to stop."))
+    buf_done = 0
+    global_rec = 0
+    t0 = time.time()
+    last = t0
+    dashboard_every_buffers = int((cfg.get('notify', {}) or {}).get('dashboard_every_buffers', 1000))
+    gui_every_buffers = int((cfg.get('notify', {}) or {}).get('gui_every_buffers', 50))
+    last_emit_buf = 0
+    last_gui_emit_buf = 0
+    timeout_count = 0
+    last_buffer_ns = time.time_ns()
+    rt = cfg.get('runtime', {}) or {}
+    rearm_if_no_trigger_s = int(rt.get('rearm_if_no_trigger_s', 300))
+    rearm_cooldown_s = int(rt.get('rearm_cooldown_s', 30))
+    max_rearms_per_hour = int(rt.get('max_rearms_per_hour', 12))
+    rearm_times: List[float] = []
+
+    try:
+        def _do_rearm():
+            nonlocal timeout_count, last_buffer_ns
+            now = time.time()
+            # keep only last hour
+            while rearm_times and (now - rearm_times[0]) > 3600:
+                rearm_times.pop(0)
+            if rearm_times and (now - rearm_times[-1]) < rearm_cooldown_s:
+                return
+            if len(rearm_times) >= max_rearms_per_hour:
+                return
+            rearm_times.append(now)
+
+            print(f"[CAPPY] Rearming acquisition (no completed buffers for {rearm_if_no_trigger_s}s). rearms_last_hour={len(rearm_times)}")
+            notifier.update(state='rearming', time=time.strftime('%Y-%m-%d %H:%M:%S'), timeouts=timeout_count)
+            notifier.maybe_emit()
+
+            try:
+                board.abortAsyncRead()
+            except Exception:
+                pass
+
+            board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recordsPerAcq, adma_flags)
+            for b in buffers:
+                board.postAsyncBuffer(b.addr, b.size_bytes)
+            board.startCapture()
+
+            timeout_count = 0
+            last_buffer_ns = time.time_ns()
+            notifier.update(state='running')
+            notifier.maybe_emit()
+
+        board.startCapture()
+        while buf_done < buf_target and not _should_stop():
+            buf = buffers[buf_done % len(buffers)]
+            try:
+                board.waitAsyncBufferComplete(buf.addr, wait_timeout_ms)
+            except Exception as ex:
+                if "ApiWaitTimeout" in str(ex):
+                    timeout_count += 1
+                    ago_s = (time.time_ns() - last_buffer_ns) / 1e9
+                    notifier.update(state="waiting_for_trigger", time=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   timeouts=timeout_count, last_buffer_ago_s=ago_s,
+                                   buffers=buf_done, records=global_rec,
+                                   reduced_rows=getattr(archive, "_n_reduced", 0),
+                                   snips=getattr(archive, "_n_snips", 0))
+                    notifier.maybe_emit()
+                    if timeout_count % 100 == 0:
+                        print(f"[CAPPY] waiting for triggers... (timeouts={timeout_count})")
+                    if rearm_if_no_trigger_s > 0 and ago_s >= float(rearm_if_no_trigger_s):
+                        _do_rearm()
+                    continue
+                if "ApiWaitCanceled" in str(ex) or "ApiWaitCancelled" in str(ex):
+                    # Normal stop path (SIGINT / abortAsyncRead)
+                    break
+                raise
+
+            timeout_count = 0
+            last_buffer_ns = time.time_ns()
+            ts_ns = last_buffer_ns
+
+            if archive.should_rotate():
+                archive.finalize(ch_expr)
+                sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
+
+            raw = buf.buffer
+            if raw.dtype != np.uint16:
+                raw = raw.astype(np.uint16, copy=False)
+
+            red_rows: List[Dict[str, Any]] = []
+
+            if ch_count == 2:
+                A = raw[0::2].reshape(rpb, spr)
+                B = raw[1::2].reshape(rpb, spr)
+                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
+                areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB)
+                for r in range(rpb):
+                    rec_g = global_rec + r
+                    red_rows.append(dict(
+                        session_id=sid, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
+                        timestamp_ns=int(ts_ns), sample_rate_hz=float(sr_hz),
+                        samples_per_record=spr, records_per_buffer=rpb,
+                        channels_mask=ch_expr, bunch_spacing_samples=bunch_spacing,
+                        area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
+                        area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]), baseline_B_V=float(baseB[r]),
+                    ))
+                    if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
+                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
+                        wfB_V = _codes_to_volts_u16(B[r], vpp=vppB) if store_volts else B[r].astype(np.float32)
+                        archive.append_snip(
+                            ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
+                            channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
+                            wfA_V=wfA_V, wfB_V=wfB_V,
+                            area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
+                            area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]),
+                            baseline_A_V=float(baseA[r]), baseline_B_V=float(baseB[r]),
+                        )
+            else:
+                A = raw.reshape(rpb, spr)
+                areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
+                for r in range(rpb):
+                    rec_g = global_rec + r
+                    red_rows.append(dict(
+                        session_id=sid, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
+                        timestamp_ns=int(ts_ns), sample_rate_hz=float(sr_hz),
+                        samples_per_record=spr, records_per_buffer=rpb,
+                        channels_mask=ch_expr, bunch_spacing_samples=bunch_spacing,
+                        area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
+                        area_B_Vs=0.0, peak_B_V=0.0, baseline_B_V=0.0,
+                    ))
+                    if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
+                        wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
+                        archive.append_snip(
+                            ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
+                            channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
+                            wfA_V=wfA_V, wfB_V=None,
+                            area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
+                            area_B_Vs=0.0, peak_B_V=0.0,
+                            baseline_A_V=float(baseA[r]), baseline_B_V=0.0,
+                        )
+
+            # Per-buffer summaries for live GUI plotting
+            try:
+                if ch_count == 2:
+                    notifier.update(
+                        buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA)),
+                        buffer_mean_area_B=float(np.mean(areaB)), buffer_mean_peak_B=float(np.mean(peakB)),
+                    )
+                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = buf_done
+                        try:
+                            temps = get_board_temperatures_c(board)
+                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
+                        except Exception:
+                            bt = None
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
+                        notifier.emit_now()
+                else:
+                    notifier.update(
+                        buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA))
+                    )
+                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = buf_done
+                        try:
+                            temps = get_board_temperatures_c(board)
+                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
+                        except Exception:
+                            bt = None
+                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
+                        notifier.emit_now()
+            except Exception:
+                pass
+
+            # Write EVERY buffer's representative waveform into the live ring for smooth GUI playback
+            try:
+                # Use record 0 as representative; convert to volts with correct per-channel Vpp
+                wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
+                wfB_live = None
+                chmask_live = 1
+                if ch_count == 2:
+                    wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
+                    chmask_live = 3
+                ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
+            except Exception:
+                pass
+
+            archive.append_reduced(red_rows, ts_ns)
+            board.postAsyncBuffer(buf.addr, buf.size_bytes)
+
+            buf_done += 1
+            global_rec += rpb
+
+            now = time.time()
+            if (now - last >= 1.0) or (dashboard_every_buffers > 0 and (buf_done - last_emit_buf) >= dashboard_every_buffers):
+                rate = global_rec / max(now - t0, 1e-9)
+                # status fields for GUI
+                last_capture_unix = time.time()
+                last_capture = time.strftime('%Y-%m-%d %H:%M:%S')
+                # board temperature (best-effort; may be unavailable depending on atsapi)
+                board_temp_c = None
+                try:
+                    # Some atsapi wrappers expose getBoardTemperature / getTemperature
+                    if hasattr(board, 'getBoardTemperature'):
+                        board_temp_c = float(board.getBoardTemperature())
+                    elif hasattr(board, 'getTemperature'):
+                        board_temp_c = float(board.getTemperature())
+                except Exception:
+                    board_temp_c = None
+
+                # latest waveform for GUI (downsampled). Uses last computed wfA_V/wfB_V if available.
+                latest_wf_A = None
+                latest_wf_B = None
+                try:
+                    if 'wfA_V' in locals():
+                        w = wfA_V
+                        step = max(1, int(len(w) // 1200))
+                        latest_wf_A = w[::step].astype(float).tolist()
+                    if 'wfB_V' in locals() and wfB_V is not None:
+                        w = wfB_V
+                        step = max(1, int(len(w) // 1200))
+                        latest_wf_B = w[::step].astype(float).tolist()
+                except Exception:
+                    latest_wf_A = None
+                    latest_wf_B = None
+
+                notifier.update(state="running", time=time.strftime("%Y-%m-%d %H:%M:%S"),
+                               buffers=buf_done, records=global_rec, rate_hz=rate, last_capture=last_capture, last_capture_unix=last_capture_unix, board_temp_c=board_temp_c, latest_waveform_A=latest_wf_A, latest_waveform_B=latest_wf_B,
+                               reduced_rows=getattr(archive, "_n_reduced", 0),
+                               snips=getattr(archive, "_n_snips", 0),
+                               last_buffer_ago_s=(time.time_ns()-last_buffer_ns)/1e9)
+                notifier.maybe_emit()
+                print(f"[CAPPY] buffers={buf_done} records={global_rec} rate={rate/1e3:.1f} kHz snips={archive._n_snips}")
+                last = now
+                last_emit_buf = buf_done
+
+    finally:
+        try:
+            board.abortAsyncRead()
+        except Exception:
+            pass
+        try:
+            ring.close()
+        except Exception:
+            pass
+        notifier.update(state='stopped', time=time.strftime('%Y-%m-%d %H:%M:%S'))
+        notifier.maybe_emit()
+        archive.finalize(ch_expr)
+
+    return 0
+
+class ArchiveBrowser(ttk.Frame):
+    def __init__(self, data_dir: Path, master=None):
         super().__init__(master)
-        self.title(title)
-        self.configure(bg=UI_COLORS['bg_dark'])
-        self.geometry("1180x760")
-        self.minsize(980, 620)
+        self._tz = datetime.now().astimezone().tzinfo
+        self.data_dir = data_dir
+        self.captures = data_dir / "captures"
+        self.sessions = pd.DataFrame()
+        self.snips = pd.DataFrame()
+        self._snip_db_dir: Optional[Path] = None
+        self._snips_view = pd.DataFrame()
+        self._sel_date = None
+        self._sel_hour = None
+        self._build()
+        self._refresh()
 
-        self.data_dir = Path(data_dir)
-        self.captures_root = self.data_dir / "captures"
-        self.filter_var = tk.StringVar(value="")
-        self.date_var = tk.StringVar(value="")
-        self.hour_var = tk.StringVar(value="")
-        self.mmss_var = tk.StringVar(value="")
-        self._sessions = []  # list[dict]
-        self._snips = []     # list[Path]
-        self._current_session = None
+    def _build(self):
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill=tk.BOTH, expand=True)
+        filt = ttk.Frame(top)
+        filt.pack(fill=tk.X)
 
-        # --- Top bar ---
-        top = tk.Frame(self, bg=UI_COLORS['bg_medium'])
-        top.pack(side=tk.TOP, fill=tk.X)
+        self.var_dir = tk.StringVar(value=str(self.data_dir))
+        
+        pan = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
+        pan.pack(fill=tk.BOTH, expand=True, pady=(8,0))
+        left = ttk.Frame(pan, padding=6)
+        right = ttk.Frame(pan, padding=6)
+        pan.add(left, weight=1)
+        pan.add(right, weight=2)
 
-        tk.Label(top, text=str(self.data_dir), bg=UI_COLORS['bg_medium'], fg='white').pack(side=tk.LEFT, padx=10, pady=8)
+        ttk.Label(left, text="Sessions").pack(anchor="w")
+        self.slist = tk.Listbox(left)
+        self.slist.pack(fill=tk.BOTH, expand=True)
+        self.slist.bind("<<ListboxSelect>>", self._on_session)
+        ttk.Label(left, text="Date").pack(anchor="w", pady=(8,0))
+        self.var_date = tk.StringVar(value="")
+        self.cmb_date = ttk.Combobox(left, textvariable=self.var_date, state="readonly", width=18)
+        self.cmb_date.pack(fill=tk.X, expand=False)
+        self.cmb_date.bind("<<ComboboxSelected>>", self._on_date)
+        hour_row = ttk.Frame(left)
+        hour_row.pack(fill=tk.X, pady=(6,0))
+        ttk.Label(hour_row, text="Hour").pack(side=tk.LEFT)
+        self.var_seek = tk.StringVar(value="")
+        seek_entry = ttk.Entry(hour_row, textvariable=self.var_seek, width=7)
+        seek_entry.pack(side=tk.LEFT, padx=(8,4))
+        ttk.Label(hour_row, text="MM:SS").pack(side=tk.LEFT)
+        ttk.Button(hour_row, text="Go", command=self._seek_mmss).pack(side=tk.LEFT, padx=(6,0))
+        # allow Enter in the seek box to trigger
+        seek_entry.bind("<Return>", lambda _e: self._seek_mmss())
 
-        tk.Label(top, text="Filter:", bg=UI_COLORS['bg_medium'], fg='#ccc').pack(side=tk.LEFT, padx=(10, 4))
-        ent = tk.Entry(top, textvariable=self.filter_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=32)
-        ent.pack(side=tk.LEFT, pady=8)
-        ent.bind("<KeyRelease>", lambda _e=None: self.refresh_sessions())
+        self.hlist = tk.Listbox(left, height=8, exportselection=False)
+        self.hlist.pack(fill=tk.X, expand=False)
+        self.hlist.bind("<<ListboxSelect>>", self._on_hour)
+        self.hlist.bind("<MouseWheel>", self._on_hour_wheel)
 
-        tk.Button(
-            top, text="Open Folder",
-            command=self.open_folder,
-            bg=UI_COLORS['button_bg'], fg='white',
-            activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).pack(side=tk.RIGHT, padx=10, pady=6)
+        ttk.Label(left, text="Waveform snippets").pack(anchor="w", pady=(8,0))
+        self.wlist = tk.Listbox(left, exportselection=False)
+        self.wlist.pack(fill=tk.BOTH, expand=True)
+        self.wlist.bind("<<ListboxSelect>>", self._on_snip)
 
-        tk.Button(
-            top, text="Refresh",
-            command=self.refresh_sessions,
-            bg=UI_COLORS['button_bg'], fg='white',
-            activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).pack(side=tk.RIGHT, padx=6, pady=6)
-
-        # --- Body split ---
-        body = tk.Frame(self, bg=UI_COLORS['bg_dark'])
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        left = tk.Frame(body, bg=UI_COLORS['bg_dark'], width=360)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 6), pady=10)
-        left.pack_propagate(False)
-
-        right = tk.Frame(body, bg=UI_COLORS['bg_dark'])
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
-
-        # --- Left panel: Sessions ---
-        tk.Label(left, text="Sessions", bg=UI_COLORS['bg_dark'], fg='white', font=('Arial', 10, 'bold')).pack(anchor='w')
-        self.session_list = tk.Listbox(left, bg='#1e1e1e', fg='white', height=10,
-                                       activestyle='none', selectbackground='#444', highlightthickness=0)
-        self.session_list.pack(fill=tk.X, pady=(6, 10))
-        self.session_list.bind("<<ListboxSelect>>", self._on_select_session)
-
-        # --- Jump controls ---
-        jump = tk.Frame(left, bg=UI_COLORS['bg_dark'])
-        jump.pack(fill=tk.X, pady=(0, 10))
-
-        tk.Label(jump, text="Date", bg=UI_COLORS['bg_dark'], fg='#ccc').grid(row=0, column=0, sticky='w')
-        tk.Entry(jump, textvariable=self.date_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=12).grid(row=1, column=0, sticky='w', pady=(2, 0))
-
-        tk.Label(jump, text="Hour", bg=UI_COLORS['bg_dark'], fg='#ccc').grid(row=2, column=0, sticky='w', pady=(10, 0))
-        tk.Entry(jump, textvariable=self.hour_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=5).grid(row=3, column=0, sticky='w', pady=(2, 0))
-
-        tk.Label(jump, text="MM:SS", bg=UI_COLORS['bg_dark'], fg='#ccc').grid(row=3, column=1, sticky='w', padx=(8, 0))
-        tk.Entry(jump, textvariable=self.mmss_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=6).grid(row=3, column=2, sticky='w', pady=(2, 0), padx=(4, 0))
-
-        tk.Button(
-            jump, text="Go",
-            command=self._jump_to_time,
-            bg=UI_COLORS['button_bg'], fg='white',
-            activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).grid(row=3, column=3, sticky='w', padx=(10, 0), pady=(2, 0))
-
-        for c in range(4):
-            jump.grid_columnconfigure(c, weight=0)
-
-        # --- Left panel: Snips ---
-        tk.Label(left, text="Waveform snippets", bg=UI_COLORS['bg_dark'], fg='white', font=('Arial', 10, 'bold')).pack(anchor='w', pady=(6, 0))
-
-        snip_frame = tk.Frame(left, bg=UI_COLORS['bg_dark'])
-        snip_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-
-        self.snip_list = tk.Listbox(snip_frame, bg='#1e1e1e', fg='white',
-                                    activestyle='none', selectbackground='#444', highlightthickness=0)
-        self.snip_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        snip_sb = tk.Scrollbar(snip_frame, orient=tk.VERTICAL, command=self.snip_list.yview)
-        snip_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.snip_list.configure(yscrollcommand=snip_sb.set)
-        # <<ListboxSelect>> fires before curselection() is updated in some Tk versions.
-        # ButtonRelease-1 fires after the click is fully committed → reliable single-click.
-        self.snip_list.bind("<ButtonRelease-1>", lambda _e=None: self.preview_selected())
-        self.snip_list.bind("<KeyRelease-Up>",   lambda _e=None: self.preview_selected())
-        self.snip_list.bind("<KeyRelease-Down>",  lambda _e=None: self.preview_selected())
-
-        # --- Right panel: plots + metadata ---
-        self.fig = plt.Figure(figsize=(7, 6), dpi=100)
-
-        # Layout: one combined waveform axis (A+B) on top, integral axis on bottom
-        gs = self.fig.add_gridspec(3, 1, height_ratios=[1, 1, 1.1], hspace=0.35)
-        self.axW = self.fig.add_subplot(gs[0:2, 0])   # combined waveform axis
-        self.axI = self.fig.add_subplot(gs[2, 0])
-
-        for ax in (self.axW, self.axI):
-            ax.grid(True, alpha=0.25)
-
-        self.axW.set_ylabel("Voltage (V)")
-        self.axI.set_ylabel("Integral (V·s)")
-
+        self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
+        self.fig.patch.set_facecolor('#1e1e1e')
+        self.axA.set_facecolor('#2d2d2d')
+        self.axB.set_facecolor('#2d2d2d')
+        self.axI.set_facecolor('#2d2d2d')
+        self.fig.tight_layout(pad=1.0)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        meta_box = tk.Frame(right, bg=UI_COLORS['bg_dark'])
-        meta_box.pack(fill=tk.X, pady=(8, 0))
+        self.meta = tk.Text(right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
+        self.meta.pack(fill=tk.X, pady=(8,0))
+        self.meta.configure(state=tk.DISABLED)
 
-        self.meta_text = scrolledtext.ScrolledText(
-            meta_box, height=7, bg="#0a0a0a", fg="#ddd",
-            font=("Courier", 9), wrap=tk.WORD
-        )
-        self.meta_text.pack(fill=tk.X, expand=False)
+    def _pick_dir(self):
+        p = filedialog.askdirectory(title="Select data directory")
+        if p:
+            self.data_dir = Path(p)
+            self.captures = self.data_dir / "captures"
+            self.var_dir.set(p)
+            self._refresh()
 
-        btns = tk.Frame(right, bg=UI_COLORS['bg_dark'])
-        btns.pack(fill=tk.X, pady=(8, 0))
-
-        tk.Button(
-            btns, text="Preview",
-            command=self.preview_selected,
-            bg=UI_COLORS['button_bg'], fg='white',
-            activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=12
-        ).pack(side=tk.LEFT)
-
-        # Record navigator (for multi-record buffers)
-        self._record_var = tk.IntVar(value=0)
-        self._record_max = 0
-        self._show_all_records = tk.BooleanVar(value=False)
-
-        rec_frame = tk.Frame(btns, bg=UI_COLORS['bg_dark'])
-        rec_frame.pack(side=tk.LEFT, padx=(16, 0))
-
-        tk.Label(rec_frame, text="Record:", bg=UI_COLORS['bg_dark'], fg='#ccc').pack(side=tk.LEFT)
-        self._rec_spin = tk.Spinbox(
-            rec_frame, from_=0, to=0, width=5,
-            textvariable=self._record_var,
-            bg='#222', fg='white', insertbackground='white',
-            buttonbackground='#333', relief=tk.FLAT,
-            command=self.preview_selected
-        )
-        self._rec_spin.pack(side=tk.LEFT, padx=(4, 0))
-        self._rec_label = tk.Label(rec_frame, text="/ 0", bg=UI_COLORS['bg_dark'], fg='#888')
-        self._rec_label.pack(side=tk.LEFT, padx=(2, 8))
-
-        tk.Checkbutton(
-            rec_frame, text="All", variable=self._show_all_records,
-            bg=UI_COLORS['bg_dark'], fg='#ccc', selectcolor='#333',
-            activebackground=UI_COLORS['bg_dark'], activeforeground='white',
-            command=self.preview_selected
-        ).pack(side=tk.LEFT)
-
-        tk.Button(
-            btns, text="Close",
-            command=self.destroy,
-            bg=UI_COLORS['button_bg'], fg='white',
-            activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=12
-        ).pack(side=tk.RIGHT)
-
-        self.refresh_sessions()
-
-    def open_folder(self):
-        try:
-            subprocess.Popen(["xdg-open", str(self.data_dir)])
-        except Exception:
-            try:
-                subprocess.Popen(["gio", "open", str(self.data_dir)])
-            except Exception:
-                pass
-
-    def _iter_session_dirs(self):
-        if not self.captures_root.exists():
-            return []
-        out = []
-        # session dir contains buf_*.npz
-        for p in self.captures_root.rglob("buf_*.npz"):
-            out.append(p.parent)
-        # unique, sorted by name
-        uniq = sorted({d for d in out})
-        return uniq
-
-    def refresh_sessions(self):
-        f = (self.filter_var.get() or "").strip().lower()
-        self._sessions.clear()
-        self.session_list.delete(0, tk.END)
-        self.snip_list.delete(0, tk.END)
-        self._snips = []
-        self._current_session = None
-
-        sess_dirs = self._iter_session_dirs()
-        for d in sess_dirs:
-            # d name like YYYYMMDD_HHMMSS
-            sid = d.name
-            # date inferred from parent structure if present
-            date_str = d.parent.parent.name if d.parent.parent.name.count('-') == 2 else ""
-            # snips count
-            try:
-                n = len(list(d.glob("buf_*.npz")))
-            except Exception:
-                n = 0
-
-            label = f"{date_str} {sid[-6:-4]}:{sid[-4:-2]}:{sid[-2:]}  {sid}  snips={n}"
-            if f and f not in label.lower():
+    def _iter_day_dirs(self):
+        """Yield all YYYY-MM-DD directories under captures/YYYY/YYYY-MM/"""
+        if not self.captures.exists():
+            return
+        for ydir in sorted(self.captures.iterdir()):
+            if not ydir.is_dir():
                 continue
-
-            self._sessions.append({"dir": d, "sid": sid, "date": date_str, "n": n, "label": label})
-            self.session_list.insert(tk.END, label)
-
-        if self._sessions:
-            self.session_list.selection_set(0)
-            self._on_select_session()
-        else:
-            self.meta_text.delete("1.0", tk.END)
-            self.meta_text.insert(tk.END, f"No sessions found under: {self.captures_root}\n")
-
-    def _on_select_session(self, _evt=None):
-        sel = self.session_list.curselection()
-        if not sel or not self._sessions:
-            return
-        s = self._sessions[int(sel[0])]
-        self._current_session = s
-        d = Path(s["dir"])
-
-        files = sorted(d.glob("buf_*.npz"))
-        self._snips = files
-
-        self.snip_list.delete(0, tk.END)
-        for p in files:
-            # show buf id only
-            self.snip_list.insert(tk.END, p.name)
-
-        if files:
-            self.snip_list.selection_clear(0, tk.END)
-            self.snip_list.selection_set(0)
-            self.preview_selected()
-
-    def _jump_to_time(self):
-        # Best-effort: select first session matching date + hour.
-        date = (self.date_var.get() or "").strip()
-        hour = (self.hour_var.get() or "").strip()
-        if not date or not hour:
-            return
-        # normalize hour
-        try:
-            hour_i = int(hour)
-            hour = f"{hour_i:02d}"
-        except Exception:
-            hour = hour.zfill(2)[:2]
-
-        for i, s in enumerate(self._sessions):
-            if s.get("date") == date:
-                # hour derived from captures path captures/YYYY-MM-DD/HHMM/...
-                # HHMM folder is parent of session dir
-                try:
-                    hhmm = Path(s["dir"]).parent.name
-                    if hhmm[:2] == hour:
-                        self.session_list.selection_clear(0, tk.END)
-                        self.session_list.selection_set(i)
-                        self.session_list.see(i)
-                        self._on_select_session()
-                        return
-                except Exception:
+            for mdir in sorted(ydir.iterdir()):
+                if not mdir.is_dir():
                     continue
+                for ddir in sorted(mdir.iterdir()):
+                    if not ddir.is_dir():
+                        continue
+                    # day folder should be YYYY-MM-DD
+                    try:
+                        _ = datetime.strptime(ddir.name, "%Y-%m-%d").date()
+                    except ValueError:
+                        continue
+                    yield ddir
 
-    def _load_npz(self, p: Path):
-        z = np.load(str(p), allow_pickle=True)
-        def _get(name, default=None):
-            return z[name] if name in z.files else default
-        wfA = _get('wfA_V', None)
-        wfB = _get('wfB_V', None)
-        sr = float(_get('sample_rate_hz', 0.0) or 0.0)
-        ts_ns = _get('timestamp_ns', None)
-        board = _get('board', None)
-        channels = _get('channels', None)
+    def _list_sessions(self, sd: Optional[date], ed: Optional[date]) -> pd.DataFrame:
+        rows = []
+        for ddir in self._iter_day_dirs() or []:
+            try:
+                d = datetime.strptime(ddir.name, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if sd and d < sd:
+                continue
+            if ed and d > ed:
+                continue
+            idx = ddir / "session_index.parquet"
+            if idx.exists():
+                try:
+                    rows += pd.read_parquet(idx).to_dict("records")
+                except Exception:
+                    pass
+        if not rows:
+            return pd.DataFrame(columns=SESSION_INDEX_SCHEMA.names)
+        return pd.DataFrame(rows).sort_values("first_timestamp_ns", ascending=False)
 
-        # Return raw arrays (may be 1D or 2D); let preview_selected decide how to use them
-        if wfA is not None:
-            wfA = np.asarray(wfA, dtype=np.float32)
-        if wfB is not None:
-            wfB = np.asarray(wfB, dtype=np.float32)
+    def _refresh(self):
+        try:
+            self.sessions = self._list_sessions(None, None)
+            self.sessions_all = self.sessions.copy()
+            self._sessions_view = self.sessions.copy().reset_index(drop=True)
+        except Exception as ex:
+            messagebox.showerror("Error", str(ex))
+            self.sessions = pd.DataFrame()
 
-        return wfA, wfB, sr, ts_ns, board, channels
+        self.slist.delete(0, tk.END)
+        self.wlist.delete(0, tk.END)
 
-    def preview_selected(self):
-        sel = self.snip_list.curselection()
-        if not sel or not self._snips:
+        if self.sessions.empty:
+            self.slist.insert(tk.END, "(no sessions)")
             return
-        p = self._snips[int(sel[0])]
 
-        try:
-            wfA, wfB, sr, ts_ns, board, channels = self._load_npz(p)
-            if wfA is None or sr <= 0:
-                raise ValueError("Missing wfA_V or sample_rate_hz")
+        self._sessions_view = getattr(self, '_sessions_view', self.sessions).reset_index(drop=True)
+        for _, r in self._sessions_view.iterrows():
+            t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9, tz=self._tz)
+            self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
 
-            # ── Handle 1D (legacy single record) vs 2D (multi-record buffer) ──
-            n_records = 1
-            if wfA.ndim == 2:
-                n_records = wfA.shape[0]
-            if wfB is not None and wfB.ndim == 2:
-                n_records = max(n_records, wfB.shape[0])
+        # If a session is already selected and snips are loaded, re-apply snip filter.
+        if getattr(self, 'snips', pd.DataFrame()).empty is False:
+            self._apply_hour_filter()
 
-            # Update record spinbox range
-            self._record_max = n_records - 1
-            self._rec_spin.config(to=self._record_max)
-            self._rec_label.config(text=f"/ {self._record_max}")
-            rec_idx = max(0, min(int(self._record_var.get()), self._record_max))
-            self._record_var.set(rec_idx)
-
-            show_all = bool(self._show_all_records.get())
-
-            # Extract the waveform(s) to plot
-            wfA_2d = wfA if wfA.ndim == 2 else wfA.reshape(1, -1)
-            wfB_2d = (wfB if wfB.ndim == 2 else wfB.reshape(1, -1)) if wfB is not None else None
-
-            if show_all:
-                # Overlay all records; each row is one trigger record
-                wfA_rows = wfA_2d                         # shape (R, S)
-                wfB_rows = wfB_2d                         # shape (R, S) or None
-                wfA_plot  = wfA_2d.mean(axis=0)           # mean trace for integrals/stats
-                wfB_plot  = wfB_2d.mean(axis=0) if wfB_2d is not None else None
-                plot_title = f"{p.name}  [all {n_records} records]"
-            else:
-                wfA_rows = wfA_2d[rec_idx:rec_idx+1]
-                wfB_rows = wfB_2d[rec_idx:rec_idx+1] if wfB_2d is not None else None
-                wfA_plot  = wfA_2d[rec_idx]
-                wfB_plot  = wfB_2d[rec_idx] if wfB_2d is not None else None
-                plot_title = f"{p.name}  [record {rec_idx}/{self._record_max}]"
-
-            wfA_plot = np.asarray(wfA_plot, dtype=np.float32)
-            wfB_plot = np.asarray(wfB_plot, dtype=np.float32) if wfB_plot is not None else None
-
-            # --- Time axis with auto units (based on samples per record) ---
-            n_plot_samples = wfA_rows.shape[1]
-            t_s = np.arange(n_plot_samples, dtype=np.float64) / float(sr)
-            dur_s = float(t_s[-1]) if len(t_s) > 1 else 0.0
-            if dur_s < 2e-6:
-                t = t_s * 1e9;  t_unit = "ns"
-            elif dur_s < 2e-3:
-                t = t_s * 1e6;  t_unit = "µs"
-            elif dur_s < 2.0:
-                t = t_s * 1e3;  t_unit = "ms"
-            else:
-                t = t_s;        t_unit = "s"
-
-            # --- Baseline subtraction ---
-            def _baseline(wf: np.ndarray) -> float:
-                n = len(wf)
-                k = max(1, min(256, n // 20))
-                return float(np.mean(wf[:k]))
-
-            baseA = _baseline(wfA_plot)
-            wfA0  = wfA_plot - baseA
-            baseB = None;  wfB0 = None
-            if wfB_plot is not None:
-                baseB = _baseline(wfB_plot)
-                wfB0  = wfB_plot - baseB
-
-            # --- Cumulative integrals ---
-            dt   = 1.0 / float(sr)
-            intA = np.cumsum(wfA0) * dt
-            intB = np.cumsum(wfB0) * dt if wfB0 is not None else None
-
-            # --- Colors by board ---
-            board_key = ("9352" if ("9352" in str(board).lower() or "9352" in self.title().lower())
-                         else ("9462" if ("9462" in str(board).lower() or "9462" in self.title().lower())
-                               else "9352"))
-            colA = COLORS.get(board_key, COLORS["9352"])["A"]
-            colB = COLORS.get(board_key, COLORS["9352"])["B"]
-
-            # --- Plot waveforms: individual records semi-transparent + mean bold ---
-            self.axW.clear()
-            self.axW.grid(True, alpha=0.25)
-
-            n_rows = wfA_rows.shape[0]
-            alpha_ind = max(0.05, min(0.5, 1.2 / max(1, n_rows ** 0.6)))
-
-            for i, row in enumerate(wfA_rows):
-                self.axW.plot(t, row, color=colA, linewidth=0.6,
-                              alpha=alpha_ind, label="_" if i else "Ch A (individual)")
-            if wfB_rows is not None:
-                for i, row in enumerate(wfB_rows):
-                    self.axW.plot(t, row, color=colB, linewidth=0.6,
-                                  alpha=alpha_ind, linestyle="--", label="_" if i else "Ch B (individual)")
-
-            # Bold mean on top (only meaningful when show_all; single record it's identical)
-            if n_rows > 1:
-                self.axW.plot(t, wfA_plot, color=colA, linewidth=1.8, label="Ch A (mean)")
-                if wfB_plot is not None:
-                    self.axW.plot(t, wfB_plot, color=colB, linewidth=1.8,
-                                  linestyle="--", label="Ch B (mean)")
-            else:
-                self.axW.plot(t, wfA_plot, color=colA, linewidth=1.4, label="Channel A")
-                if wfB_plot is not None:
-                    self.axW.plot(t, wfB_plot, color=colB, linewidth=1.4,
-                                  linestyle="--", label="Channel B")
-
-            self.axW.set_title(plot_title, fontsize=9)
-            self.axW.set_ylabel("Voltage (V)")
-            self.axW.set_xlabel(f"Time ({t_unit})")
-            self.axW.legend(loc="upper right", fontsize=8, framealpha=0.85)
-
-            # --- Plot integrals ---
-            self.axI.clear()
-            self.axI.grid(True, alpha=0.25)
-            self.axI.plot(t, intA, color=colA, linewidth=0.8, label="∫A dt")
-            if intB is not None:
-                self.axI.plot(t, intB, color=colB, linewidth=0.8, linestyle="--", label="∫B dt")
-            self.axI.set_ylabel("Integral (V·s)")
-            self.axI.set_xlabel(f"Time ({t_unit})")
-            self.axI.legend(loc='best', fontsize=8)
-
-            # --- Metadata ---
-            pkA  = float(np.max(wfA_plot) - np.min(wfA_plot))
-            pkB  = float(np.max(wfB_plot) - np.min(wfB_plot)) if wfB_plot is not None else 0.0
-            areaA = float(np.trapezoid(wfA0, dx=dt))
-            areaB = float(np.trapezoid(wfB0, dx=dt)) if wfB0 is not None else 0.0
-
-            self.meta_text.delete("1.0", tk.END)
-            self.meta_text.insert(tk.END, f"File: {p}\n")
-            if self._current_session:
-                self.meta_text.insert(tk.END, f"Session: {self._current_session.get('sid','')}\n")
-            if ts_ns is not None:
-                self.meta_text.insert(tk.END, f"Timestamp_ns: {ts_ns}\n")
-            if board is not None:
-                self.meta_text.insert(tk.END, f"Board: {board}\n")
-            if channels is not None:
-                self.meta_text.insert(tk.END, f"Channels: {channels}\n")
-            self.meta_text.insert(tk.END, f"Sample rate: {sr:.6g} Hz\n")
-            self.meta_text.insert(tk.END, f"Records in buffer: {n_records}  |  Showing: {'all' if show_all else rec_idx}\n")
-            self.meta_text.insert(tk.END, f"Samples shown: {len(wfA_plot)}\n")
-            self.meta_text.insert(tk.END, f"Peak-to-peak A: {pkA:.6g} V\n")
-            if wfB_plot is not None:
-                self.meta_text.insert(tk.END, f"Peak-to-peak B: {pkB:.6g} V\n")
-            self.meta_text.insert(tk.END, f"Baseline A: {baseA:.6g} V\n")
-            if wfB_plot is not None and baseB is not None:
-                self.meta_text.insert(tk.END, f"Baseline B: {baseB:.6g} V\n")
-            self.meta_text.insert(tk.END, f"Area A (baseline-sub): {areaA:.6g} V·s\n")
-            if wfB0 is not None:
-                self.meta_text.insert(tk.END, f"Area B (baseline-sub): {areaB:.6g} V·s\n")
-
-            self.canvas.draw_idle()
-
-        except Exception as e:
-            self.meta_text.delete("1.0", tk.END)
-            self.meta_text.insert(tk.END, f"Failed to preview {p.name}: {e}\n")
+    def _sel_sid(self) -> Optional[str]:
+        if self.sessions.empty:
+            return None
+        sel = self.slist.curselection()
+        if not sel:
+            return None
+        view = getattr(self, '_sessions_view', self.sessions)
+        return str(view.iloc[sel[0]]["session_id"])
 
 
+    def _build_hour_index(self):
+        """Add _date/_hour columns to self.snips (local time)."""
+        if self.snips is None or self.snips.empty:
+            return
+        # Treat stored ns as UTC epoch, then convert to local timezone for display/grouping.
+        dt = pd.to_datetime(self.snips["timestamp_ns"], unit="ns", utc=True).dt.tz_convert(self._tz)
+        self.snips = self.snips.copy()
+        self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
+        self.snips["_hour"] = dt.dt.strftime("%H")
 
-class DualBoardGUI:
-    """Main GUI - fully corrected with all improvements"""
-    
-    def __init__(self, root):
-        self.root = root
-        self.root.title("CAPPY Dual-Board Acquisition System")
-        self.root.geometry("1800x1000")
-        self.root.configure(bg=UI_COLORS['bg_dark'])
-        
-        self.running = False
-        self.sidebar_visible = True
-        self.sidebar_popout_win = None
-        self._sidebar_main_container = None
-        self._sidebar_toggle_btn = None
-        self._board_running = {'9352': False, '9462': False}
-        
-        self.gui_queue = queue.Queue()
-        self._log_buffer = []
-        self.log_text = None
-        
-        self.acq_9352 = None
-        self.acq_9462 = None
-        
-        self.config_path_9352 = Path("config_9352.yaml")
-        self.config_path_9462 = Path("config_9462.yaml")
-
-
-        # Load persisted UI state (last YAML/data dirs) and ensure defaults exist
-        self._load_app_state_and_defaults()
-        
-        self.waveform_data = {
-            '9352': {'A': [], 'B': [], 'intA': [], 'intB': [], 'time': []},
-            '9462': {'A': [], 'B': [], 'intA': [], 'intB': [], 'time': []}
-        }
-        self.max_plot_points = 1000
-        
-        # ADDED: Rolling time window for integrals
-        self.integral_time_window = 20.0  # seconds
-        self.integral_start_time = {}
-        
-        self.stats_labels = {}
-        self.trigger_vars = {}
-        self.channel_b_vars = {}
-        
-        self.setup_ui()
-        self.update_from_queue()
-        
-    def setup_ui(self):
-        """Build UI"""
-        self.create_toolbar()
-        
-        main_container = tk.Frame(self.root, bg=UI_COLORS['bg_dark'])
-        main_container.pack(fill=tk.BOTH, expand=True)
-        
-        self.create_sidebar(main_container)
-        self.create_content_area(main_container)
-        
-    def create_toolbar(self):
-        """Streamlined toolbar with white play button"""
-        toolbar = tk.Frame(self.root, bg=UI_COLORS['bg_medium'], height=60)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
-        toolbar.pack_propagate(False)
-        
-        # Simple white play button on grey
-        self.play_pause_btn = tk.Button(
-            toolbar, text="▶ Start", 
-            command=self.toggle_acquisition,
-            bg=UI_COLORS['play_button_bg'],
-            fg=UI_COLORS['play_button_fg'], 
-            font=('Arial', 12, 'bold'),
-            width=12, height=2,
-            relief=tk.FLAT,
-            cursor='hand2'
-        )
-        self.play_pause_btn.pack(side=tk.LEFT, padx=15, pady=10)
-
-        # Controls toggle (for hidden sidebar)
-        tk.Button(
-            toolbar, text="Controls",
-            command=self.toggle_sidebar,
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10, height=2
-        ).pack(side=tk.LEFT, padx=(0, 10), pady=10)
-        
-        tk.Frame(toolbar, width=2, bg=UI_COLORS['separator']).pack(side=tk.LEFT, fill=tk.Y, padx=15)
-        
-        # ATS-9352 - white label
-        frame_9352 = tk.Frame(toolbar, bg=UI_COLORS['bg_medium'])
-        frame_9352.pack(side=tk.LEFT, padx=10, pady=10)
-        
-        tk.Label(
-            frame_9352, text="ATS-9352", 
-            bg=UI_COLORS['bg_medium'], fg='white',
-            font=('Arial', 10, 'bold')
-        ).pack(side=tk.TOP)
-        
-        btn_frame_9352 = tk.Frame(frame_9352, bg=UI_COLORS['bg_medium'])
-        btn_frame_9352.pack(side=tk.TOP)
-        
-        tk.Button(
-            btn_frame_9352, text="Load YAML",
-            command=lambda: self.load_yaml('9352'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).pack(side=tk.LEFT, padx=2)
-        
-        tk.Button(
-            btn_frame_9352, text="Data Dir",
-            command=lambda: self.select_data_dir('9352'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).pack(side=tk.LEFT, padx=2)
-        
-        tk.Frame(toolbar, width=2, bg=UI_COLORS['separator']).pack(side=tk.LEFT, fill=tk.Y, padx=15)
-        
-        # ATS-9462 - white label
-        frame_9462 = tk.Frame(toolbar, bg=UI_COLORS['bg_medium'])
-        frame_9462.pack(side=tk.LEFT, padx=10, pady=10)
-        
-        tk.Label(
-            frame_9462, text="ATS-9462",
-            bg=UI_COLORS['bg_medium'], fg='white',
-            font=('Arial', 10, 'bold')
-        ).pack(side=tk.TOP)
-        
-        btn_frame_9462 = tk.Frame(frame_9462, bg=UI_COLORS['bg_medium'])
-        btn_frame_9462.pack(side=tk.TOP)
-        
-        tk.Button(
-            btn_frame_9462, text="Load YAML",
-            command=lambda: self.load_yaml('9462'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).pack(side=tk.LEFT, padx=2)
-        
-        tk.Button(
-            btn_frame_9462, text="Data Dir",
-            command=lambda: self.select_data_dir('9462'),
-            bg=UI_COLORS['button_bg'], fg=UI_COLORS['button_fg'], activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).pack(side=tk.LEFT, padx=2)
-        
-    def create_sidebar(self, parent):
-        """Create the main (docked) sidebar."""
-        self.sidebar_frame = tk.Frame(parent, bg=UI_COLORS['bg_sidebar'], width=330)
-        self.sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
-        self.sidebar_frame.pack_propagate(False)
-
-        # Host where we can rebuild the sidebar contents (also reused for popout)
-        self._sidebar_main_container = tk.Frame(self.sidebar_frame, bg=UI_COLORS['bg_sidebar'])
-        self._sidebar_main_container.pack(fill=tk.BOTH, expand=True)
-        self._build_sidebar_contents(self._sidebar_main_container, mode="docked")
-
-    def _build_sidebar_contents(self, parent, mode: str = "docked"):
-        """Build sidebar UI into a given parent (docked or popout)."""
-        for child in parent.winfo_children():
-            child.destroy()
-
-        header = tk.Frame(parent, bg=UI_COLORS['bg_sidebar'])
-        header.pack(fill=tk.X)
-
-        if mode == "docked":
-            self._sidebar_toggle_btn = tk.Button(
-                header, text="◀ Hide",
-                command=self.toggle_sidebar,
-                bg='#333', fg='white', font=('Arial', 9),
-                relief=tk.FLAT, cursor='hand2'
-            )
-            self._sidebar_toggle_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-            pop_btn = tk.Button(
-                header, text="Pop out",
-                command=self.popout_sidebar,
-                bg='#333', fg='white', font=('Arial', 9),
-                relief=tk.FLAT, cursor='hand2'
-            )
-            pop_btn.pack(side=tk.RIGHT)
-        else:
-            dock_btn = tk.Button(
-                header, text="Dock ◀",
-                command=self.dock_sidebar,
-                bg='#333', fg='white', font=('Arial', 9),
-                relief=tk.FLAT, cursor='hand2'
-            )
-            dock_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Scroll area (with mouse wheel + width sync so popout isn't cropped)
-        canvas = tk.Canvas(parent, bg=UI_COLORS['bg_sidebar'], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg=UI_COLORS['bg_sidebar'])
-
-        win_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-
-        def _sync_scrollregion(_evt=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _sync_width(_evt=None):
+    def _populate_hours(self):
+        """Populate date combobox + hour listbox from currently loaded snips."""
+        self.hlist.delete(0, tk.END)
+        if self.snips is None or self.snips.empty:
             try:
-                canvas.itemconfigure(win_id, width=canvas.winfo_width())
+                self.cmb_date["values"] = []
+                self.var_date.set("")
             except Exception:
                 pass
+            return
 
-        scrollable_frame.bind("<Configure>", _sync_scrollregion)
-        canvas.bind("<Configure>", _sync_width)
+        self._build_hour_index()
 
-        canvas.configure(yscrollcommand=scrollbar.set)
+        # Dates available in this session's snips
+        dates = sorted(self.snips["_date"].unique().tolist())
+        # show newest first in UI
+        dates = list(reversed(dates))
 
-        def _on_mousewheel(event):
-            if getattr(event, "num", None) == 4:
-                canvas.yview_scroll(-1, "units")
-            elif getattr(event, "num", None) == 5:
-                canvas.yview_scroll(1, "units")
-            else:
-                delta = int(-1 * (event.delta / 120)) if hasattr(event, "delta") else 0
-                if delta:
-                    canvas.yview_scroll(delta, "units")
-
-        for w in (canvas, scrollable_frame):
-            w.bind("<MouseWheel>", _on_mousewheel)
-            w.bind("<Button-4>", _on_mousewheel)
-            w.bind("<Button-5>", _on_mousewheel)
-
-        def _bind_all(_e=None):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            canvas.bind_all("<Button-4>", _on_mousewheel)
-            canvas.bind_all("<Button-5>", _on_mousewheel)
-
-        def _unbind_all(_e=None):
-            try:
-                canvas.unbind_all("<MouseWheel>")
-                canvas.unbind_all("<Button-4>")
-                canvas.unbind_all("<Button-5>")
-            except Exception:
-                pass
-
-        canvas.bind("<Enter>", _bind_all)
-        canvas.bind("<Leave>", _unbind_all)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Archives
-        tk.Label(
-            scrollable_frame, text="ARCHIVES",
-            bg=UI_COLORS['bg_sidebar'], fg='white',
-            font=('Arial', 11, 'bold')
-        ).pack(pady=(10, 6))
-
-        tk.Button(
-            scrollable_frame, text="ATS-9352 Archive",
-            command=lambda: self.open_archive('9352'),
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
-            font=('Arial', 10),
-            relief=tk.FLAT, cursor='hand2',
-            height=2
-        ).pack(fill=tk.X, padx=10, pady=3)
-
-        tk.Button(
-            scrollable_frame, text="ATS-9462 Archive",
-            command=lambda: self.open_archive('9462'),
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
-            font=('Arial', 10),
-            relief=tk.FLAT, cursor='hand2',
-            height=2
-        ).pack(fill=tk.X, padx=10, pady=3)
-
-        tk.Frame(scrollable_frame, height=2, bg='#555').pack(fill=tk.X, pady=10)
-
-        # Per-board panels (Acquire / Vertical / Trigger / Stats)
-        self.create_board_panel(scrollable_frame, '9352')
-        tk.Frame(scrollable_frame, height=2, bg='#555').pack(fill=tk.X, pady=10)
-        self.create_board_panel(scrollable_frame, '9462')
-
-    def popout_sidebar(self):
-        """Pop the side panel into a separate window."""
         try:
-            if self.sidebar_popout_win is not None and self.sidebar_popout_win.winfo_exists():
-                self.sidebar_popout_win.lift()
-                self.sidebar_popout_win.focus_force()
-                return
-        except Exception:
-            self.sidebar_popout_win = None
-
-        self.sidebar_popout_win = tk.Toplevel(self.root)
-        self.sidebar_popout_win.title("CAPPY Controls")
-        self.sidebar_popout_win.geometry("420x950")
-        self.sidebar_popout_win.minsize(380, 600)
-        self.sidebar_popout_win.resizable(True, True)
-        self.sidebar_popout_win.configure(bg=UI_COLORS['bg_sidebar'])
-
-        pop_host = tk.Frame(self.sidebar_popout_win, bg=UI_COLORS['bg_sidebar'])
-        pop_host.pack(fill=tk.BOTH, expand=True)
-        self._build_sidebar_contents(pop_host, mode="popout")
-
-        def _on_close():
-            try:
-                self.sidebar_popout_win.destroy()
-            except Exception:
-                pass
-            self.sidebar_popout_win = None
-
-        self.sidebar_popout_win.protocol("WM_DELETE_WINDOW", _on_close)
-
-    def dock_sidebar(self):
-        """Close the popout and ensure the docked sidebar is visible."""
-        try:
-            if self.sidebar_popout_win is not None and self.sidebar_popout_win.winfo_exists():
-                self.sidebar_popout_win.destroy()
-        except Exception:
-            pass
-        self.sidebar_popout_win = None
-
-        if not self.sidebar_visible:
-            self.toggle_sidebar()
-        
-    def create_board_panel(self, parent, board_type):
-        """Side-panel controls (Acquire / Vertical / Trigger / Stats) for one board."""
-        board_name = COLORS[board_type]['name']
-        color_a = COLORS[board_type]['A']
-        color_b = COLORS[board_type]['B']
-        
-        frame = CollapsibleFrame(parent, title=board_name, bg=UI_COLORS['bg_widget'])
-        frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        content = frame.content
-
-        # -------------------------
-        # Acquire
-        # -------------------------
-        acquire = tk.LabelFrame(
-            content, text="Acquire",
-            bg=UI_COLORS['bg_widget'], fg='white',
-            bd=1, relief=tk.GROOVE,
-            font=('Arial', 10, 'bold'),
-            labelanchor='nw'
-        )
-        acquire.pack(fill=tk.X, padx=10, pady=(8, 6))
-
-        acq_row = tk.Frame(acquire, bg=UI_COLORS['bg_widget'])
-        acq_row.pack(fill=tk.X, padx=8, pady=6)
-
-        state_var = tk.StringVar(value="Stopped")
-        setattr(self, f"_statevar_{board_type}", state_var)
-
-        tk.Button(
-            acq_row, text="Start",
-            command=lambda bt=board_type: self.start_board(bt),
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', width=8
-        ).pack(side=tk.LEFT)
-
-        tk.Button(
-            acq_row, text="Stop",
-            command=lambda bt=board_type: self.stop_board(bt),
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', width=8
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        tk.Label(
-            acq_row, text="State",
-            bg=UI_COLORS['bg_widget'], fg='#aaa',
-            font=('Arial', 9)
-        ).pack(side=tk.LEFT, padx=(12, 6))
-
-        tk.Label(
-            acq_row, textvariable=state_var,
-            bg=UI_COLORS['bg_widget'], fg='white',
-            font=('Arial', 9, 'bold')
-        ).pack(side=tk.LEFT)
-
-        # -------------------------
-        # Vertical (Channel controls)
-        # -------------------------
-        vertical = tk.LabelFrame(
-            content, text="Vertical",
-            bg=UI_COLORS['bg_widget'], fg='white',
-            bd=1, relief=tk.GROOVE,
-            font=('Arial', 10, 'bold'),
-            labelanchor='nw'
-        )
-        vertical.pack(fill=tk.X, padx=10, pady=6)
-
-        # Range options (Alazar input ranges)
-        range_opts = [
-            ("20 mV", "PM_20_MV"), ("40 mV", "PM_40_MV"), ("50 mV", "PM_50_MV"),
-            ("80 mV", "PM_80_MV"), ("100 mV", "PM_100_MV"), ("200 mV", "PM_200_MV"),
-            ("400 mV", "PM_400_MV"), ("800 mV", "PM_800_MV"),
-            ("1 V", "PM_1_V"), ("2 V", "PM_2_V"), ("4 V", "PM_4_V"),
-        ]
-        range_labels = [x[0] for x in range_opts]
-        range_map = {lbl: val for lbl, val in range_opts}
-
-        coupling_labels = ["DC", "AC"]
-        impedance_labels = ["50 Ω", "1 MΩ"]
-        impedance_map = {"50 Ω": "50_OHM", "1 MΩ": "1M_OHM"}
-
-        def _channel_block(ch: str, title: str, title_fg: str):
-            blk = tk.LabelFrame(
-                vertical, text=title,
-                bg=UI_COLORS['bg_widget'], fg=title_fg,
-                bd=1, relief=tk.GROOVE,
-                font=('Arial', 10, 'bold'),
-                labelanchor='nw'
-            )
-            blk.pack(fill=tk.X, padx=8, pady=6)
-
-            row1 = tk.Frame(blk, bg=UI_COLORS['bg_widget'])
-            row1.pack(fill=tk.X, padx=6, pady=(4, 2))
-
-            # Disabled
-            disabled_var = tk.BooleanVar(value=False)
-            setattr(self, f"_ch_disabled_{board_type}_{ch}", disabled_var)
-
-            tk.Checkbutton(
-                row1, text="Disabled",
-                variable=disabled_var,
-                command=lambda: self._apply_channel_disabled(board_type, ch, disabled_var.get()),
-                bg=UI_COLORS['bg_widget'], fg='#ddd',
-                selectcolor='#1e1e1e',
-                activebackground=UI_COLORS['bg_widget'],
-                activeforeground='#ddd',
-                cursor='hand2'
-            ).pack(side=tk.RIGHT)
-
-            # Range
-            tk.Label(row1, text="Range", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
-            range_var = tk.StringVar(value=range_labels[-3])
-            setattr(self, f"_ch_range_{board_type}_{ch}", range_var)
-
-            om = ttk.OptionMenu(
-                row1, range_var, range_var.get(), *range_labels,
-                command=lambda _=None: self._apply_channel_setting(
-                    board_type, ch, 'range', range_map.get(range_var.get(), 'PM_1_V')
-                )
-            )
-            om.pack(side=tk.LEFT, padx=(6, 0))
-
-            row2 = tk.Frame(blk, bg=UI_COLORS['bg_widget'])
-            row2.pack(fill=tk.X, padx=6, pady=(2, 6))
-
-            # Coupling
-            tk.Label(row2, text="Coupling", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
-            coup_var = tk.StringVar(value="DC")
-            setattr(self, f"_ch_coup_{board_type}_{ch}", coup_var)
-            ttk.OptionMenu(
-                row2, coup_var, coup_var.get(), *coupling_labels,
-                command=lambda _=None: self._apply_channel_setting(board_type, ch, 'coupling', coup_var.get())
-            ).pack(side=tk.LEFT, padx=(6, 14))
-
-            # Impedance
-            tk.Label(row2, text="Impedance", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
-            imp_var = tk.StringVar(value="50 Ω")
-            setattr(self, f"_ch_imp_{board_type}_{ch}", imp_var)
-            ttk.OptionMenu(
-                row2, imp_var, imp_var.get(), *impedance_labels,
-                command=lambda _=None: self._apply_channel_setting(
-                    board_type, ch, 'impedance', impedance_map.get(imp_var.get(), '50_OHM')
-                )
-            ).pack(side=tk.LEFT, padx=(6, 0))
-
-        _channel_block('A', 'Channel A', color_a)
-        _channel_block('B', 'Channel B', color_b)
-
-        # -------------------------
-        # Trigger
-        # -------------------------
-        trigger_box = tk.LabelFrame(
-            content, text="Trigger",
-            bg=UI_COLORS['bg_widget'], fg='white',
-            bd=1, relief=tk.GROOVE,
-            font=('Arial', 10, 'bold'),
-            labelanchor='nw'
-        )
-        trigger_box.pack(fill=tk.X, padx=10, pady=6)
-
-        trig_row = tk.Frame(trigger_box, bg=UI_COLORS['bg_widget'])
-        trig_row.pack(fill=tk.X, padx=8, pady=(6, 2))
-
-        tk.Button(
-            trig_row, text="Force",
-            command=lambda: self._force_trigger(board_type),
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', width=8
-        ).pack(side=tk.RIGHT)
-
-        # Trigger source
-        tk.Label(trig_row, text="Source", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
-        src_labels = ["External", "Channel A", "Channel B"]
-        src_map = {"External": "TRIG_EXTERNAL", "Channel A": "TRIG_CHAN_A", "Channel B": "TRIG_CHAN_B"}
-        src_var = tk.StringVar(value="External")
-        setattr(self, f"_trig_src_{board_type}", src_var)
-        ttk.OptionMenu(
-            trig_row, src_var, src_var.get(), *src_labels,
-            command=lambda _=None: self._apply_trigger_setting(board_type, 'sourceJ', src_map.get(src_var.get(), 'TRIG_EXTERNAL'))
-        ).pack(side=tk.LEFT, padx=(6, 12))
-
-        # Trigger slope
-        tk.Label(trig_row, text="Slope", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
-        slope_labels = ["Positive", "Negative"]
-        slope_map = {"Positive": "TRIGGER_SLOPE_POSITIVE", "Negative": "TRIGGER_SLOPE_NEGATIVE"}
-        slope_var = tk.StringVar(value="Positive")
-        setattr(self, f"_trig_slope_{board_type}", slope_var)
-        ttk.OptionMenu(
-            trig_row, slope_var, slope_var.get(), *slope_labels,
-            command=lambda _=None: self._apply_trigger_setting(board_type, 'slopeJ', slope_map.get(slope_var.get(), 'TRIGGER_SLOPE_POSITIVE'))
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        # Readout mode (TR vs NPT)
-        mode_row = tk.Frame(trigger_box, bg=UI_COLORS['bg_widget'])
-        mode_row.pack(fill=tk.X, padx=8, pady=(0, 2))
-
-        tk.Label(mode_row, text="Readout", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
-        readout_var = tk.StringVar(value="TR")
-        setattr(self, f"_readout_{board_type}", readout_var)
-        ttk.OptionMenu(
-            mode_row, readout_var, readout_var.get(), "TR", "NPT",
-            command=lambda _=None: self.update_readout_mode(board_type, readout_var.get())
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        # Level as percent
-        lvl_row = tk.Frame(trigger_box, bg=UI_COLORS['bg_widget'])
-        lvl_row.pack(fill=tk.X, padx=8, pady=(2, 6))
-
-        tk.Label(lvl_row, text="Level (%)", bg=UI_COLORS['bg_widget'], fg='#aaa').pack(side=tk.LEFT)
-
-        trigger_var = tk.DoubleVar(value=50.0)  # 50% = 128/255
-
-        def update_trigger_from_percent(event=None):
-            percent = float(trigger_var.get())
-            level_255 = int(max(0.0, min(100.0, percent)) * 255.0 / 100.0)
-            self.update_trigger_level(board_type, level_255)
-
-        spinbox = tk.Spinbox(
-            lvl_row,
-            from_=0, to=100,
-            textvariable=trigger_var,
-            width=6, font=('Arial', 10),
-            command=update_trigger_from_percent,
-            increment=1.0
-        )
-        spinbox.pack(side=tk.LEFT, padx=(6, 3))
-        spinbox.bind('<Return>', update_trigger_from_percent)
-
-        tk.Label(lvl_row, text="%", bg=UI_COLORS['bg_widget'], fg='#aaa', font=('Arial', 10)).pack(side=tk.LEFT)
-
-        self.trigger_vars[board_type] = trigger_var
-
-        # -------------------------
-        # Stats (kept, but visually grouped)
-        # -------------------------
-        stats_box = tk.LabelFrame(
-            content, text="Stats",
-            bg=UI_COLORS['bg_widget'], fg='white',
-            bd=1, relief=tk.GROOVE,
-            font=('Arial', 10, 'bold'),
-            labelanchor='nw'
-        )
-        stats_box.pack(fill=tk.X, padx=10, pady=(6, 10))
-
-        meta_frame = tk.Frame(stats_box, bg=UI_COLORS['bg_widget'])
-        meta_frame.pack(fill=tk.X, padx=10, pady=6)
-        
-        labels = {}
-        
-        row = 0
-        for label_text, key, default, fg_color in [
-            ("Rate:", 'rate', "0 Hz", 'white'),
-            ("Captures:", 'captures', "0", 'white'),
-            ("Last:", 'last', "--", 'white'),
-            ("Peak A:", 'peak_a', "0.000 V", color_a),
-            ("Peak B:", 'peak_b', "0.000 V", color_b),
-            ("Disk:", 'disk', "0.0 GB written", '#ffaa00'),  # CHANGED: "GB written"
-        ]:
-            tk.Label(meta_frame, text=label_text, bg=UI_COLORS['bg_widget'], fg='#aaa', anchor='w').grid(row=row, column=0, sticky='w', pady=2)
-            labels[key] = tk.Label(meta_frame, text=default, bg=UI_COLORS['bg_widget'], fg=fg_color, anchor='w', font=('Arial', 9, 'bold'))
-            labels[key].grid(row=row, column=1, sticky='w', padx=5, pady=2)
-            row += 1
-        
-        self.stats_labels[board_type] = labels
-        # Keep a boolean var around for programmatic enable/disable.
-        self.channel_b_vars[board_type] = tk.BooleanVar(value=True)
-        
-    def create_content_area(self, parent):
-        """Main content with tabs"""
-        content_frame = tk.Frame(parent, bg=UI_COLORS['bg_dark'])
-        content_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        
-        style = ttk.Style()
-        style.theme_use('default')
-        style.configure('TNotebook', background=UI_COLORS['bg_dark'], borderwidth=0)
-        style.configure('TNotebook.Tab', background=UI_COLORS['bg_medium'], foreground='white', padding=[20, 10])
-        style.map('TNotebook.Tab', background=[('selected', '#3d3d3d')])
-        
-        self.notebook = ttk.Notebook(content_frame)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
-        
-        self.create_overview_tab()
-        self.create_log_tab()
-        
-    def create_overview_tab(self):
-        """Overview - board name once, simplified titles, rolling integrals"""
-        overview_frame = tk.Frame(self.notebook, bg=UI_COLORS['bg_dark'])
-        self.notebook.add(overview_frame, text='Overview')
-        
-        self.fig = Figure(figsize=(14, 10), facecolor=UI_COLORS['bg_dark'])
-        
-        gs = self.fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
-        
-        self.ax_9352_A = self.fig.add_subplot(gs[0, 0])
-        self.ax_9352_B = self.fig.add_subplot(gs[1, 0])
-        self.ax_9352_int = self.fig.add_subplot(gs[2, 0])
-        
-        self.ax_9462_A = self.fig.add_subplot(gs[0, 1])
-        self.ax_9462_B = self.fig.add_subplot(gs[1, 1])
-        self.ax_9462_int = self.fig.add_subplot(gs[2, 1])
-        
-        # Board name ONCE at top only
-        self.style_axis(self.ax_9352_A, "A (V)", COLORS['9352']['A'], board_name="ATS-9352")
-        self.style_axis(self.ax_9352_B, "B (V)", COLORS['9352']['B'])
-        self.style_axis(self.ax_9352_int, "Integral (V·s)", COLORS['9352']['A'])
-        
-        self.style_axis(self.ax_9462_A, "A (V)", COLORS['9462']['A'], board_name="ATS-9462")
-        self.style_axis(self.ax_9462_B, "B (V)", COLORS['9462']['B'])
-        self.style_axis(self.ax_9462_int, "Integral (V·s)", COLORS['9462']['A'])
-        
-        self.lines = {}
-        self.lines['9352_A'], = self.ax_9352_A.plot([], [], color=COLORS['9352']['A'], linewidth=1.5)
-        self.lines['9352_B'], = self.ax_9352_B.plot([], [], color=COLORS['9352']['B'], linewidth=1.5)
-        self.lines['9352_intA'], = self.ax_9352_int.plot([], [], color=COLORS['9352']['A'], linewidth=2, label='Ch A')
-        self.lines['9352_intB'], = self.ax_9352_int.plot([], [], color=COLORS['9352']['B'], linewidth=2, label='Ch B')
-        self.ax_9352_int.legend(loc='upper left', fontsize=8)
-        
-        self.lines['9462_A'], = self.ax_9462_A.plot([], [], color=COLORS['9462']['A'], linewidth=1.5)
-        self.lines['9462_B'], = self.ax_9462_B.plot([], [], color=COLORS['9462']['B'], linewidth=1.5)
-        self.lines['9462_intA'], = self.ax_9462_int.plot([], [], color=COLORS['9462']['A'], linewidth=2, label='Ch A')
-        self.lines['9462_intB'], = self.ax_9462_int.plot([], [], color=COLORS['9462']['B'], linewidth=2, label='Ch B')
-        self.ax_9462_int.legend(loc='upper left', fontsize=8)
-        
-        self.canvas = FigureCanvasTkAgg(self.fig, master=overview_frame)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-    def style_axis(self, ax, ylabel, color, board_name=None):
-        """Style axis - board name shown once at top"""
-        ax.set_facecolor('#0a0a0a')
-        ax.set_ylabel(ylabel, color=color, fontweight='bold', fontsize=11)
-        ax.set_xlabel('Time (µs)', color='white', fontsize=9)
-        ax.tick_params(colors='white', labelsize=8)
-        ax.grid(True, alpha=0.15, color='white', linestyle='--', linewidth=0.5)
-        
-        if board_name:
-            ax.set_title(board_name, color='white', fontsize=12, fontweight='bold', pad=10)
-        
-        for spine in ax.spines.values():
-            spine.set_edgecolor('#555')
-            spine.set_linewidth(0.5)
-        
-    def create_log_tab(self):
-        """Log tab"""
-        log_frame = tk.Frame(self.notebook, bg=UI_COLORS['bg_dark'])
-        self.notebook.add(log_frame, text='Log')
-        
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            bg='#0a0a0a', fg='#00ff00',
-            font=('Courier', 9),
-            wrap=tk.WORD
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.log_message("CAPPY Dual-Board System Initialized")
-        self.log_message("-" * 80)
-
-    # ==================================================================================
-    # PERSISTED PATHS (YAML + DATA DIR) AND DEFAULT CREATION
-    # ==================================================================================
-
-    def _load_app_state_and_defaults(self) -> None:
-        """Load last-used YAML/data dirs and create defaults if missing."""
-        _ensure_dir(APP_STATE_DIR)
-        state = _read_json(APP_STATE_PATH)
-
-        p9352 = state.get("9352", {}).get("yaml_path")
-        p9462 = state.get("9462", {}).get("yaml_path")
-
-        self.config_path_9352 = Path(p9352) if p9352 else (APP_STATE_DIR / DEFAULT_CONFIG_9352_NAME)
-        self.config_path_9462 = Path(p9462) if p9462 else (APP_STATE_DIR / DEFAULT_CONFIG_9462_NAME)
-
-        if not self.config_path_9352.exists():
-            self.config_path_9352.write_text(DEFAULT_YAML_9352, encoding="utf-8")
-        if not self.config_path_9462.exists():
-            self.config_path_9462.write_text(DEFAULT_YAML_9462, encoding="utf-8")
-
-        # Preload configs so archive buttons work immediately
-        try:
-            if self.acq_9352 is None:
-                self.acq_9352 = BoardAcquisition('9352', self.config_path_9352, self.gui_queue)
-                self.acq_9352.load_config()
-            if self.acq_9462 is None:
-                self.acq_9462 = BoardAcquisition('9462', self.config_path_9462, self.gui_queue)
-                self.acq_9462.load_config()
+            self.cmb_date["values"] = dates
         except Exception:
             pass
 
-        # Ensure data dirs exist
-        for bt in ("9352", "9462"):
-            acq = self._get_acq(bt)
-            if not acq or not isinstance(acq.config, dict):
-                continue
-            data_dir = Path(acq.config.get("storage", {}).get("data_dir", str(APP_STATE_DIR / f"data_{bt}")))
-            if not data_dir.is_absolute():
-                data_dir = (Path.cwd() / data_dir).resolve()
-            _ensure_dir(data_dir)
-            acq.config.setdefault("storage", {})["data_dir"] = str(data_dir)
+        # Default to newest date unless user already selected one
+        if self._sel_date is None or self._sel_date not in dates:
+            self._sel_date = dates[0] if dates else None
 
-        self._save_app_state()
+        if self._sel_date is not None:
+            self.var_date.set(str(self._sel_date))
 
-    def _save_app_state(self) -> None:
-        state = _read_json(APP_STATE_PATH)
-        for bt in ("9352", "9462"):
-            acq = self._get_acq(bt)
-            if not acq:
-                continue
-            state.setdefault(bt, {})
-            state[bt]["yaml_path"] = str(self.config_path_9352 if bt == "9352" else self.config_path_9462)
-            try:
-                dd = Path(acq.config.get("storage", {}).get("data_dir", ""))
-                state[bt]["data_dir"] = str(dd)
-            except Exception:
-                pass
-        _write_json(APP_STATE_PATH, state)
-    # ==================================================================================
-    # EVENT HANDLERS
-    # ==================================================================================
+        # Hours for selected date
+        sub = self.snips[self.snips["_date"] == self._sel_date] if self._sel_date is not None else self.snips
+        counts = sub["_hour"].value_counts().sort_index()
+        hours = list(counts.index)
 
-    def _get_acq(self, board_type: str) -> Optional[BoardAcquisition]:
-        return self.acq_9352 if board_type == '9352' else self.acq_9462
+        for hh in hours:
+            self.hlist.insert(tk.END, f"{hh}:00  ({int(counts[hh])})")
 
-    def _ensure_acq(self, board_type: str) -> Optional[BoardAcquisition]:
-        # We allow config loading / archive browsing even if the ATS driver is unavailable.
-        # Hardware access is only required when starting acquisition.
+        if self._sel_hour is None or self._sel_hour not in hours:
+            self._sel_hour = str(hours[0]) if hours else None
 
-        if board_type == '9352':
-            if self.acq_9352 is None:
-                self.acq_9352 = BoardAcquisition('9352', self.config_path_9352, self.gui_queue)
-                self.acq_9352.load_config()
-            return self.acq_9352
-        else:
-            if self.acq_9462 is None:
-                self.acq_9462 = BoardAcquisition('9462', self.config_path_9462, self.gui_queue)
-                self.acq_9462.load_config()
-            return self.acq_9462
+        if self._sel_hour is not None and self._sel_hour in hours:
+            idx = hours.index(self._sel_hour)
+            self.hlist.selection_clear(0, tk.END)
+            self.hlist.selection_set(idx)
+            self.hlist.see(idx)
 
-    def start_board(self, board_type: str):
-        if not ATS_AVAILABLE:
-            messagebox.showerror("Error", "ATS API not available!")
+    def _apply_hour_filter(self):
+        """Render wlist using selected date/hour."""
+        self.wlist.delete(0, tk.END)
+        self._snips_view = pd.DataFrame()
+        if self.snips is None or self.snips.empty:
+            self.wlist.insert(tk.END, "(no saved waveforms)")
             return
-        acq = self._ensure_acq(board_type)
-        if acq is None:
-            messagebox.showerror("Error", "Failed to initialize board acquisition")
+        df = self.snips
+        if "_date" in df.columns and self._sel_date is not None:
+            df = df[df["_date"] == self._sel_date]
+        if "_hour" in df.columns and self._sel_hour is not None:
+            df = df[df["_hour"] == self._sel_hour]
+
+        self._snips_view = df.sort_values("timestamp_ns", ascending=False)
+
+        if self._snips_view.empty:
+            self.wlist.insert(tk.END, "(no saved waveforms in this hour)")
             return
-        acq.start()
-        self._board_running[board_type] = True
-        sv = getattr(self, f"_statevar_{board_type}", None)
-        if isinstance(sv, tk.StringVar):
-            sv.set("Running")
-        # Keep global state consistent for toolbar button
-        self.running = any(self._board_running.values())
-        if self.running:
-            self.play_pause_btn.config(text="⏸ Pause", bg='#FF5722')
 
-    def stop_board(self, board_type: str):
-        acq = self._get_acq(board_type)
-        if acq:
-            acq.stop()
-        self._board_running[board_type] = False
-        sv = getattr(self, f"_statevar_{board_type}", None)
-        if isinstance(sv, tk.StringVar):
-            sv.set("Stopped")
+        for _, r in self._snips_view.iterrows():
+            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
+            self.wlist.insert(tk.END, f"{ts.strftime('%H:%M:%S')}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
 
-        self.running = any(self._board_running.values())
-        if not self.running:
-            self.play_pause_btn.config(text="▶ Start", bg=UI_COLORS['play_button_bg'])
+    def _on_date(self, _=None):
+        if self.snips is None or self.snips.empty:
+            return
+        d = (self.var_date.get() or "").strip()
+        if not d:
+            return
+        self._sel_date = d
+        # reset hour selection so we pick first available for that date
+        self._sel_hour = None
+        self._populate_hours()
+        self._apply_hour_filter()
 
-    def _write_config(self, board_type: str):
-        acq = self._get_acq(board_type)
-        if not acq or not acq.config:
+    def _on_hour(self, _=None):
+        if self.snips is None or self.snips.empty:
+            return
+        sel = self.hlist.curselection()
+        if not sel:
+            return
+        txt = self.hlist.get(sel[0])
+        # 'HH:00  (N)'
+        self._sel_hour = txt.split(":")[0].strip()
+        self._apply_hour_filter()
+
+
+    def _seek_mmss(self):
+        """Jump to the snip closest to MM:SS within the currently selected date/hour."""
+        if getattr(self, "_snips_view", pd.DataFrame()).empty:
+            return
+        txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
+        if not txt:
+            return
+        # Parse MM:SS (allow SS or M:SS)
+        mm = 0
+        ss = 0
+        try:
+            if ":" in txt:
+                a, b = txt.split(":", 1)
+                mm = int(a)
+                ss = int(b)
+            else:
+                ss = int(txt)
+        except Exception:
+            messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
+            return
+        if ss < 0 or ss > 59 or mm < 0:
+            messagebox.showerror("Invalid time", "Seconds must be 0–59.")
+            return
+        if self._sel_date is None or self._sel_hour is None:
             return
         try:
-            cfg_path = acq.config_path
-            cfg_path.write_text(yaml.safe_dump(acq.config, sort_keys=False))
-        except Exception as e:
-            self.log_message(f"Warning: failed to write YAML for {COLORS[board_type]['name']}: {e}")
-
-    def _sync_sidebar_from_config(self, board_type: str):
-        """Best-effort sync of the sidebar widgets from the loaded YAML."""
-        acq = self._get_acq(board_type)
-        if not acq or not acq.config:
+            # Build a local-time target and compare in epoch ns
+            y, m, d = map(int, str(self._sel_date).split("-"))
+            hh = int(self._sel_hour)
+            target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
+            target_ns = int(target_local.timestamp() * 1e9)
+        except Exception:
             return
-        cfg = acq.config
-        ch_cfg = cfg.get('channels', {})
-        for ch in ('A', 'B'):
-            if ch not in ch_cfg:
-                continue
-            r = str(ch_cfg[ch].get('range', 'PM_1_V'))
-            c = str(ch_cfg[ch].get('coupling', 'DC'))
-            z = str(ch_cfg[ch].get('impedance', '50_OHM'))
 
-            rv = getattr(self, f"_ch_range_{board_type}_{ch}", None)
-            cv = getattr(self, f"_ch_coup_{board_type}_{ch}", None)
-            zv = getattr(self, f"_ch_imp_{board_type}_{ch}", None)
+        df = self._snips_view.copy()
+        # Find nearest timestamp
+        try:
+            idx_min = (df["timestamp_ns"].astype("int64") - target_ns).abs().idxmin()
+        except Exception:
+            return
+        # Position in the currently rendered order
+        try:
+            pos = df.reset_index().index[df.reset_index()["index"] == idx_min][0]
+        except Exception:
+            # fallback: brute force
+            pos = 0
+        self.wlist.selection_clear(0, tk.END)
+        self.wlist.selection_set(pos)
+        self.wlist.see(pos)
+        # trigger display
+        try:
+            self._on_snip()
+        except Exception:
+            pass
 
-            # map range code -> label if possible
-            range_label = None
-            for lbl, code in [
-                ("20 mV", "PM_20_MV"), ("40 mV", "PM_40_MV"), ("50 mV", "PM_50_MV"),
-                ("80 mV", "PM_80_MV"), ("100 mV", "PM_100_MV"), ("200 mV", "PM_200_MV"),
-                ("400 mV", "PM_400_MV"), ("800 mV", "PM_800_MV"), ("1 V", "PM_1_V"),
-                ("2 V", "PM_2_V"), ("4 V", "PM_4_V"),
-            ]:
-                if code == r:
-                    range_label = lbl
+    def _on_hour_wheel(self, evt):
+        # Mouse wheel scroll selects next/prev hour entry
+        if self.hlist.size() == 0:
+            return "break"
+        cur = self.hlist.curselection()
+        idx = int(cur[0]) if cur else 0
+        idx = max(0, min(self.hlist.size() - 1, idx + (-1 if evt.delta > 0 else 1)))
+        self.hlist.selection_clear(0, tk.END)
+        self.hlist.selection_set(idx)
+        self.hlist.see(idx)
+        self._on_hour()
+        return "break"
+
+    def _on_session(self, _=None):
+        sid = self._sel_sid()
+        if not sid:
+            return
+        self.snips = pd.DataFrame()
+        self._snip_db_dir = None
+
+        for ddir in self._iter_day_dirs() or []:
+            idx_dir = ddir / "index"
+            db = idx_dir / f"snips_{sid}.sqlite"
+            if db.exists():
+                conn = sqlite3.connect(db)
+                
+                try:
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,"
+                        "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+                        "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                        params=(sid,),
+                    )
+                except Exception:
+                    # Legacy DB schema (no channel-separated columns or baseline columns)
+                    try:
+                        self.snips = pd.read_sql_query(
+                            "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                            "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                            "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                            conn,
+                            params=(sid,),
+                        )
+                    except Exception:
+                        pass
+                conn.close()
+                self._snip_db_dir = ddir
+                break
+
+        self.wlist.delete(0, tk.END)
+        if self.snips.empty:
+            self.wlist.insert(tk.END, "(no saved waveforms)")
+            return
+        # Populate hour list and apply hour filter
+        self._populate_hours()
+        self._apply_hour_filter()
+        self._set_meta(f"Snips loaded: {len(self.snips):,}")
+
+    def _on_snip(self, _=None):
+        if self.snips.empty or self._snip_db_dir is None:
+            return
+        sel = self.wlist.curselection()
+        if not sel:
+            return
+        # listbox entry format: "HH:MM:SS  id=123  buf=..."
+        try:
+            txt = str(self.wlist.get(sel[0]))
+            # Extract the id value from "id=123"
+            for part in txt.split():
+                if part.startswith("id="):
+                    snip_id = int(part.split("=")[1])
                     break
-            if isinstance(rv, tk.StringVar) and range_label is not None:
-                rv.set(range_label)
-            if isinstance(cv, tk.StringVar):
-                cv.set("AC" if "AC" in c.upper() else "DC")
-            if isinstance(zv, tk.StringVar):
-                zv.set("1 MΩ" if "1M" in z.upper() else "50 Ω")
+            else:
+                return
+        except Exception:
+            return
 
-        # Trigger percent
-        trig = cfg.get('trigger', {})
-        level = int(trig.get('levelJ', 128))
-        percent = max(0.0, min(100.0, level * 100.0 / 255.0))
-        tv = self.trigger_vars.get(board_type)
-        if isinstance(tv, tk.DoubleVar):
-            tv.set(percent)
+        df = self._snips_view if (hasattr(self, '_snips_view') and not self._snips_view.empty) else self.snips
+        row = df[df["id"] == snip_id]
+        if row.empty:
+            self._set_meta(f"Error: Could not find snip with id={snip_id}")
+            return
+        r = row.iloc[0]
 
-        # Channel mask -> B enabled
-        acq_cfg = cfg.get('acquisition', {})
-        mask = str(acq_cfg.get('channels_mask', 'CHANNEL_A|CHANNEL_B'))
-        b_enabled = 'CHANNEL_B' in mask
-        dv = getattr(self, f"_ch_disabled_{board_type}_B", None)
-        if isinstance(dv, tk.BooleanVar):
-            dv.set(not b_enabled)
-    
-    def toggle_sidebar(self):
-        if self.sidebar_visible:
-            self.sidebar_frame.pack_forget()
-            self.sidebar_visible = False
+        try:
+            wa, wb = load_waveforms_from_row(r, self._snip_db_dir)
+        except Exception as e:
+            self._set_meta(f"Error loading waveform: {e}\nRow data: {r.to_dict()}")
+            import traceback
+            traceback.print_exc()
+            return
+
+        sr = float(r.get("sample_rate_hz", np.nan))
+        if not np.isfinite(sr) or sr <= 0:
+            sr = 1.0
+
+        # Get baseline values (mean voltage in baseline window, already computed during acquisition)
+        baseline_A = float(r.get("baseline_A_V", 0.0))
+        baseline_B = float(r.get("baseline_B_V", 0.0))
+        
+        # Fallback: If baseline values are missing (old data), calculate from waveform
+        # Using first 64 samples as baseline window (matching default config)
+        if baseline_A == 0.0 and len(wa) >= 64:
+            baseline_A = float(np.mean(wa[:64]))
+        if baseline_B == 0.0 and wb is not None and len(wb) >= 64:
+            baseline_B = float(np.mean(wb[:64]))
+        
+        # Apply baseline subtraction to waveforms for display
+        wa_bs = wa - baseline_A
+        wb_bs = wb - baseline_B if wb is not None else None
+
+        # Time axis with adaptive units (ns/us/ms/s)
+        tvec, unit = _auto_time_axis(len(wa), sr)
+
+        # Clear axes
+        self.axA.clear()
+        self.axB.clear()
+        self.axI.clear()
+
+        # Waveform A (baseline-subtracted)
+        self.axA.plot(tvec, wa_bs, color=NEON_PINK, linewidth=1.5)
+        self.axA.axhline(0, color='white', linewidth=0.5, linestyle='--', alpha=0.3)
+        self.axA.set_ylabel("A (V)", color=NEON_PINK)
+        self.axA.tick_params(colors=NEON_PINK)
+        self.axA.spines['left'].set_color(NEON_PINK)
+        self.axA.spines['bottom'].set_color('white')
+        self.axA.spines['top'].set_visible(False)
+        self.axA.spines['right'].set_visible(False)
+        self.axA.grid(True, alpha=0.15, color=NEON_PINK)
+
+        # Waveform B (baseline-subtracted if available)
+        if wb_bs is not None:
+            self.axB.plot(tvec, wb_bs, color=NEON_GREEN, linewidth=1.5)
+            self.axB.axhline(0, color='white', linewidth=0.5, linestyle='--', alpha=0.3)
+            self.axB.set_ylabel("B (V)", color=NEON_GREEN)
+            self.axB.tick_params(colors=NEON_GREEN)
+            self.axB.spines['left'].set_color(NEON_GREEN)
+            self.axB.spines['bottom'].set_color('white')
+            self.axB.spines['top'].set_visible(False)
+            self.axB.spines['right'].set_visible(False)
         else:
-            self.sidebar_frame.pack(side=tk.LEFT, fill=tk.Y, before=self.notebook.master)
-            self.sidebar_visible = True
+            self.axB.text(0.02, 0.5, "Channel B not captured in this snip", transform=self.axB.transAxes, color='white')
+            self.axB.set_ylabel("B (V)", color='white')
+            self.axB.tick_params(colors='white')
+            self.axB.spines['left'].set_color('white')
+            self.axB.spines['bottom'].set_color('white')
+            self.axB.spines['top'].set_visible(False)
+            self.axB.spines['right'].set_visible(False)
+        self.axB.grid(True, alpha=0.15, color='white')
 
-    def _apply_channel_setting(self, board_type: str, ch: str, key: str, value: str):
-        acq = self._ensure_acq(board_type)
-        if acq is None:
+        # Cumulative integral (V·s) - using baseline-subtracted waveforms
+        dt = 1.0 / sr
+        intA = np.cumsum(np.asarray(wa_bs, dtype=np.float64)) * dt
+        self.axI.plot(tvec, intA, color=NEON_PINK, linewidth=1.5, label="∫A dt")
+        if wb_bs is not None:
+            intB = np.cumsum(np.asarray(wb_bs, dtype=np.float64)) * dt
+            self.axI.plot(tvec, intB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="∫B dt")
+        self.axI.set_ylabel("Integral (V·s)", color='white')
+        self.axI.set_xlabel(f"Time ({unit})", color='white')
+        self.axI.tick_params(colors='white')
+        self.axI.spines['left'].set_color('white')
+        self.axI.spines['bottom'].set_color('white')
+        self.axI.spines['top'].set_visible(False)
+        self.axI.spines['right'].set_visible(False)
+        self.axI.grid(True, alpha=0.15, color='white')
+        legend = self.axI.legend(loc="best")
+        for text in legend.get_texts():
+            text.set_color('white')
+
+        self.canvas.draw()
+
+        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
+        a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
+        b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
+        self._set_meta(
+            f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
+            f"Session: {r.get('session_id','?')}\n"
+            f"Buffer: {int(r.get('buffer_index',-1))}  Record: {int(r.get('record_in_buffer',-1))}  Global: {int(r.get('record_global',-1))}\n"
+            f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
+            f"Area A: {float(r.get('area_A_Vs',0.0)):.6g} V·s   Peak A: {float(r.get('peak_A_V',0.0)):.6g} V\n"
+            f"Area B: {float(r.get('area_B_Vs',0.0)):.6g} V·s   Peak B: {float(r.get('peak_B_V',0.0)):.6g} V\n"
+            f"Baseline A: {baseline_A:.6g} V   Baseline B: {baseline_B:.6g} V\n"
+            f"Waveform points: {int(r.get('npts', len(wa)))}"
+        )
+
+    def _set_meta(self, s: str):
+        self.meta.configure(state=tk.NORMAL)
+        self.meta.delete("1.0", tk.END)
+        self.meta.insert(tk.END, s)
+        self.meta.configure(state=tk.DISABLED)
+
+
+
+
+
+
+    def _on_hour_wheel(self, evt):
+        # Mouse wheel scroll selects next/prev hour entry
+        if self.hlist.size() == 0:
+            return "break"
+        cur = self.hlist.curselection()
+        idx = int(cur[0]) if cur else 0
+        idx = max(0, min(self.hlist.size() - 1, idx + (-1 if evt.delta > 0 else 1)))
+        self.hlist.selection_clear(0, tk.END)
+        self.hlist.selection_set(idx)
+        self.hlist.see(idx)
+        self._on_hour()
+        return "break"
+
+    def _on_session(self, _=None):
+        sid = self._sel_sid()
+        if not sid:
             return
-        if acq.config is None:
-            acq.load_config()
-        acq.config.setdefault('channels', {}).setdefault(ch, {})[key] = value
-        self._write_config(board_type)
+        self.snips = pd.DataFrame()
+        self._snip_db_dir = None
 
-        # If acquisition is running, restart to apply channel inputControlEx.
-        if acq.running:
-            self.log_message(f"Applying {COLORS[board_type]['name']} {ch} {key}={value} (restart)")
-            self.stop_board(board_type)
-            time.sleep(0.2)
-            self.start_board(board_type)
+        # Locate the snips sqlite DB for this session in any day directory
+        for ddir in self._iter_day_dirs() or []:
+            idx_dir = ddir / "index"
+            db = idx_dir / f"snips_{sid}.sqlite"
+            if db.exists():
+                conn = sqlite3.connect(db)
+                try:
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,"
+                        "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+                        "area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                        params=(sid,),
+                    )
+                except Exception:
+                    # Legacy DB schema (no channel-separated columns)
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                        params=(sid,),
+                    )
+                conn.close()
+                self._snip_db_dir = ddir
+                break
 
-    def _apply_channel_disabled(self, board_type: str, ch: str, disabled: bool):
-        if ch == 'A' and disabled:
-            messagebox.showwarning("Not supported", "Channel A cannot be disabled (used for timing/plotting).")
-            dv = getattr(self, f"_ch_disabled_{board_type}_A", None)
-            if isinstance(dv, tk.BooleanVar):
-                dv.set(False)
+        self.wlist.delete(0, tk.END)
+        if self.snips.empty:
+            self.wlist.insert(tk.END, "(no saved waveforms)")
             return
 
-        if ch == 'B':
-            # Channel B enable/disable is implemented via channels_mask.
-            self.update_channel_b(board_type, not disabled)
+        # Populate hour list and apply hour filter
+        self._populate_hours()
+        self._apply_hour_filter()
+        self._set_meta(f"Snips loaded: {len(self.snips):,}")
 
-    def _apply_trigger_setting(self, board_type: str, key: str, value: str):
-        acq = self._ensure_acq(board_type)
-        if acq is None:
+
+    # --- Legacy callback compatibility (older bindings may call these names) ---
+    def _on_session_(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
+
+    def on_session(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
+
+    def on_session_(self, *args, **kwargs):
+        return self._on_session(*args, **kwargs)
+
+    def _on_snip_(self, *args, **kwargs):
+        return self._on_snip(*args, **kwargs)
+
+    def on_snip(self, *args, **kwargs):
+        return self._on_snip(*args, **kwargs)
+
+    def on_snip_(self, *args, **kwargs):
+        return self._on_snip(*args, **kwargs)
+
+class LiveDashboard(ttk.Frame):
+    """
+    Dashboard optimized for capture monitoring:
+      - Top stats: rate, captures, started, last capture, mean peak, board temperature
+      - Plots: mean integral history + latest waveform
+    Colors:
+      - Channel A: integral RED, waveform BLUE
+      - Channel B (if enabled): PINK (dashed)
+    """
+    def __init__(self, master, data_dir_var: tk.StringVar):
+        super().__init__(master, padding=6)
+        self.data_dir_var = data_dir_var
+        self.status_path: Optional[Path] = None
+        self.ring_path: Optional[Path] = None
+        self._ring_npts = 1024
+        self._ring_rec_bytes = None
+        self._ring_hdr_bytes = 32
+        self._ring_last_seq = 0
+        self._ring_play_seq = 0
+        self._ring_nslots = 0
+
+        # rolling history (x in seconds since capture start, to-scale)
+        self.t: list[float] = []
+        self.areaA: list[float] = []
+        self.areaB: list[float] = []
+
+        # rolling waveform history (store last N downsampled waveforms)
+        self._wfA_hist: list[np.ndarray] = []
+        self._wfB_hist: list[np.ndarray] = []
+        # rolling stream buffers for true scrolling (concatenate each buffer waveform)
+        self._streamA = np.empty((0,), dtype=np.float32)
+        self._streamB = np.empty((0,), dtype=np.float32)
+        self._stream_window = 20000  # points shown in scrolling mode
+
+        self._started_unix: Optional[float] = None
+        self._last_seen_seq: int = 0
+
+        # --- top stats ---
+        stats = ttk.Frame(self)
+        stats.pack(fill=tk.X, pady=(0, 6))
+
+        def mkrow(label: str):
+            f = ttk.Frame(stats)
+            f.pack(side=tk.LEFT, padx=(0, 14))
+            ttk.Label(f, text=label).pack(anchor="w")
+            v = ttk.Label(f, text="—")
+            v.pack(anchor="w")
+            return v
+
+        self.lbl_rate = mkrow("Rate (Hz)")
+        self.lbl_caps = mkrow("Captures (buffers)")
+        self.lbl_started = mkrow("Started")
+        self.lbl_last = mkrow("Last capture")
+        self.lbl_peak = mkrow("Mean peak (V)")
+        self.lbl_temp = mkrow("Board temp (°C)")
+
+        # --- plots ---
+        self.fig = plt.Figure(figsize=(8.2, 7.2))
+        self.fig.patch.set_facecolor('#1e1e1e')
+
+        # Scope-like layout: Channel A (top), Channel B (middle), Integration history (bottom)
+        self.ax_wfA = self.fig.add_subplot(311)
+        self.ax_wfA.set_facecolor('#2d2d2d')
+        self.ax_wfB = self.fig.add_subplot(312)
+        self.ax_wfB.set_facecolor('#2d2d2d')
+        self.ax_int = self.fig.add_subplot(313)
+        self.ax_int.set_facecolor('#2d2d2d')
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.meta = tk.Text(self, height=3, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
+        self.meta.pack(fill=tk.X, pady=(6, 0))
+        self.meta.configure(state=tk.DISABLED)
+
+        # Schedule periodic UI updates
+        if hasattr(self, "_tick"):
+            self.after(100, self._tick)
+        else:
+            # Fallback to avoid startup crash if _tick is missing due to editing/merge issues
+            self.after(100, lambda: None)
+
+    def _set_meta(self, s: str):
+        self.meta.configure(state=tk.NORMAL)
+        self.meta.delete("1.0", tk.END)
+        self.meta.insert(tk.END, s)
+        self.meta.configure(state=tk.DISABLED)
+
+    def _read_status(self) -> Optional[dict]:
+        data_dir = Path(self.data_dir_var.get()).expanduser()
+        p = data_dir / "status" / "cappy_status.json"
+        self.status_path = p
+        try:
+            if not p.exists():
+                return None
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _append_point(self, snap: dict):
+        seq = snap.get("status_seq", None)
+        if seq is None:
             return
-        if acq.config is None:
-            acq.load_config()
-        acq.config.setdefault('trigger', {})[key] = value
-        self._write_config(board_type)
+        try:
+            seq = int(seq)
+        except Exception:
+            return
+        if seq <= self._last_seen_seq:
+            return
+        self._last_seen_seq = seq
 
-        if acq.running:
+        su = snap.get("started_unix", None)
+        tu = snap.get("status_unix", None)
+        if su is not None:
             try:
-                acq._reconfigure_trigger()
-            except Exception as e:
-                self.log_message(f"Trigger update failed: {e}")
-
-    def _force_trigger(self, board_type: str):
-        acq = self._get_acq(board_type)
-        if not acq or not acq.board:
-            self.log_message(f"[{COLORS[board_type]['name']}] Force: board not connected")
+                self._started_unix = float(su)
+            except Exception:
+                pass
+        if self._started_unix is None and tu is not None:
+            try:
+                self._started_unix = float(tu)
+            except Exception:
+                pass
+        if self._started_unix is None or tu is None:
             return
-        # Some ATS models support forceTrigger; if not available, just log.
+
+        t = float(tu) - float(self._started_unix)
+        self.t.append(t)
+        self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
+        self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
+
+        while self.t and (self.t[-1] - self.t[0]) > 600.0:
+            self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
+
+
+    def _open_ring_from_status(self, snap: dict):
+        rp = snap.get("live_ring_path", None)
+        if not rp:
+            return
+        p = Path(str(rp)).expanduser()
+        if self.ring_path != p:
+            self.ring_path = p
+            # reset playback on ring change
+            self._ring_last_seq = 0
+            self._ring_play_seq = 0
+            self._wfA_hist.clear()
+            self._wfB_hist.clear()
+            self._streamA = np.empty((0,), dtype=np.float32)
+            self._streamB = np.empty((0,), dtype=np.float32)
+
+    def _read_ring_next(self):
+        """
+        Read the next available waveform record from the live ring.
+        Returns (wfA, wfB) as numpy arrays or (None, None) if nothing new.
+        """
+        if self.ring_path is None:
+            return None, None
+
         try:
-            if hasattr(acq.board, 'forceTrigger'):
-                acq.board.forceTrigger()
-                self.log_message(f"[{COLORS[board_type]['name']}] Forced trigger")
+            import struct
+            with open(self.ring_path, "rb", buffering=0) as f:
+                hdr = f.read(32)
+                if len(hdr) != 32:
+                    return None, None
+                magic, ver, nslots, npts, _rsv, write_seq = struct.unpack("<8sIIIIQ", hdr)
+                if magic != LiveRingWriter.MAGIC:
+                    return None, None
+                self._ring_nslots = int(nslots)
+                self._ring_npts = int(npts)
+                rec_bytes = (8 + 8 + 8 + 4 + 4) + (self._ring_npts * 4) + (self._ring_npts * 4)
+                self._ring_rec_bytes = rec_bytes
+                self._ring_last_seq = int(write_seq)
+
+                # initialize play seq to most recent history window on first open
+                if self._ring_play_seq == 0 and self._ring_last_seq > 0:
+                    # start just behind the head so the plot fills quickly
+                    self._ring_play_seq = max(1, self._ring_last_seq - 50)
+
+                if self._ring_play_seq >= self._ring_last_seq:
+                    return None, None
+
+                # read next record
+                self._ring_play_seq += 1
+                seq = self._ring_play_seq
+                slot = (seq - 1) % self._ring_nslots
+                off = self._ring_hdr_bytes + slot * rec_bytes
+                f.seek(off)
+                rec_hdr = f.read(8 + 8 + 8 + 4 + 4)
+                if len(rec_hdr) != (8 + 8 + 8 + 4 + 4):
+                    return None, None
+                r_seq, t_unix, buf_idx, chmask, _r = struct.unpack("<QdQII", rec_hdr)
+                if int(r_seq) != int(seq):
+                    # slot not yet written / overwritten; jump to last
+                    self._ring_play_seq = self._ring_last_seq
+                    return None, None
+
+                wfA = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
+                wfB = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
+                if (chmask & 2) == 0:
+                    wfB = None
+                return wfA, wfB
+        except Exception:
+            return None, None
+
+    def _redraw(self, snap: dict):
+        """
+        Redraw all plots with optimizations for smooth scrolling.
+        Uses smart axis limits and efficient plotting for better performance.
+        """
+        # Clear axes efficiently
+        self.ax_wfA.clear()
+        self.ax_wfB.clear()
+        self.ax_int.clear()
+
+        # --- Channel A waveform (top) - Optimized rendering ---
+        if self._streamA.size > 1:
+            # Use downsampled view if stream is very large for better performance
+            if self._streamA.size > 50000:
+                # Decimate for display only - use every Nth point
+                step = max(1, self._streamA.size // 20000)
+                x_view = np.arange(0, self._streamA.size, step)
+                y_view = self._streamA[::step]
             else:
-                self.log_message(f"[{COLORS[board_type]['name']}] Force trigger not supported by API")
-        except Exception as e:
-            self.log_message(f"[{COLORS[board_type]['name']}] Force trigger failed: {e}")
+                x_view = np.arange(self._streamA.size)
+                y_view = self._streamA
             
-    def toggle_acquisition(self):
-        if not self.running:
-            self.start_acquisition()
+            # Plot with reduced antialiasing for speed
+            line_a, = self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True, rasterized=True)
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
+            self.ax_wfA.set_xlabel("Rolling samples", color='white')
+            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.spines['left'].set_color(NEON_PINK)
+            self.ax_wfA.spines['bottom'].set_color('white')
+            self.ax_wfA.spines['top'].set_visible(False)
+            self.ax_wfA.spines['right'].set_visible(False)
+            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
         else:
-            self.stop_acquisition()
-            
-    def start_acquisition(self):
-        if not ATS_AVAILABLE:
-            messagebox.showerror("Error", "ATS API not available!")
-            return
-            
-        if self.acq_9352 is None:
-            self.acq_9352 = BoardAcquisition('9352', self.config_path_9352, self.gui_queue)
-            self.acq_9352.load_config()
-            
-        if self.acq_9462 is None:
-            self.acq_9462 = BoardAcquisition('9462', self.config_path_9462, self.gui_queue)
-            self.acq_9462.load_config()
-            
-        self.acq_9352.start()
-        self.acq_9462.start()
-        self._board_running['9352'] = True
-        self._board_running['9462'] = True
-        sv1 = getattr(self, "_statevar_9352", None)
-        sv2 = getattr(self, "_statevar_9462", None)
-        if isinstance(sv1, tk.StringVar):
-            sv1.set("Running")
-        if isinstance(sv2, tk.StringVar):
-            sv2.set("Running")
-        
-        self.running = True
-        self.play_pause_btn.config(
-            text="⏸ Pause",
-            bg='#FF5722'
-        )
-        self.log_message("=== ACQUISITION STARTED ===")
-        
-    def stop_acquisition(self):
-        if self.acq_9352:
-            self.acq_9352.stop()
-        if self.acq_9462:
-            self.acq_9462.stop()
+            self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
+            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
+            self.ax_wfA.set_xlabel("Rolling samples", color='white')
+            self.ax_wfA.tick_params(colors='white')
+            self.ax_wfA.spines['left'].set_color(NEON_PINK)
+            self.ax_wfA.spines['bottom'].set_color('white')
+            self.ax_wfA.spines['top'].set_visible(False)
+            self.ax_wfA.spines['right'].set_visible(False)
+            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
 
-        self._board_running['9352'] = False
-        self._board_running['9462'] = False
-        sv1 = getattr(self, "_statevar_9352", None)
-        sv2 = getattr(self, "_statevar_9462", None)
-        if isinstance(sv1, tk.StringVar):
-            sv1.set("Stopped")
-        if isinstance(sv2, tk.StringVar):
-            sv2.set("Stopped")
-            
-        self.running = False
-        self.play_pause_btn.config(
-            text="▶ Start",
-            bg=UI_COLORS['play_button_bg']
-        )
-        self.log_message("=== ACQUISITION STOPPED ===")
-        
-    def load_yaml(self, board_type):
-        filename = filedialog.askopenfilename(
-            title=f"Select {COLORS[board_type]['name']} Configuration",
-            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")]
-        )
-        
-        if filename:
-            if board_type == '9352':
-                self.config_path_9352 = Path(filename)
-                if self.acq_9352:
-                    self.acq_9352.load_config(self.config_path_9352)
+        # --- Channel B waveform (middle) - Optimized rendering ---
+        if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+            # Use downsampled view if stream is very large
+            if self._streamB.size > 50000:
+                step = max(1, self._streamB.size // 20000)
+                xb_view = np.arange(0, self._streamB.size, step)
+                yb_view = self._streamB[::step]
             else:
-                self.config_path_9462 = Path(filename)
-                if self.acq_9462:
-                    self.acq_9462.load_config(self.config_path_9462)
-                    
-            self.log_message(f"Loaded config for {COLORS[board_type]['name']}: {filename}")
-            # Ensure storage dir exists and persist
-            acq = self._get_acq(board_type)
-            if acq and isinstance(acq.config, dict):
-                dd = Path(acq.config.get('storage', {}).get('data_dir', '.'))
-                if not dd.is_absolute():
-                    dd = (Path.cwd() / dd).resolve()
-                _ensure_dir(dd)
-                acq.config.setdefault('storage', {})['data_dir'] = str(dd)
-            self._save_app_state()
-            self._sync_sidebar_from_config(board_type)
+                xb_view = np.arange(self._streamB.size)
+                yb_view = self._streamB
             
-    def select_data_dir(self, board_type):
-        directory = filedialog.askdirectory(
-            title=f"Select {COLORS[board_type]['name']} Data Directory"
-        )
+            line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
+            self.ax_wfB.set_xlabel("Rolling samples", color='white')
+            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.spines['left'].set_color(NEON_GREEN)
+            self.ax_wfB.spines['bottom'].set_color('white')
+            self.ax_wfB.spines['top'].set_visible(False)
+            self.ax_wfB.spines['right'].set_visible(False)
+            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
+        else:
+            self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
+            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
+            self.ax_wfB.set_xlabel("Rolling samples", color='white')
+            self.ax_wfB.tick_params(colors='white')
+            self.ax_wfB.spines['left'].set_color(NEON_GREEN)
+            self.ax_wfB.spines['bottom'].set_color('white')
+            self.ax_wfB.spines['top'].set_visible(False)
+            self.ax_wfB.spines['right'].set_visible(False)
+            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
+
+        # Integration history strip (bottom)
+        if self.t:
+            # Downsample integration history if very long for better performance
+            if len(self.t) > 5000:
+                step = max(1, len(self.t) // 2000)
+                t_view = self.t[::step]
+                areaA_view = self.areaA[::step]
+                areaB_view = self.areaB[::step] if self.areaB else []
+            else:
+                t_view = self.t
+                areaA_view = self.areaA
+                areaB_view = self.areaB
+            
+            self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=True, rasterized=True)
+            if areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
+                self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=True, rasterized=True)
+            self.ax_int.set_ylabel("Integral (V·s)", color='white')
+            self.ax_int.set_xlabel("Time (s)", color='white')
+            self.ax_int.tick_params(colors='white')
+            self.ax_int.spines['left'].set_color('white')
+            self.ax_int.spines['bottom'].set_color('white')
+            self.ax_int.spines['top'].set_visible(False)
+            self.ax_int.spines['right'].set_visible(False)
+            self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
+            legend = self.ax_int.legend(loc="best")
+            for text in legend.get_texts():
+                text.set_color('white')
+        else:
+            self.ax_int.set_title("Integration: waiting for data…", color='white')
+            self.ax_int.set_ylabel("Integral (V·s)", color='white')
+            self.ax_int.set_xlabel("Time (s)", color='white')
+            self.ax_int.tick_params(colors='white')
+            self.ax_int.spines['left'].set_color('white')
+            self.ax_int.spines['bottom'].set_color('white')
+            self.ax_int.spines['top'].set_visible(False)
+            self.ax_int.spines['right'].set_visible(False)
+            self.ax_int.grid(True, alpha=0.15, color='white', linestyle='-', linewidth=0.5)
+
+        # Use tight layout for better spacing
+        try:
+            self.fig.tight_layout(pad=0.5)
+        except Exception:
+            pass
         
-        if directory:
-            if board_type == '9352' and self.acq_9352:
-                self.acq_9352.config['storage']['data_dir'] = directory
-            elif board_type == '9462' and self.acq_9462:
-                self.acq_9462.config['storage']['data_dir'] = directory
-                
-            dd = Path(directory)
-            _ensure_dir(dd)
-            self.log_message(f"Data directory for {COLORS[board_type]['name']}: {dd}")
-            self._save_app_state()
-            
-    def update_trigger_level(self, board_type, level):
-        acq = self.acq_9352 if board_type == '9352' else self.acq_9462
-        if acq:
-            acq.update_trigger_level(level)
-            
-    def update_channel_b(self, board_type, enabled):
-        acq = self.acq_9352 if board_type == '9352' else self.acq_9462
-        if acq:
-            acq.update_channel_b_enabled(enabled)
-        dv = getattr(self, f"_ch_disabled_{board_type}_B", None)
-        if isinstance(dv, tk.BooleanVar):
-            dv.set(not enabled)
-            
-    
-    def update_readout_mode(self, board_type: str, mode: str):
-        """Set TR vs NPT mode (persists to YAML; restarts board if running)."""
-        mode_u = str(mode).strip().upper()
-        if mode_u not in ("TR", "NPT"):
-            mode_u = "TR"
+        # Efficient canvas draw with flush
+        self.canvas.draw_idle()  # Use draw_idle() instead of draw() for better performance
+        self.canvas.flush_events()
 
-        acq = self._ensure_acq(board_type)
-        if acq is None:
-            return
-        if acq.config is None:
-            acq.load_config()
+    def _tick(self):
+        snap = self._read_status()
+        if snap:
+            # stats
+            try:
+                self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
+            except Exception:
+                self.lbl_rate.configure(text=str(snap.get("rate_hz", "—")))
+            self.lbl_caps.configure(text=str(snap.get("buffers", "—")))
+            self.lbl_started.configure(text=str(snap.get("started", "—")))
+            self.lbl_last.configure(text=str(snap.get("last_capture", snap.get("time", "—"))))
 
-        acq.config.setdefault('runtime', {})['readout_mode'] = mode_u
-        self._write_config(board_type)
+            # mean peak stat (A [+ B])
+            pA = snap.get("buffer_mean_peak_A", None)
+            pB = snap.get("buffer_mean_peak_B", None)
+            try:
+                if pA is None:
+                    self.lbl_peak.configure(text="—")
+                else:
+                    if pB is not None and float(pB) != 0.0:
+                        self.lbl_peak.configure(text=f"A {float(pA):.6g}   B {float(pB):.6g}")
+                    else:
+                        self.lbl_peak.configure(text=f"{float(pA):.6g}")
+            except Exception:
+                self.lbl_peak.configure(text=str(pA))
 
-        if acq.running:
-            self.log_message(f"Applying {COLORS[board_type]['name']} readout_mode={mode_u} (restart)")
-            self.stop_board(board_type)
-            time.sleep(0.2)
-            self.start_board(board_type)
+            try:
+                live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
+                if 'stream_window_points' in live_cfg:
+                    self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
+            except Exception:
+                pass
 
-    def open_archive(self, board_type: str):
-        """Open the archive viewer for a given board ('9352' or '9462')."""
-        board_type = str(board_type).strip()
-        if board_type not in ("9352", "9462"):
-            messagebox.showwarning("Warning", f"Unknown board type: {board_type}")
-            return
+            bt = snap.get("board_temp_c", None)
+            self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
 
-        acq = self._ensure_acq(board_type)
-        if acq is None:
-            messagebox.showwarning("Warning", "Acquisition object not available for this board")
-            return
-        if acq.config is None:
-            acq.load_config()
+            self._open_ring_from_status(snap)
+            self._append_point(snap)
+            # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
+            try:
+                max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
+            except Exception:
+                max_wf = 20
+            for _ in range(max_wf):
+                wfA, wfB = self._read_ring_next()
+                if wfA is None and wfB is None:
+                    break
+                if wfA is not None:
+                    try:
+                        self._streamA = np.concatenate([self._streamA, wfA.astype(np.float32, copy=False)])
+                        if self._streamA.size > self._stream_window:
+                            self._streamA = self._streamA[-self._stream_window:]
+                    except Exception:
+                        pass
+                if wfB is not None:
+                    try:
+                        self._streamB = np.concatenate([self._streamB, wfB.astype(np.float32, copy=False)])
+                        if self._streamB.size > self._stream_window:
+                            self._streamB = self._streamB[-self._stream_window:]
+                    except Exception:
+                        pass
+            self._redraw(snap)
 
-        data_dir = Path(acq.config.get('storage', {}).get('data_dir', '.')).expanduser()
-        # If relative, anchor to ~/.cappy so it is stable across launches
-        if not data_dir.is_absolute():
-            data_dir = (Path.home() / ".cappy" / data_dir).resolve()
+            self._set_meta(f"State: {snap.get('state','?')}    Status: {self.status_path}")
+        # Schedule periodic UI updates
+        if hasattr(self, "_tick"):
+            self.after(100, self._tick)
+        else:
+            # Fallback to avoid startup crash if _tick is missing due to editing/merge issues
+            self.after(100, lambda: None)
 
-        # Ensure directory exists
+class _ProcLogPump:
+    """
+    Reads a subprocess' stdout in a background thread and pushes lines into a Queue.
+    Prevents Tkinter freezes from blocking readline().
+    """
+    def __init__(self, proc):
+        self.proc = proc
+        self.q: "queue.Queue[str]" = queue.Queue()
+        self._stop_evt = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
         try:
-            data_dir.mkdir(parents=True, exist_ok=True)
+            f = self.proc.stdout
+            if f is None:
+                return
+            for line in f:
+                if self._stop_evt.is_set():
+                    break
+                self.q.put(line.rstrip("\n"))
         except Exception as e:
-            messagebox.showwarning("Warning", f"Could not create/open data directory:\n{data_dir}\n{e}")
+            try:
+                self.q.put(f"[GUI] log pump error: {e}")
+            except Exception:
+                pass
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def drain(self, max_lines: int = 200):
+        out = []
+        for _ in range(max_lines):
+            try:
+                out.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+
+class LauncherGUI(tk.Tk):
+    """Simple launcher: Start Capture / Browse Archive / Open YAML."""
+    def __init__(self, script_path: Path):
+        super().__init__()
+        self.script_path = script_path
+        self.proc = None
+        self.pump = None
+        self._kill_after_id = None
+
+        # Apply dark mode theme
+        self.tk_setPalette(background='#2d2d2d', foreground='white', activeBackground='#404040', activeForeground='white')
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background='#2d2d2d')
+        style.configure('TLabel', background='#2d2d2d', foreground='white')
+        style.configure('TButton', background='#404040', foreground='white', borderwidth=1)
+        style.map('TButton', background=[('active', '#505050')])
+        style.configure('TNotebook', background='#2d2d2d', borderwidth=0)
+        style.configure('TNotebook.Tab', background='#404040', foreground='white', padding=[20, 10])
+        style.map('TNotebook.Tab', background=[('selected', '#505050')])
+        style.configure('TEntry', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white', borderwidth=1)
+        style.configure('TCombobox', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white')
+
+        self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
+        self.var_data_dir = tk.StringVar(value="dataFile")
+
+        # Auto-create default config so you never need to run `init` in a terminal.
+        cfgp = Path(self.var_config.get())
+        if not cfgp.exists():
+            try:
+                _atomic_write_text(cfgp, DEFAULT_YAML)
+            except Exception as ex:
+                messagebox.showerror('CAPPY', f'Failed to create default config {cfgp}: {ex}')
+
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="Config YAML:").pack(side=tk.LEFT)
+        ttk.Entry(top, textvariable=self.var_config, width=52).pack(side=tk.LEFT, padx=(6,8))
+        ttk.Button(top, text="Browse…", command=self._pick_yaml).pack(side=tk.LEFT)
+
+        ttk.Label(top, text="Data dir:").pack(side=tk.LEFT, padx=(16,4))
+        ttk.Entry(top, textvariable=self.var_data_dir, width=24).pack(side=tk.LEFT)
+
+        ttk.Button(top, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
+        ttk.Button(top, text="Browse Archive", command=self._browse).pack(side=tk.LEFT)
+
+        ctrl = ttk.Frame(self, padding=8)
+        ctrl.pack(fill=tk.X)
+
+        self.btn = ttk.Button(ctrl, text="Start Capture", command=self._toggle)
+        self.btn.pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Stop", command=self._stop).pack(side=tk.LEFT, padx=(8,0))
+        self.lbl = ttk.Label(ctrl, text="State: idle")
+        self.lbl.pack(side=tk.LEFT, padx=(16,0))
+
+        # Tabs (Overview + Log)
+        tabs = ttk.Notebook(self)
+        tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self.dashboard = LiveDashboard(tabs, self.var_data_dir)
+        tabs.add(self.dashboard, text="Overview")
+
+        logbox = ttk.Frame(tabs, padding=6)
+        tabs.add(logbox, text="Log")
+        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9))
+        self.log.pack(fill=tk.BOTH, expand=True)
+
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.after(100, self._poll)
+
+    def _append(self, s: str):
+        self.log.configure(state=tk.NORMAL)
+        self.log.insert(tk.END, s + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    def _pick_yaml(self):
+        p = filedialog.askopenfilename(title="Select YAML", filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")])
+        if p:
+            self.var_config.set(p)
+
+    def _open_yaml(self):
+        p = Path(self.var_config.get()).expanduser()
+        if not p.exists():
+            messagebox.showerror("Missing", f"Config not found:\n{p}")
+            return
+        try:
+            import os, subprocess
+            if os.name == "posix":
+                subprocess.Popen(["xdg-open", str(p)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                os.startfile(str(p))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _browse(self):
+        try:
+            win = tk.Toplevel(self)
+            win.title('CAPPY Archive')
+            app = ArchiveBrowser(Path(self.var_data_dir.get()), master=win)
+            app.pack(fill=tk.BOTH, expand=True)
+        except Exception as e:
+            messagebox.showerror('CAPPY', str(e))
+
+    def _toggle(self):
+        if self.proc is None:
+            self._start()
+        else:
+            self._stop()
+
+    def _start(self):
+        import subprocess
+        if self.proc is not None:
+            return
+        cfg_path = Path(self.var_config.get()).expanduser()
+        if not cfg_path.exists():
+            messagebox.showerror("Missing", f"Config not found:{cfg_path}")
             return
 
-        # Persist normalized path back into config/state so it stays attached
-        acq.config.setdefault('storage', {})['data_dir'] = str(data_dir)
-        self._write_config(board_type)
-
-        if not hasattr(self, "_archive_windows"):
-            self._archive_windows = {}
-
-        # Reuse an existing viewer per board
-        win = self._archive_windows.get(board_type)
+        # Clear Python bytecode cache to avoid stale imports and reduce startup churn
         try:
-            if win is not None and win.winfo_exists():
-                win.set_data_dir(data_dir) if hasattr(win, "set_data_dir") else None
-                win.lift()
-                win.focus_force()
+            removed = clear_pycache(self.script_path.parent)
+            self._append(f"[CAPPY] Cleared pycache (removed ~{removed} items)")
+        except Exception:
+            pass
+
+        cmd = [sys.executable, str(self.script_path), "capture", "--config", str(cfg_path)]
+        self._append("RUN: " + " ".join(cmd))
+
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=str(self.script_path.parent),
+            )
+            self.pump = _ProcLogPump(self.proc)
+        except Exception as e:
+            self.proc = None
+            self.pump = None
+            messagebox.showerror("CAPPY", f"Failed to start capture:\n{e}")
+            return
+
+        self.lbl.config(text="State: capturing")
+        self.btn.config(text="Stop Capture")
+
+    def _stop(self):
+        if self.proc is None:
+            return
+        try:
+            try:
+                self.proc.send_signal(signal.SIGINT)
+                self._append("[GUI] sent SIGINT")
+            except Exception:
+                self.proc.terminate()
+                self._append("[GUI] sent terminate")
+        except Exception as e:
+            self._append("[GUI] stop failed: " + str(e))
+
+        if self._kill_after_id is None:
+            self._kill_after_id = self.after(2500, self._kill_if_running)
+
+    def _kill_if_running(self):
+        self._kill_after_id = None
+        if self.proc is None:
+            return
+        try:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self._append("[GUI] forced kill")
+        except Exception as e:
+            self._append("[GUI] kill failed: " + str(e))
+
+    def _on_close(self):
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self._stop()
+                self.after(600, self.destroy)
                 return
         except Exception:
             pass
+        self.destroy()
 
-        title = f"{COLORS[board_type]['name']} Archive"
-        win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
-        self._archive_windows[board_type] = win
-    def log_message(self, message: str):
-        """Thread-safe-ish logger: prints to terminal and writes to the Log tab if available."""
-        try:
-            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        except Exception:
-            ts = ''
-        line = f"[{ts}] {message}" if ts else str(message)
-        # Always print so you have logs even if GUI isn't ready yet
-        try:
-            print(line)
-        except Exception:
-            pass
 
-        # If log widget not created yet, buffer messages
-        if not hasattr(self, '_log_buffer'):
-            self._log_buffer = []
-        if not hasattr(self, 'log_text') or self.log_text is None:
-            self._log_buffer.append(line)
-            # prevent unbounded growth
-            if len(self._log_buffer) > 2000:
-                self._log_buffer = self._log_buffer[-1000:]
-            return
+    def _poll(self):
+        if self.pump is not None:
+            for ln in self.pump.drain(max_lines=400):
+                self._append(ln)
 
-        # Flush buffered lines first
-        if self._log_buffer:
-            try:
-                for b in self._log_buffer:
-                    self.log_text.insert(tk.END, b + "\n")
-            except Exception:
-                pass
-            self._log_buffer.clear()
+        if self.proc is not None:
+            rc = self.proc.poll()
+            if rc is not None:
+                try:
+                    if self.pump is not None:
+                        for ln in self.pump.drain(max_lines=10000):
+                            self._append(ln)
+                        self.pump.stop()
+                except Exception:
+                    pass
+                self._append(f"[GUI] DAQ exited rc={rc}")
+                self.proc = None
+                self.pump = None
+                self.lbl.config(text="State: idle")
+                self.btn.config(text="Start Capture")
 
-        try:
-            self.log_text.insert(tk.END, line + "\n")
-            self.log_text.see(tk.END)
-        except Exception:
-            # widget may be destroyed during shutdown
-            pass
-    def update_from_queue(self):
-        try:
-            while True:
-                msg = self.gui_queue.get_nowait()
-                msg_type = msg[0]
-            
-                if msg_type == 'log':
-                    self.log_message(msg[1])
-                
-                elif msg_type == 'stats':
-                    board_type = msg[1]
-                    stats = msg[2]
-                    self.update_stats_display(board_type, stats)
-                
-                elif msg_type == 'waveform':
-                    self.update_waveform_display(msg[1])
-                
-        except queue.Empty:
-            pass
-        finally:
-            self.root.after(50, self.update_from_queue)
-        
-    def update_stats_display(self, board_type, stats: AcquisitionStats):
-        if board_type not in self.stats_labels:
-            return
-        
-        labels = self.stats_labels[board_type]
-    
-        labels['rate'].config(text=f"{stats.rate_hz:.1f} Hz")
-        labels['captures'].config(text=f"{stats.captures}")
-        labels['last'].config(text=stats.last_capture.split()[1] if stats.last_capture else "--")
-        labels['peak_a'].config(text=f"{stats.mean_peak_a:.6f} V")
-        labels['peak_b'].config(text=f"{stats.mean_peak_b:.6f} V")
-        labels['disk'].config(text=f"{stats.data_written_gb:.1f} GB written")  # CHANGED
-    
-    def update_waveform_display(self, wf_data):
-        board_type = wf_data['board']
-        wfA = wf_data['wfA']
-        wfB = wf_data['wfB']
-        integralA = wf_data['integralA']
-        integralB = wf_data['integralB']
-        timestamp = wf_data['time']
-    
-        data = self.waveform_data[board_type]
-        data['A'].append(wfA)
-        data['B'].append(wfB if wfB is not None else np.zeros_like(wfA))
-        data['intA'].append(integralA)
-        data['intB'].append(integralB)
-        data['time'].append(timestamp)
-    
-        if len(data['A']) > self.max_plot_points:
-            data['A'].pop(0)
-            data['B'].pop(0)
-            data['intA'].pop(0)
-            data['intB'].pop(0)
-            data['time'].pop(0)
-        
-        # Refresh plots more responsively (throttled)
-        now = time.time()
-        if not hasattr(self, '_last_plot_time'):
-            self._last_plot_time = 0.0
-        if (now - self._last_plot_time) >= 0.08:
-            self._last_plot_time = now
-            self.refresh_plots()
-        
-    def refresh_plots(self):
-        """Redraw plots with ROLLING TIME for integrals"""
-        for board_type in ['9352', '9462']:
-            data = self.waveform_data[board_type]
-        
-            if not data['A']:
-                continue
-            
-            wfA = data['A'][-1]
-            wfB = data['B'][-1]
-        
-            sample_rate = 250e6 if board_type == '9352' else 180e6
-            time_us = np.arange(len(wfA)) / sample_rate * 1e6
-        
-            prefix = f"{board_type}_"
-            self.lines[prefix + 'A'].set_data(time_us, wfA)
-            self.lines[prefix + 'B'].set_data(time_us, wfB)
-        
-            # ROLLING TIME for integrals
-            if len(data['time']) > 0:
-                if board_type not in self.integral_start_time:
-                    self.integral_start_time[board_type] = data['time'][0]
-            
-                int_times = np.array(data['time']) - self.integral_start_time[board_type]
-            
-                current_time = int_times[-1]
-                window_start = max(0, current_time - self.integral_time_window)
-            
-                mask = int_times >= window_start
-                int_times_windowed = int_times[mask]
-                intA_windowed = np.array(data['intA'])[mask]
-                intB_windowed = np.array(data['intB'])[mask]
-            
-                self.lines[prefix + 'intA'].set_data(int_times_windowed, intA_windowed)
-                self.lines[prefix + 'intB'].set_data(int_times_windowed, intB_windowed)
-            
-                ax_int = self.ax_9352_int if board_type == '9352' else self.ax_9462_int
-                # Guard against identical x-limits (can happen at startup)
-                if current_time <= window_start:
-                    current_time = window_start + 1e-6
-                ax_int.set_xlim(window_start, current_time)
-                ax_int.set_xlabel('Time (s)', color='white', fontsize=9)
-        
-            ax_map = {
-                '9352': (self.ax_9352_A, self.ax_9352_B),
-                '9462': (self.ax_9462_A, self.ax_9462_B)
-            }
-        
-            for ax in ax_map[board_type]:
-                ax.relim()
-                ax.autoscale_view()
-            
-        self.canvas.draw_idle()
+        self.after(100, self._poll)
 
+
+def run_browse(data_dir: Path) -> int:
+    root = tk.Tk()
+    root.title('CAPPY Archive')
+    app = ArchiveBrowser(data_dir, master=root)
+    app.pack(fill=tk.BOTH, expand=True)
+    root.mainloop()
+    return 0
 
 def main() -> int:
-    try:
-        root = tk.Tk()
-        _app = DualBoardGUI(root)
-        root.mainloop()
-        return 0
-    except Exception as e:
-        print(f"\nFATAL ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+    argv = sys.argv[1:]
+    if not argv:
+        argv = ["gui"]
+    if argv and argv[0] not in {"init","capture","browse","gui"}:
+        ap = argparse.ArgumentParser(prog="CAPPY_v1_3 (legacy)")
+        ap.add_argument("--config", default="CAPPY_v1_3.yaml")
+        args = ap.parse_args(argv)
+        return run_capture(Path(args.config))
 
-# ==================================================================================
-# ENTRY POINT
-# ==================================================================================
+    ap = argparse.ArgumentParser(prog="CAPPY_v1_3")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init")
+    cap = sub.add_parser("capture")
+    cap.add_argument("--config", default="CAPPY_v1_3.yaml")
+    br = sub.add_parser("browse")
+    br.add_argument("--data_dir", default="dataFile")
+    sub.add_parser("gui")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd == "init":
+        p = Path("CAPPY_v1_3.yaml")
+        if not p.exists():
+            _atomic_write_text(p, DEFAULT_YAML)
+        print("[CAPPY] init done")
+        return 0
+    if args.cmd == "capture":
+        return run_capture(Path(args.config))
+    if args.cmd == "browse":
+        return run_browse(Path(args.data_dir))
+    if args.cmd == "gui":
+        LauncherGUI(Path(__file__).resolve()).mainloop()
+        return 0
+    return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
