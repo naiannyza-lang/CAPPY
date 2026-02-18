@@ -403,251 +403,6 @@ BoardAcquisition class with ATS-9352 connection fix and data_written tracking.
 # BOARD ACQUISITION CLASS
 # ==================================================================================
 
-
-# ==================================================================================
-# Legacy-compatible archive writer (v1.x format)
-#   Layout under <data_dir>/captures/YYYY/YYYY-MM/YYYY-MM-DD/:
-#     index/snips_<session>.sqlite
-#     session_index.parquet
-#     <HH:00>/waveforms/A_snips_<session>_<YYYYMMDD_HHMM>.bin (+ B_...)
-# ==================================================================================
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def _captures_day_dir(data_dir: Path, ts_ns: int) -> Path:
-    dt = datetime.fromtimestamp(ts_ns / 1e9)
-    y = dt.strftime("%Y")
-    ym = dt.strftime("%Y-%m")
-    ymd = dt.strftime("%Y-%m-%d")
-    return data_dir / "captures" / y / ym / ymd
-
-class WaveBinSqliteStore:
-    """Write waveform snippets to time-rolled .bin files + SQLite index (WAL)."""
-
-    def __init__(self, day_dir: Path, session_id: str, rollover_minutes: int = 10, commit_every: int = 200):
-        self.day_dir = Path(day_dir)
-        self.session_id = str(session_id)
-        self.rollover_minutes = max(1, int(rollover_minutes))
-        self.commit_every = max(1, int(commit_every))
-        _ensure_dir(self.day_dir)
-
-        idx_dir = self.day_dir / "index"
-        _ensure_dir(idx_dir)
-        self.db_path = idx_dir / f"snips_{self.session_id}.sqlite"
-
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
-
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS snips (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              session_id TEXT,
-              timestamp_ns INTEGER,
-              buffer_index INTEGER,
-              record_in_buffer INTEGER,
-              record_global INTEGER,
-              channels_mask TEXT,
-              sample_rate_hz REAL,
-              n_samples INTEGER,
-
-              n_channels INTEGER,
-              file TEXT,
-              offset_bytes INTEGER,
-              nbytes INTEGER,
-
-              file_A TEXT,
-              offset_A INTEGER,
-              nbytes_A INTEGER,
-              file_B TEXT,
-              offset_B INTEGER,
-              nbytes_B INTEGER,
-
-              area_A_Vs REAL,
-              peak_A_V REAL,
-              baseline_A_V REAL,
-              area_B_Vs REAL,
-              peak_B_V REAL,
-              baseline_B_V REAL
-            );
-        """)
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_snips_session_time ON snips(session_id, timestamp_ns);")
-        self.conn.commit()
-
-        self._fhA = None
-        self._fhB = None
-        self._bin_key = None
-        self._bin_hour = None
-        self._rows_since_commit = 0
-
-        self._n_snips = 0
-
-    def _hour_dir(self, ts_ns: int):
-        dt = datetime.fromtimestamp(ts_ns / 1e9)
-        hour = dt.strftime("%H:00")
-        p = self.day_dir / hour / "waveforms"
-        _ensure_dir(p)
-        return hour, p
-
-    def _minute_key(self, ts_ns: int) -> str:
-        return datetime.fromtimestamp(ts_ns / 1e9).strftime("%Y%m%d_%H%M")
-
-    def _open_bins(self, ts_ns: int, key: str):
-        hour, base = self._hour_dir(ts_ns)
-        pathA = base / f"A_snips_{self.session_id}_{key}.bin"
-        pathB = base / f"B_snips_{self.session_id}_{key}.bin"
-        self._fhA = open(pathA, "ab", buffering=0)
-        self._fhB = open(pathB, "ab", buffering=0)
-        self._bin_key = key
-        self._bin_hour = hour
-
-    def _close_bins(self):
-        for fh in (self._fhA, self._fhB):
-            try:
-                if fh:
-                    fh.close()
-            except Exception:
-                pass
-        self._fhA = None
-        self._fhB = None
-        self._bin_key = None
-        self._bin_hour = None
-
-    def _maybe_roll(self, ts_ns: int):
-        key = self._minute_key(ts_ns)
-        hour, _ = self._hour_dir(ts_ns)
-
-        if self._bin_key is None or self._fhA is None or self._fhB is None or self._bin_hour is None:
-            self._open_bins(ts_ns, key)
-            return
-
-        if hour != self._bin_hour:
-            self._close_bins()
-            self._open_bins(ts_ns, key)
-            return
-
-        try:
-            t0 = datetime.strptime(self._bin_key, "%Y%m%d_%H%M")
-            t1 = datetime.strptime(key, "%Y%m%d_%H%M")
-            if (t1 - t0).total_seconds() >= 60 * self.rollover_minutes:
-                self._close_bins()
-                self._open_bins(ts_ns, key)
-        except Exception:
-            self._close_bins()
-            self._open_bins(ts_ns, key)
-
-    def append(self,
-               ts_ns: int,
-               buffer_index: int,
-               record_in_buffer: int,
-               record_global: int,
-               channels_mask: str,
-               sample_rate_hz: float,
-               wfA_V: np.ndarray,
-               wfB_V: Optional[np.ndarray],
-               area_A_Vs: float,
-               peak_A_V: float,
-               baseline_A_V: float,
-               area_B_Vs: float,
-               peak_B_V: float,
-               baseline_B_V: float):
-
-        self._maybe_roll(ts_ns)
-        assert self._fhA is not None and self._fhB is not None
-
-        wfA = np.asarray(wfA_V, dtype=np.float32)
-        offA = self._fhA.tell()
-        bA = wfA.tobytes(order="C")
-        self._fhA.write(bA)
-
-        fileA = str((Path(self._bin_hour) / "waveforms" / Path(self._fhA.name).name))
-
-        if wfB_V is not None:
-            wfB = np.asarray(wfB_V, dtype=np.float32)
-            offB = self._fhB.tell()
-            bB = wfB.tobytes(order="C")
-            self._fhB.write(bB)
-            fileB = str((Path(self._bin_hour) / "waveforms" / Path(self._fhB.name).name))
-            n_channels = 2
-            n_samples = int(wfA.size)
-        else:
-            offB = None
-            bB = b""
-            fileB = None
-            n_channels = 1
-            n_samples = int(wfA.size)
-
-        # Legacy combined payload fields left NULL/0 (we store channel-separated)
-        self.conn.execute(
-            "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,"
-            "sample_rate_hz,n_samples,n_channels,"
-            "file,offset_bytes,nbytes,"
-            "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
-            "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                self.session_id, int(ts_ns), int(buffer_index), int(record_in_buffer), int(record_global),
-                str(channels_mask),
-                float(sample_rate_hz), int(n_samples), int(n_channels),
-                None, None, None,
-                fileA, int(offA), int(len(bA)),
-                fileB, (int(offB) if offB is not None else None), (int(len(bB)) if wfB_V is not None else None),
-                float(area_A_Vs), float(peak_A_V), float(baseline_A_V),
-                float(area_B_Vs), float(peak_B_V), float(baseline_B_V),
-            )
-        )
-        self._rows_since_commit += 1
-        self._n_snips += 1
-
-        if self._rows_since_commit >= self.commit_every:
-            try:
-                self.conn.commit()
-            except Exception:
-                pass
-            self._rows_since_commit = 0
-
-    def finalize(self):
-        try:
-            self.conn.commit()
-        except Exception:
-            pass
-        try:
-            self._close_bins()
-        except Exception:
-            pass
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-
-def _update_session_index(day_dir: Path, session_id: str, first_ns: int, last_ns: int, waveform_snips: int):
-    """Append/update session_index.parquet inside the day_dir."""
-    try:
-        idx = Path(day_dir) / "session_index.parquet"
-        row = {
-            "date": Path(day_dir).name,
-            "session_id": str(session_id),
-            "first_timestamp_ns": int(first_ns),
-            "last_timestamp_ns": int(last_ns),
-            "waveform_snips": int(waveform_snips),
-        }
-        if idx.exists():
-            try:
-                df = pd.read_parquet(idx)
-            except Exception:
-                df = pd.DataFrame()
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        else:
-            df = pd.DataFrame([row])
-        # Keep newest first
-        df = df.sort_values("first_timestamp_ns", ascending=False)
-        df.to_parquet(idx, index=False)
-    except Exception:
-        # Don't break acquisition if parquet writing fails
-        pass
-
-
 class BoardAcquisition:
     """
     Handles data acquisition for a single board (9352 or 9462).
@@ -1031,48 +786,36 @@ class BoardAcquisition:
             
             self.stats.started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # ---- Legacy-compatible archive storage (auto-create) ----
-            self._data_dir = None
-            self._day_dir = None
-            self._session_id = None
-            self._snip_store = None
-            self._session_first_ns = None
-            self._session_last_ns = None
-
+            # ---- Persistent capture storage (auto-create) ----
             try:
-                dd = Path(self.config.get('storage', {}).get('data_dir', f"dataFile_ATS{self.board_type}")).expanduser()
-                if not dd.is_absolute():
-                    dd = (Path.cwd() / dd).resolve()
-                _ensure_dir(dd)
-
-                ts0 = time.time_ns()
-                day_dir = _captures_day_dir(dd, ts0)
-                _ensure_dir(day_dir)
-
-                session_id = datetime.fromtimestamp(ts0 / 1e9).strftime("%Y%m%d_%H%M%S")
-                rollover = int(self.config.get('storage', {}).get('rollover_minutes', 10) or 10)
-                commit_every = int(self.config.get('storage', {}).get('commit_every', 200) or 200)
-
-                self._data_dir = dd
-                self._day_dir = day_dir
-                self._session_id = session_id
-                self._snip_store = WaveBinSqliteStore(day_dir, session_id, rollover_minutes=rollover, commit_every=commit_every)
-                self._session_first_ns = ts0
-                self._session_last_ns = ts0
-
-                # Persist resolved data_dir back into config for archive viewer
-                self.config.setdefault('storage', {})['data_dir'] = str(dd)
-
+                _dd = Path(self.config.get('storage', {}).get('data_dir', f"dataFile_ATS{self.board_type}")).expanduser()
+                if not _dd.is_absolute():
+                    _dd = (Path.cwd() / _dd).resolve()
+                (_dd).mkdir(parents=True, exist_ok=True)
+                _captures_root = _dd / "captures"
+                _date = datetime.now().strftime("%Y-%m-%d")
+                _hour = datetime.now().strftime("%H%M")
+                _session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self._session_dir = _captures_root / _date / _hour / _session_id
+                self._session_dir.mkdir(parents=True, exist_ok=True)
+                self._index_path = self._session_dir / "snips.csv"
+                if not self._index_path.exists():
+                    self._index_path.write_text(
+                        "buf_index,timestamp_ns,sample_rate_hz,file,channels\n",
+                        encoding="utf-8",
+                    )
                 self._save_every = int(self.config.get('storage', {}).get('save_every_buffers', 1) or 1)
                 self._save_every = max(1, self._save_every)
-
-                self._log(f"Archive day dir: {day_dir}")
-                self._log(f"Archive session: {session_id} (save_every={self._save_every})")
+                # Persist resolved data_dir back into config for archive viewer
+                self.config.setdefault('storage', {})['data_dir'] = str(_dd)
+                self._log(f"Saving captures under: {self._session_dir}")
             except Exception as _e:
+                self._session_dir = None
+                self._index_path = None
                 self._save_every = 0
-                self._log(f"Warning: archive saving disabled (could not init storage): {_e}")
-            buf_count = 0
+                self._log(f"Warning: capture saving disabled (could not init storage): {_e}")
 
+            buf_count = 0
             last_stats_time = time.time()
             
             while self.running:
@@ -1101,41 +844,40 @@ class BoardAcquisition:
                     integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
                     integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
 
-                    # ---- Save to legacy archive (snips sqlite + bin files) ----
-                    if self._snip_store is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
+                    # ---- Save to disk (per buffer) ----
+                    if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
                         try:
                             ts_ns = time.time_ns()
-                            self._session_last_ns = ts_ns
-
-                            # Basic baseline estimate (first 16 samples)
-                            nbase = min(16, len(wfA_volts))
-                            baseline_A = float(np.mean(wfA_volts[:nbase])) if nbase > 0 else 0.0
-                            baseline_B = float(np.mean(wfB_volts[:nbase])) if (wfB_volts is not None and nbase > 0) else 0.0
-
-                            area_A = float(integralA)
-                            area_B = float(integralB) if wfB_volts is not None else 0.0
-                            peak_A = float(np.max(np.abs(wfA_volts))) if wfA_volts is not None else 0.0
-                            peak_B = float(np.max(np.abs(wfB_volts))) if wfB_volts is not None else 0.0
-
-                            chmask_txt = "CHANNEL_A|CHANNEL_B" if wfB_volts is not None else "CHANNEL_A"
-                            self._snip_store.append(
-                                ts_ns=int(ts_ns),
-                                buffer_index=int(buf_count),
-                                record_in_buffer=0,
-                                record_global=int(buf_count),
-                                channels_mask=chmask_txt,
-                                sample_rate_hz=float(self.sample_rate_hz),
-                                wfA_V=wfA_volts,
-                                wfB_V=wfB_volts,
-                                area_A_Vs=area_A,
-                                peak_A_V=peak_A,
-                                baseline_A_V=baseline_A,
-                                area_B_Vs=area_B,
-                                peak_B_V=peak_B,
-                                baseline_B_V=baseline_B,
-                            )
+                            fname = f"buf_{buf_count:06d}.npz"
+                            fpath = self._session_dir / fname
+                            if wfB_volts is None:
+                                np.savez_compressed(
+                                    fpath,
+                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
+                                    sample_rate_hz=float(self.sample_rate_hz),
+                                    timestamp_ns=int(ts_ns),
+                                    board=str(self.board_type),
+                                    channels="A",
+                                )
+                                chs = "A"
+                            else:
+                                np.savez_compressed(
+                                    fpath,
+                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
+                                    wfB_V=wfB_volts.astype(np.float32, copy=False),
+                                    sample_rate_hz=float(self.sample_rate_hz),
+                                    timestamp_ns=int(ts_ns),
+                                    board=str(self.board_type),
+                                    channels="A|B",
+                                )
+                                chs = "A|B"
+                            if self._index_path is not None:
+                                with open(self._index_path, "a", encoding="utf-8") as _fp:
+                                    _fp.write(f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},{chs}\n")
                         except Exception as _se:
+                            # Don't kill acquisition if disk write fails
                             self._log(f"Save warning: {_se}")
+
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self.stats.mean_peak_a = float(np.max(np.abs(wfA_volts)))
@@ -1167,31 +909,6 @@ class BoardAcquisition:
             traceback.print_exc()
             
         finally:
-            # Flush archive writers (do not raise)
-            try:
-                store = getattr(self, "_snip_store", None)
-                n_snips = int(getattr(store, "_n_snips", 0) or 0) if store is not None else 0
-                if store is not None:
-                    try:
-                        store.finalize()
-                    finally:
-                        self._snip_store = None
-            except Exception:
-                n_snips = int(getattr(self.stats, "captures", 0) or 0)
-            except Exception:
-                pass
-            try:
-                if getattr(self, "_day_dir", None) is not None and getattr(self, "_session_id", None) is not None:
-                    first_ns = int(getattr(self, "_session_first_ns", 0) or 0)
-                    last_ns = int(getattr(self, "_session_last_ns", 0) or first_ns)
-                    n_snips = int(locals().get('n_snips', 0) or 0)
-                    # If store already cleared, attempt to infer from stats
-                    if n_snips <= 0:
-                        n_snips = int(getattr(self.stats, "captures", 0) or 0)
-                    _update_session_index(Path(self._day_dir), str(self._session_id), first_ns, last_ns, n_snips)
-            except Exception:
-                pass
-
             try:
                 if self.board:
                     self.board.abortAsyncRead()
@@ -1254,304 +971,364 @@ class CollapsibleFrame(tk.Frame):
             self.show.set(True)
 
 
-class ArchiveViewer(tk.Toplevel):
-    """Lightweight archive browser that auto-attaches to a data_dir (no file picking)."""
-
-    def __init__(self, parent, data_dir: Path, title: str = "Archive"):
-        super().__init__(parent)
-        self.title(title)
-        self.configure(bg=UI_COLORS['bg_dark'])
-        self.geometry("900x650")
-        self.minsize(700, 450)
-
-        self.data_dir = Path(data_dir)
-        self.captures_root = self.data_dir / "captures"
-
-        top = tk.Frame(self, bg=UI_COLORS['bg_medium'])
-        top.pack(fill=tk.X)
-
-        tk.Label(top, text=title, bg=UI_COLORS['bg_medium'], fg="white",
-                 font=("Arial", 11, "bold")).pack(side=tk.LEFT, padx=10, pady=8)
-
-        tk.Button(top, text="Open Folder",
-                  command=self._open_folder,
-                  bg=UI_COLORS['button_bg'], fg="white",
-                  activebackground="#4a4a4a", activeforeground="white",
-                  relief=tk.FLAT, cursor="hand2").pack(side=tk.RIGHT, padx=10, pady=8)
-
-        body = tk.Frame(self, bg=UI_COLORS['bg_dark'])
-        body.pack(fill=tk.BOTH, expand=True)
-
-        left = tk.Frame(body, bg=UI_COLORS['bg_dark'])
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
-
-        tk.Label(left, text="Sessions", bg=UI_COLORS['bg_dark'], fg="white",
-                 font=("Arial", 10, "bold")).pack(anchor="w")
-
-        self.session_list = tk.Listbox(left, width=42, bg="#0f0f0f", fg="white",
-                                       selectbackground="#333", activestyle="none")
-        self.session_list.pack(fill=tk.Y, expand=True, pady=(6, 0))
-        self.session_list.bind("<<ListboxSelect>>", self._on_select)
-
-        right = tk.Frame(body, bg=UI_COLORS['bg_dark'])
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
-
-        tk.Label(right, text="Details", bg=UI_COLORS['bg_dark'], fg="white",
-                 font=("Arial", 10, "bold")).pack(anchor="w")
-
-        self.details = scrolledtext.ScrolledText(
-            right, bg="#0a0a0a", fg="#ddd", font=("Courier", 9),
-            wrap=tk.WORD
-        )
-        self.details.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-
-        self._sessions = self._scan_sessions()
-        for s in self._sessions:
-            self.session_list.insert(tk.END, s["label"])
-
-        if not self._sessions:
-            self.details.insert(tk.END, f"No sessions found under: {self.captures_root}\n")
-
-    def _open_folder(self):
-        target = self.captures_root if self.captures_root.exists() else self.data_dir
-        try:
-            subprocess.Popen(["xdg-open", str(target)])
-        except Exception:
-            try:
-                subprocess.Popen(["gio", "open", str(target)])
-            except Exception:
-                messagebox.showinfo("Folder", f"Path: {target}")
-
-    def _scan_sessions(self) -> List[dict]:
-        sessions: List[dict] = []
-        root = self.captures_root
-        if not root.exists():
-            return sessions
-
-        for idx in sorted(root.rglob("session_index.parquet")):
-            try:
-                df = pq.read_table(idx).to_pandas()
-                day_dir = idx.parent
-                for _, row in df.iterrows():
-                    sid = str(row.get("session_id", "")).strip()
-                    if not sid:
-                        continue
-                    first_ns = int(row.get("first_timestamp_ns", 0) or 0)
-                    last_ns = int(row.get("last_timestamp_ns", 0) or 0)
-                    date_s = str(row.get("date", "")) if row.get("date", "") else day_dir.name
-                    label = f"{date_s}  {sid}"
-                    sessions.append({
-                        "label": label,
-                        "session_id": sid,
-                        "day_dir": day_dir,
-                        "meta": row.to_dict(),
-                        "first_ns": first_ns,
-                        "last_ns": last_ns,
-                    })
-            except Exception:
-                continue
-
-        if sessions:
-            sessions.sort(key=lambda x: x.get("last_ns", 0), reverse=True)
-            return sessions
-
-        for p in sorted(root.rglob("session_*.txt"), reverse=True):
-            try:
-                sid = p.stem.replace("session_", "")
-                day_dir = p.parent.parent if p.parent.name == "index" else p.parent
-                label = f"{day_dir.name}  {sid}"
-                sessions.append({"label": label, "session_id": sid, "day_dir": day_dir, "meta": {"marker": str(p)}})
-            except Exception:
-                pass
-        return sessions
-
-    def _on_select(self, _evt=None):
-        sel = self.session_list.curselection()
-        if not sel:
-            return
-        s = self._sessions[int(sel[0])]
-        self.details.delete("1.0", tk.END)
-
-        day_dir = Path(s["day_dir"])
-        sid = s["session_id"]
-        self.details.insert(tk.END, f"Data dir: {self.data_dir}\n")
-        self.details.insert(tk.END, f"Day dir:  {day_dir}\n")
-        self.details.insert(tk.END, f"Session:  {sid}\n\n")
-
-        meta = s.get("meta", {}) or {}
-        for k in sorted(meta.keys()):
-            self.details.insert(tk.END, f"{k}: {meta[k]}\n")
-
-        idx_dir = day_dir / "index"
-        self.details.insert(tk.END, "\nLikely files:\n")
-        self.details.insert(tk.END, f"  - {idx_dir / ('snips_' + sid + '.sqlite')}\n")
-        self.details.insert(tk.END, f"  - reduced/ and waveforms/ under hour folders in: {day_dir}\n")
 
 
 
 class ArchiveViewer(tk.Toplevel):
-    """Simple archive browser bound to a board's data_dir.
+    """Archive browser with A/B waveform plots + integral + metadata (scope-like).
 
-    - Lists files under data_dir (recursive)
-    - Double-click to preview .npy/.npz waveforms
+    Expected on-disk layout (from this program):
+      <data_dir>/captures/YYYY-MM-DD/HHMM/YYYYMMDD_HHMMSS/buf_000123.npz
+    Each .npz should contain:
+      - wfA_V (N,)
+      - wfB_V (N,) optional
+      - sample_rate_hz (scalar)
+      - timestamp_ns (scalar) optional
+      - board (str) optional
+      - channels (str) optional
     """
 
     def __init__(self, master, title: str, data_dir: Path):
         super().__init__(master)
         self.title(title)
         self.configure(bg=UI_COLORS['bg_dark'])
-        self.geometry("980x720")
-        self.minsize(820, 560)
+        self.geometry("1180x760")
+        self.minsize(980, 620)
 
         self.data_dir = Path(data_dir)
+        self.captures_root = self.data_dir / "captures"
         self.filter_var = tk.StringVar(value="")
-        self._files = []
+        self.date_var = tk.StringVar(value="")
+        self.hour_var = tk.StringVar(value="")
+        self.mmss_var = tk.StringVar(value="")
+        self._sessions = []  # list[dict]
+        self._snips = []     # list[Path]
+        self._current_session = None
 
+        # --- Top bar ---
         top = tk.Frame(self, bg=UI_COLORS['bg_medium'])
         top.pack(side=tk.TOP, fill=tk.X)
 
         tk.Label(top, text=str(self.data_dir), bg=UI_COLORS['bg_medium'], fg='white').pack(side=tk.LEFT, padx=10, pady=8)
 
         tk.Label(top, text="Filter:", bg=UI_COLORS['bg_medium'], fg='#ccc').pack(side=tk.LEFT, padx=(10, 4))
-        ent = tk.Entry(top, textvariable=self.filter_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=28)
+        ent = tk.Entry(top, textvariable=self.filter_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=32)
         ent.pack(side=tk.LEFT, pady=8)
-        ent.bind("<KeyRelease>", lambda _e=None: self.refresh_list())
-
-        tk.Button(
-            top, text="Refresh",
-            command=self.refresh_list,
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
-            relief=tk.FLAT, cursor='hand2', padx=10
-        ).pack(side=tk.RIGHT, padx=10, pady=6)
+        ent.bind("<KeyRelease>", lambda _e=None: self.refresh_sessions())
 
         tk.Button(
             top, text="Open Folder",
             command=self.open_folder,
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
+            bg=UI_COLORS['button_bg'], fg='white',
+            activebackground='#4a4a4a', activeforeground='white',
+            relief=tk.FLAT, cursor='hand2', padx=10
+        ).pack(side=tk.RIGHT, padx=10, pady=6)
+
+        tk.Button(
+            top, text="Refresh",
+            command=self.refresh_sessions,
+            bg=UI_COLORS['button_bg'], fg='white',
+            activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=10
         ).pack(side=tk.RIGHT, padx=6, pady=6)
 
+        # --- Body split ---
         body = tk.Frame(self, bg=UI_COLORS['bg_dark'])
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Left: file list
-        left = tk.Frame(body, bg=UI_COLORS['bg_dark'])
-        left.pack(side=tk.LEFT, fill=tk.Y)
+        left = tk.Frame(body, bg=UI_COLORS['bg_dark'], width=360)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 6), pady=10)
+        left.pack_propagate(False)
 
-        self.listbox = tk.Listbox(left, bg='#1e1e1e', fg='white', width=55, activestyle='none',
-                                  selectbackground='#444', highlightthickness=0)
-        self.listbox.pack(side=tk.LEFT, fill=tk.Y, expand=False, padx=(10, 0), pady=10)
-
-        sb = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.listbox.yview)
-        sb.pack(side=tk.LEFT, fill=tk.Y, pady=10)
-        self.listbox.configure(yscrollcommand=sb.set)
-
-        self.listbox.bind("<Double-Button-1>", lambda _e=None: self.preview_selected())
-
-        # Right: preview plot
         right = tk.Frame(body, bg=UI_COLORS['bg_dark'])
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 10), pady=10)
 
-        self.fig = plt.Figure(figsize=(6, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Preview")
-        self.ax.grid(True, alpha=0.2)
+        # --- Left panel: Sessions ---
+        tk.Label(left, text="Sessions", bg=UI_COLORS['bg_dark'], fg='white', font=('Arial', 10, 'bold')).pack(anchor='w')
+        self.session_list = tk.Listbox(left, bg='#1e1e1e', fg='white', height=10,
+                                       activestyle='none', selectbackground='#444', highlightthickness=0)
+        self.session_list.pack(fill=tk.X, pady=(6, 10))
+        self.session_list.bind("<<ListboxSelect>>", self._on_select_session)
+
+        # --- Jump controls ---
+        jump = tk.Frame(left, bg=UI_COLORS['bg_dark'])
+        jump.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(jump, text="Date", bg=UI_COLORS['bg_dark'], fg='#ccc').grid(row=0, column=0, sticky='w')
+        tk.Entry(jump, textvariable=self.date_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=12).grid(row=1, column=0, sticky='w', pady=(2, 0))
+
+        tk.Label(jump, text="Hour", bg=UI_COLORS['bg_dark'], fg='#ccc').grid(row=2, column=0, sticky='w', pady=(10, 0))
+        tk.Entry(jump, textvariable=self.hour_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=5).grid(row=3, column=0, sticky='w', pady=(2, 0))
+
+        tk.Label(jump, text="MM:SS", bg=UI_COLORS['bg_dark'], fg='#ccc').grid(row=3, column=1, sticky='w', padx=(8, 0))
+        tk.Entry(jump, textvariable=self.mmss_var, bg='#222', fg='white', insertbackground='white', relief=tk.FLAT, width=6).grid(row=3, column=2, sticky='w', pady=(2, 0), padx=(4, 0))
+
+        tk.Button(
+            jump, text="Go",
+            command=self._jump_to_time,
+            bg=UI_COLORS['button_bg'], fg='white',
+            activebackground='#4a4a4a', activeforeground='white',
+            relief=tk.FLAT, cursor='hand2', padx=10
+        ).grid(row=3, column=3, sticky='w', padx=(10, 0), pady=(2, 0))
+
+        for c in range(4):
+            jump.grid_columnconfigure(c, weight=0)
+
+        # --- Left panel: Snips ---
+        tk.Label(left, text="Waveform snippets", bg=UI_COLORS['bg_dark'], fg='white', font=('Arial', 10, 'bold')).pack(anchor='w', pady=(6, 0))
+
+        snip_frame = tk.Frame(left, bg=UI_COLORS['bg_dark'])
+        snip_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        self.snip_list = tk.Listbox(snip_frame, bg='#1e1e1e', fg='white',
+                                    activestyle='none', selectbackground='#444', highlightthickness=0)
+        self.snip_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        snip_sb = tk.Scrollbar(snip_frame, orient=tk.VERTICAL, command=self.snip_list.yview)
+        snip_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.snip_list.configure(yscrollcommand=snip_sb.set)
+        self.snip_list.bind("<Double-Button-1>", lambda _e=None: self.preview_selected())
+
+        # --- Right panel: plots + metadata ---
+        self.fig = plt.Figure(figsize=(7, 6), dpi=100)
+        gs = self.fig.add_gridspec(3, 1, height_ratios=[1, 1, 1.1], hspace=0.35)
+
+        self.axA = self.fig.add_subplot(gs[0, 0])
+        self.axB = self.fig.add_subplot(gs[1, 0])
+        self.axI = self.fig.add_subplot(gs[2, 0])
+
+        for ax in (self.axA, self.axB, self.axI):
+            ax.grid(True, alpha=0.25)
+
+        self.axA.set_ylabel("A (V)")
+        self.axB.set_ylabel("B (V)")
+        self.axI.set_ylabel("Integral (V·s)")
+        self.axI.set_xlabel("Time (µs)")
+
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        meta_box = tk.Frame(right, bg=UI_COLORS['bg_dark'])
+        meta_box.pack(fill=tk.X, pady=(8, 0))
+
+        self.meta_text = scrolledtext.ScrolledText(
+            meta_box, height=7, bg="#0a0a0a", fg="#ddd",
+            font=("Courier", 9), wrap=tk.WORD
+        )
+        self.meta_text.pack(fill=tk.X, expand=False)
 
         btns = tk.Frame(right, bg=UI_COLORS['bg_dark'])
-        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+        btns.pack(fill=tk.X, pady=(8, 0))
 
         tk.Button(
             btns, text="Preview",
             command=self.preview_selected,
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
+            bg=UI_COLORS['button_bg'], fg='white',
+            activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=12
         ).pack(side=tk.LEFT)
 
         tk.Button(
             btns, text="Close",
             command=self.destroy,
-            bg=UI_COLORS['button_bg'], fg='white', activebackground='#4a4a4a', activeforeground='white',
+            bg=UI_COLORS['button_bg'], fg='white',
+            activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=12
         ).pack(side=tk.RIGHT)
 
-        self.refresh_list()
+        self.refresh_sessions()
 
     def open_folder(self):
         try:
-            import subprocess
             subprocess.Popen(["xdg-open", str(self.data_dir)])
         except Exception:
-            pass
+            try:
+                subprocess.Popen(["gio", "open", str(self.data_dir)])
+            except Exception:
+                pass
 
-    def _iter_files(self):
-        if not self.data_dir.exists():
+    def _iter_session_dirs(self):
+        if not self.captures_root.exists():
             return []
         out = []
-        for p in self.data_dir.rglob("*"):
-            if p.is_file():
-                # keep common capture formats
-                if p.suffix.lower() in (".npy", ".npz", ".bin", ".dat", ".csv", ".txt"):
-                    out.append(p)
-        return sorted(out)
+        # session dir contains buf_*.npz
+        for p in self.captures_root.rglob("buf_*.npz"):
+            out.append(p.parent)
+        # unique, sorted by name
+        uniq = sorted({d for d in out})
+        return uniq
 
-    def refresh_list(self):
-        flt = self.filter_var.get().strip().lower()
-        self._files = self._iter_files()
-        self.listbox.delete(0, tk.END)
+    def refresh_sessions(self):
+        f = (self.filter_var.get() or "").strip().lower()
+        self._sessions.clear()
+        self.session_list.delete(0, tk.END)
+        self.snip_list.delete(0, tk.END)
+        self._snips = []
+        self._current_session = None
 
-        for p in self._files:
-            s = str(p.relative_to(self.data_dir))
-            if flt and flt not in s.lower():
+        sess_dirs = self._iter_session_dirs()
+        for d in sess_dirs:
+            # d name like YYYYMMDD_HHMMSS
+            sid = d.name
+            # date inferred from parent structure if present
+            date_str = d.parent.parent.name if d.parent.parent.name.count('-') == 2 else ""
+            # snips count
+            try:
+                n = len(list(d.glob("buf_*.npz")))
+            except Exception:
+                n = 0
+
+            label = f"{date_str} {sid[-6:-4]}:{sid[-4:-2]}:{sid[-2:]}  {sid}  snips={n}"
+            if f and f not in label.lower():
                 continue
-            self.listbox.insert(tk.END, s)
 
-    def _get_selected_path(self):
-        sel = self.listbox.curselection()
-        if not sel:
-            return None
-        rel = self.listbox.get(sel[0])
-        return self.data_dir / rel
+            self._sessions.append({"dir": d, "sid": sid, "date": date_str, "n": n, "label": label})
+            self.session_list.insert(tk.END, label)
+
+        if self._sessions:
+            self.session_list.selection_set(0)
+            self._on_select_session()
+        else:
+            self.meta_text.delete("1.0", tk.END)
+            self.meta_text.insert(tk.END, f"No sessions found under: {self.captures_root}\n")
+
+    def _on_select_session(self, _evt=None):
+        sel = self.session_list.curselection()
+        if not sel or not self._sessions:
+            return
+        s = self._sessions[int(sel[0])]
+        self._current_session = s
+        d = Path(s["dir"])
+
+        files = sorted(d.glob("buf_*.npz"))
+        self._snips = files
+
+        self.snip_list.delete(0, tk.END)
+        for p in files:
+            # show buf id only
+            self.snip_list.insert(tk.END, p.name)
+
+        if files:
+            self.snip_list.selection_clear(0, tk.END)
+            self.snip_list.selection_set(0)
+            self.preview_selected()
+
+    def _jump_to_time(self):
+        # Best-effort: select first session matching date + hour.
+        date = (self.date_var.get() or "").strip()
+        hour = (self.hour_var.get() or "").strip()
+        if not date or not hour:
+            return
+        # normalize hour
+        try:
+            hour_i = int(hour)
+            hour = f"{hour_i:02d}"
+        except Exception:
+            hour = hour.zfill(2)[:2]
+
+        for i, s in enumerate(self._sessions):
+            if s.get("date") == date:
+                # hour derived from captures path captures/YYYY-MM-DD/HHMM/...
+                # HHMM folder is parent of session dir
+                try:
+                    hhmm = Path(s["dir"]).parent.name
+                    if hhmm[:2] == hour:
+                        self.session_list.selection_clear(0, tk.END)
+                        self.session_list.selection_set(i)
+                        self.session_list.see(i)
+                        self._on_select_session()
+                        return
+                except Exception:
+                    continue
+
+    def _load_npz(self, p: Path):
+        z = np.load(str(p), allow_pickle=True)
+        def _get(name, default=None):
+            return z[name] if name in z.files else default
+        wfA = _get('wfA_V', None)
+        wfB = _get('wfB_V', None)
+        sr = float(_get('sample_rate_hz', 0.0) or 0.0)
+        ts_ns = _get('timestamp_ns', None)
+        board = _get('board', None)
+        channels = _get('channels', None)
+        return wfA, wfB, sr, ts_ns, board, channels
 
     def preview_selected(self):
-        p = self._get_selected_path()
-        if p is None:
+        sel = self.snip_list.curselection()
+        if not sel or not self._snips:
             return
-
-        self.ax.clear()
-        self.ax.grid(True, alpha=0.2)
-
+        p = self._snips[int(sel[0])]
         try:
-            if p.suffix.lower() == ".npy":
-                arr = np.load(p, allow_pickle=False)
-                y = np.ravel(arr)
-                self.ax.plot(y)
-                self.ax.set_title(str(p.name))
+            wfA, wfB, sr, ts_ns, board, channels = self._load_npz(p)
+            if wfA is None or sr <= 0:
+                raise ValueError("Missing wfA_V or sample_rate_hz")
 
-            elif p.suffix.lower() == ".npz":
-                z = np.load(p, allow_pickle=False)
-                # Try common keys
-                for key in ("A", "B", "chA", "chB", "wfA", "wfB", "waveform", "data"):
-                    if key in z.files:
-                        y = np.ravel(z[key])
-                        self.ax.plot(y)
-                        self.ax.set_title(f"{p.name} : {key}")
-                        break
-                else:
-                    # plot first array-like
-                    y = np.ravel(z[z.files[0]])
-                    self.ax.plot(y)
-                    self.ax.set_title(f"{p.name} : {z.files[0]}")
-            else:
-                self.ax.text(0.02, 0.98, f"Preview not supported for {p.suffix}", transform=self.ax.transAxes, va='top')
-                self.ax.set_title(str(p.name))
+            t_us = np.arange(len(wfA)) / sr * 1e6
+
+            # Integrals
+            intA = np.cumsum(wfA) / sr
+            intB = np.cumsum(wfB) / sr if wfB is not None else None
+
+            # Plot A
+            self.axA.clear()
+            self.axA.grid(True, alpha=0.25)
+            self.axA.plot(t_us, wfA, label='A')
+            self.axA.set_ylabel("A (V)")
+            self.axA.set_title(f"{p.name}")
+
+            # Plot B
+            self.axB.clear()
+            self.axB.grid(True, alpha=0.25)
+            if wfB is not None:
+                self.axB.plot(t_us, wfB, label='B')
+            self.axB.set_ylabel("B (V)")
+
+            # Plot integrals
+            self.axI.clear()
+            self.axI.grid(True, alpha=0.25)
+            self.axI.plot(t_us, intA, label="∫A dt")
+            if intB is not None:
+                self.axI.plot(t_us, intB, linestyle='--', label="∫B dt")
+            self.axI.set_ylabel("Integral (V·s)")
+            self.axI.set_xlabel("Time (µs)")
+            self.axI.legend(loc='best', fontsize=8)
+
+            # Metadata
+            pkA = float(np.max(wfA) - np.min(wfA))
+            pkB = float(np.max(wfB) - np.min(wfB)) if wfB is not None else 0.0
+            areaA = float(np.trapezoid(wfA, dx=1.0/sr))
+            areaB = float(np.trapezoid(wfB, dx=1.0/sr)) if wfB is not None else 0.0
+            baseA = float(np.mean(wfA[:max(1, len(wfA)//20)]))
+            baseB = float(np.mean(wfB[:max(1, len(wfB)//20)])) if wfB is not None else 0.0
+
+            self.meta_text.delete("1.0", tk.END)
+            self.meta_text.insert(tk.END, f"File: {p}\n")
+            if self._current_session:
+                self.meta_text.insert(tk.END, f"Session: {self._current_session.get('sid','')}\n")
+            if ts_ns is not None:
+                self.meta_text.insert(tk.END, f"Timestamp_ns: {ts_ns}\n")
+            if board is not None:
+                self.meta_text.insert(tk.END, f"Board: {board}\n")
+            if channels is not None:
+                self.meta_text.insert(tk.END, f"Channels: {channels}\n")
+            self.meta_text.insert(tk.END, f"Sample rate: {sr:.6g} Hz\n")
+            self.meta_text.insert(tk.END, f"Waveform points: {len(wfA)}\n")
+            self.meta_text.insert(tk.END, f"Peak A: {pkA:.6g} V\n")
+            if wfB is not None:
+                self.meta_text.insert(tk.END, f"Peak B: {pkB:.6g} V\n")
+            self.meta_text.insert(tk.END, f"Area A: {areaA:.6g} V·s\n")
+            if wfB is not None:
+                self.meta_text.insert(tk.END, f"Area B: {areaB:.6g} V·s\n")
+            self.meta_text.insert(tk.END, f"Baseline A: {baseA:.6g} V\n")
+            if wfB is not None:
+                self.meta_text.insert(tk.END, f"Baseline B: {baseB:.6g} V\n")
+
+            self.canvas.draw_idle()
 
         except Exception as e:
-            self.ax.text(0.02, 0.98, f"Failed to load: {e}", transform=self.ax.transAxes, va='top')
-            self.ax.set_title(str(p.name))
+            self.meta_text.delete("1.0", tk.END)
+            self.meta_text.insert(tk.END, f"Failed to preview {p.name}: {e}\n")
 
-        self.canvas.draw_idle()
+
 
 class DualBoardGUI:
     """Main GUI - fully corrected with all improvements"""
