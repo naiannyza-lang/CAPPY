@@ -236,7 +236,7 @@ acquisition:
   pre_trigger_samples: 0
   post_trigger_samples: 256
   records_per_buffer: 128
-  buffers_allocated: 16
+  buffers_allocated: 64
   buffers_per_acquisition: 0
   wait_timeout_ms: 1000
 
@@ -314,7 +314,7 @@ acquisition:
   pre_trigger_samples: 0
   post_trigger_samples: 256
   records_per_buffer: 128
-  buffers_allocated: 16
+  buffers_allocated: 64
   buffers_per_acquisition: 0
   wait_timeout_ms: 1000
 
@@ -735,8 +735,48 @@ class BoardAcquisition:
             self._log(f"Warning: Unsupported sample rate {rate_msps} MS/s, using 250 MS/s")
             return ats.SAMPLE_RATE_250MSPS
             
+    def _disk_writer_thread(self, write_queue: queue.Queue):
+        """
+        Background thread that handles all disk I/O so the acquisition loop
+        is never blocked by storage latency.
+        """
+        while True:
+            item = write_queue.get()
+            if item is None:          # sentinel: shut down
+                write_queue.task_done()
+                break
+            try:
+                fpath, save_kwargs, index_path, index_line = item
+                np.savez_compressed(fpath, **save_kwargs)
+                if index_path is not None:
+                    with open(index_path, "a", encoding="utf-8") as _fp:
+                        _fp.write(index_line)
+            except Exception as _se:
+                self._log(f"Save warning (disk writer): {_se}")
+            finally:
+                write_queue.task_done()
+
     def _acquisition_loop(self):
-        """Main acquisition loop - runs in background thread"""
+        """
+        Main acquisition loop - runs in background thread.
+
+        KEY CHANGE vs original:
+          • postAsyncBuffer() is called IMMEDIATELY after the raw copy so the
+            board gets its buffer back before any processing or disk I/O.
+          • All disk writes are handed off to a dedicated background thread via
+            a bounded queue, so compression/fsync never stalls the loop.
+          • buffers_allocated defaults to 64 (was 16) for extra headroom.
+        """
+        # Background disk-writer
+        _write_queue: queue.Queue = queue.Queue(maxsize=256)
+        _writer = threading.Thread(
+            target=self._disk_writer_thread,
+            args=(_write_queue,),
+            daemon=True,
+            name=f"DiskWriter-{self.board_type}",
+        )
+        _writer.start()
+
         try:
             if not self._configure_board():
                 return
@@ -746,7 +786,8 @@ class BoardAcquisition:
             post_trigger = int(acq_cfg.get('post_trigger_samples', 256))
             samples_per_record = pre_trigger + post_trigger
             records_per_buffer = int(acq_cfg.get('records_per_buffer', 128))
-            buffers_allocated = int(acq_cfg.get('buffers_allocated', 16))
+            # Default bumped from 16 → 64; override in YAML via buffers_allocated
+            buffers_allocated = int(acq_cfg.get('buffers_allocated', 64))
             
             channels_mask_str = str(acq_cfg.get('channels_mask', 'CHANNEL_A|CHANNEL_B'))
             ch_mask = 0
@@ -829,54 +870,76 @@ class BoardAcquisition:
                     
                     self.board.waitAsyncBufferComplete(buf.addr, 1000)
                     
+                    # ── CRITICAL: copy raw data first, then immediately recycle
+                    # the buffer back to the board BEFORE doing any processing.
+                    # This is the primary fix for ApiBufferOverflow.
                     raw = buf.buffer.copy()
-                    
+                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)  # ← moved up
+
+                    # ── Process the copy (board is free to fill the buffer again)
                     if ch_count == 2:
                         A = raw[0::2].reshape(records_per_buffer, samples_per_record)
                         B = raw[1::2].reshape(records_per_buffer, samples_per_record)
                     else:
                         A = raw.reshape(records_per_buffer, samples_per_record)
                         B = None
-                        
+
+                    # ── Stale-buffer guard ─────────────────────────────────────────
+                    # An uninitialized DMA buffer contains all-zero uint16 words.
+                    # After volt conversion, ADC code 0x0000 maps to exactly -Vpp/2
+                    # (e.g. -0.4 V for PM_400_MV).  If every sample in record[0]
+                    # equals that floor value the buffer hasn't been written by the
+                    # board yet; skip it rather than saving garbage.
+                    _floor_code = 0          # uint16 value for uninitialized memory
+                    _stale = bool(np.all(A[0] == _floor_code))
+                    if _stale:
+                        buf_count += 1
+                        continue
+                    # ──────────────────────────────────────────────────────────────
+
                     wfA_volts = _codes_to_volts_u16(A[0], self.vpp_A)
                     wfB_volts = _codes_to_volts_u16(B[0], self.vpp_B) if B is not None else None
                     
                     integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
                     integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
 
-                    # ---- Save to disk (per buffer) ----
+                    # ── Enqueue disk save (non-blocking; handled by background thread)
                     if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
+                        ts_ns = time.time_ns()
+                        fname = f"buf_{buf_count:06d}.npz"
+                        fpath = self._session_dir / fname
+                        # Save ALL records in this buffer (shape: [records_per_buffer, samples])
+                        # so downstream analysis has full context, not just record[0].
+                        A_volts_all = _codes_to_volts_u16(A, self.vpp_A)   # shape (R, S)
+                        B_volts_all = _codes_to_volts_u16(B, self.vpp_B) if B is not None else None
+                        if B_volts_all is None:
+                            save_kwargs = dict(
+                                wfA_V=A_volts_all.astype(np.float32, copy=False),
+                                sample_rate_hz=float(self.sample_rate_hz),
+                                timestamp_ns=int(ts_ns),
+                                board=str(self.board_type),
+                                channels="A",
+                            )
+                            chs = "A"
+                        else:
+                            save_kwargs = dict(
+                                wfA_V=A_volts_all.astype(np.float32, copy=False),
+                                wfB_V=B_volts_all.astype(np.float32, copy=False),
+                                sample_rate_hz=float(self.sample_rate_hz),
+                                timestamp_ns=int(ts_ns),
+                                board=str(self.board_type),
+                                channels="A|B",
+                            )
+                            chs = "A|B"
+                        index_line = (
+                            f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},{chs}\n"
+                            if self._index_path is not None else None
+                        )
                         try:
-                            ts_ns = time.time_ns()
-                            fname = f"buf_{buf_count:06d}.npz"
-                            fpath = self._session_dir / fname
-                            if wfB_volts is None:
-                                np.savez_compressed(
-                                    fpath,
-                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
-                                    sample_rate_hz=float(self.sample_rate_hz),
-                                    timestamp_ns=int(ts_ns),
-                                    board=str(self.board_type),
-                                    channels="A",
-                                )
-                                chs = "A"
-                            else:
-                                np.savez_compressed(
-                                    fpath,
-                                    wfA_V=wfA_volts.astype(np.float32, copy=False),
-                                    wfB_V=wfB_volts.astype(np.float32, copy=False),
-                                    sample_rate_hz=float(self.sample_rate_hz),
-                                    timestamp_ns=int(ts_ns),
-                                    board=str(self.board_type),
-                                    channels="A|B",
-                                )
-                                chs = "A|B"
-                            if self._index_path is not None:
-                                with open(self._index_path, "a", encoding="utf-8") as _fp:
-                                    _fp.write(f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},{chs}\n")
-                        except Exception as _se:
-                            # Don't kill acquisition if disk write fails
-                            self._log(f"Save warning: {_se}")
+                            _write_queue.put_nowait((fpath, save_kwargs, self._index_path, index_line))
+                        except queue.Full:
+                            self._log(f"Save warning: disk writer queue full at buf {buf_count}; "
+                                      "disk too slow – increase save_every_buffers or use faster storage")
 
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -893,7 +956,6 @@ class BoardAcquisition:
                     if buf_count % 10 == 0:
                         self._send_stats_update()
                         
-                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
                     buf_count += 1
                     
                 except Exception as e:
@@ -916,6 +978,12 @@ class BoardAcquisition:
                 pass
             self.running = False
             self._log("Acquisition stopped")
+            # Gracefully drain and stop the disk writer
+            try:
+                _write_queue.put(None)   # sentinel
+                _write_queue.join()      # wait for all pending writes to finish
+            except Exception:
+                pass
 
 """
 ==================================================================================
