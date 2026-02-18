@@ -816,8 +816,13 @@ class BoardAcquisition:
                 self.board.beforeAsyncRead(ch_mask, 0, samples_per_record, records_per_buffer, 0x7FFFFFFF, adma_flags)
             else:
                 self._log("Using Traditional mode")
-                adma_flags = ats.ADMA_TRADITIONAL_MODE | ats.ADMA_EXTERNAL_STARTCAPTURE
-                self.board.beforeAsyncRead(ch_mask, -pre_trigger, samples_per_record, records_per_buffer, 0, adma_flags)
+                # records_per_acquisition = 0x7FFFFFFF → run indefinitely.
+                # Traditional mode arms itself via startCapture() below;
+                # do NOT add ADMA_EXTERNAL_STARTCAPTURE here or the board
+                # waits for a software arm signal that never comes.
+                adma_flags = ats.ADMA_TRADITIONAL_MODE
+                self.board.beforeAsyncRead(ch_mask, -pre_trigger, samples_per_record,
+                                           records_per_buffer, 0x7FFFFFFF, adma_flags)
                 
             for buf in buffers:
                 self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
@@ -899,6 +904,10 @@ class BoardAcquisition:
 
                     wfA_volts = _codes_to_volts_u16(A[0], self.vpp_A)
                     wfB_volts = _codes_to_volts_u16(B[0], self.vpp_B) if B is not None else None
+
+                    # Convert all records (needed for stats and optionally disk save)
+                    A_volts_all = _codes_to_volts_u16(A, self.vpp_A)      # shape (R, S)
+                    B_volts_all = _codes_to_volts_u16(B, self.vpp_B) if B is not None else None
                     
                     integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
                     integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
@@ -909,9 +918,6 @@ class BoardAcquisition:
                         fname = f"buf_{buf_count:06d}.npz"
                         fpath = self._session_dir / fname
                         # Save ALL records in this buffer (shape: [records_per_buffer, samples])
-                        # so downstream analysis has full context, not just record[0].
-                        A_volts_all = _codes_to_volts_u16(A, self.vpp_A)   # shape (R, S)
-                        B_volts_all = _codes_to_volts_u16(B, self.vpp_B) if B is not None else None
                         if B_volts_all is None:
                             save_kwargs = dict(
                                 wfA_V=A_volts_all.astype(np.float32, copy=False),
@@ -943,13 +949,14 @@ class BoardAcquisition:
 
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self.stats.mean_peak_a = float(np.max(np.abs(wfA_volts)))
-                    if wfB_volts is not None:
-                        self.stats.mean_peak_b = float(np.max(np.abs(wfB_volts)))
+                    # Peak over ALL records in the buffer for a meaningful reading
+                    self.stats.mean_peak_a = float(np.max(np.abs(A_volts_all)))
+                    if B_volts_all is not None:
+                        self.stats.mean_peak_b = float(np.max(np.abs(B_volts_all)))
                         
                     now = time.time()
                     if buf_count > 0 and now > last_stats_time:
-                        self.stats.rate_hz = 1.0 / (now - last_stats_time)
+                        self.stats.rate_hz = records_per_buffer / (now - last_stats_time)
                     last_stats_time = now
                     
                     self._send_waveform_update(wfA_volts, wfB_volts, integralA, integralB)
@@ -1154,7 +1161,11 @@ class ArchiveViewer(tk.Toplevel):
         snip_sb = tk.Scrollbar(snip_frame, orient=tk.VERTICAL, command=self.snip_list.yview)
         snip_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.snip_list.configure(yscrollcommand=snip_sb.set)
-        self.snip_list.bind("<Double-Button-1>", lambda _e=None: self.preview_selected())
+        # <<ListboxSelect>> fires before curselection() is updated in some Tk versions.
+        # ButtonRelease-1 fires after the click is fully committed → reliable single-click.
+        self.snip_list.bind("<ButtonRelease-1>", lambda _e=None: self.preview_selected())
+        self.snip_list.bind("<KeyRelease-Up>",   lambda _e=None: self.preview_selected())
+        self.snip_list.bind("<KeyRelease-Down>",  lambda _e=None: self.preview_selected())
 
         # --- Right panel: plots + metadata ---
         self.fig = plt.Figure(figsize=(7, 6), dpi=100)
@@ -1191,6 +1202,33 @@ class ArchiveViewer(tk.Toplevel):
             bg=UI_COLORS['button_bg'], fg='white',
             activebackground='#4a4a4a', activeforeground='white',
             relief=tk.FLAT, cursor='hand2', padx=12
+        ).pack(side=tk.LEFT)
+
+        # Record navigator (for multi-record buffers)
+        self._record_var = tk.IntVar(value=0)
+        self._record_max = 0
+        self._show_all_records = tk.BooleanVar(value=False)
+
+        rec_frame = tk.Frame(btns, bg=UI_COLORS['bg_dark'])
+        rec_frame.pack(side=tk.LEFT, padx=(16, 0))
+
+        tk.Label(rec_frame, text="Record:", bg=UI_COLORS['bg_dark'], fg='#ccc').pack(side=tk.LEFT)
+        self._rec_spin = tk.Spinbox(
+            rec_frame, from_=0, to=0, width=5,
+            textvariable=self._record_var,
+            bg='#222', fg='white', insertbackground='white',
+            buttonbackground='#333', relief=tk.FLAT,
+            command=self.preview_selected
+        )
+        self._rec_spin.pack(side=tk.LEFT, padx=(4, 0))
+        self._rec_label = tk.Label(rec_frame, text="/ 0", bg=UI_COLORS['bg_dark'], fg='#888')
+        self._rec_label.pack(side=tk.LEFT, padx=(2, 8))
+
+        tk.Checkbutton(
+            rec_frame, text="All", variable=self._show_all_records,
+            bg=UI_COLORS['bg_dark'], fg='#ccc', selectcolor='#333',
+            activebackground=UI_COLORS['bg_dark'], activeforeground='white',
+            command=self.preview_selected
         ).pack(side=tk.LEFT)
 
         tk.Button(
@@ -1316,6 +1354,13 @@ class ArchiveViewer(tk.Toplevel):
         ts_ns = _get('timestamp_ns', None)
         board = _get('board', None)
         channels = _get('channels', None)
+
+        # Return raw arrays (may be 1D or 2D); let preview_selected decide how to use them
+        if wfA is not None:
+            wfA = np.asarray(wfA, dtype=np.float32)
+        if wfB is not None:
+            wfB = np.asarray(wfB, dtype=np.float32)
+
         return wfA, wfB, sr, ts_ns, board, channels
 
     def preview_selected(self):
@@ -1329,59 +1374,109 @@ class ArchiveViewer(tk.Toplevel):
             if wfA is None or sr <= 0:
                 raise ValueError("Missing wfA_V or sample_rate_hz")
 
-            wfA = np.asarray(wfA, dtype=np.float32)
-            wfB_arr = np.asarray(wfB, dtype=np.float32) if wfB is not None else None
+            # ── Handle 1D (legacy single record) vs 2D (multi-record buffer) ──
+            n_records = 1
+            if wfA.ndim == 2:
+                n_records = wfA.shape[0]
+            if wfB is not None and wfB.ndim == 2:
+                n_records = max(n_records, wfB.shape[0])
 
-            # --- Time axis with auto units ---
-            t_s = np.arange(len(wfA), dtype=np.float32) / float(sr)
+            # Update record spinbox range
+            self._record_max = n_records - 1
+            self._rec_spin.config(to=self._record_max)
+            self._rec_label.config(text=f"/ {self._record_max}")
+            rec_idx = max(0, min(int(self._record_var.get()), self._record_max))
+            self._record_var.set(rec_idx)
+
+            show_all = bool(self._show_all_records.get())
+
+            # Extract the waveform(s) to plot
+            wfA_2d = wfA if wfA.ndim == 2 else wfA.reshape(1, -1)
+            wfB_2d = (wfB if wfB.ndim == 2 else wfB.reshape(1, -1)) if wfB is not None else None
+
+            if show_all:
+                # Overlay all records; each row is one trigger record
+                wfA_rows = wfA_2d                         # shape (R, S)
+                wfB_rows = wfB_2d                         # shape (R, S) or None
+                wfA_plot  = wfA_2d.mean(axis=0)           # mean trace for integrals/stats
+                wfB_plot  = wfB_2d.mean(axis=0) if wfB_2d is not None else None
+                plot_title = f"{p.name}  [all {n_records} records]"
+            else:
+                wfA_rows = wfA_2d[rec_idx:rec_idx+1]
+                wfB_rows = wfB_2d[rec_idx:rec_idx+1] if wfB_2d is not None else None
+                wfA_plot  = wfA_2d[rec_idx]
+                wfB_plot  = wfB_2d[rec_idx] if wfB_2d is not None else None
+                plot_title = f"{p.name}  [record {rec_idx}/{self._record_max}]"
+
+            wfA_plot = np.asarray(wfA_plot, dtype=np.float32)
+            wfB_plot = np.asarray(wfB_plot, dtype=np.float32) if wfB_plot is not None else None
+
+            # --- Time axis with auto units (based on samples per record) ---
+            n_plot_samples = wfA_rows.shape[1]
+            t_s = np.arange(n_plot_samples, dtype=np.float64) / float(sr)
             dur_s = float(t_s[-1]) if len(t_s) > 1 else 0.0
             if dur_s < 2e-6:
-                t = t_s * 1e9
-                t_unit = "ns"
+                t = t_s * 1e9;  t_unit = "ns"
             elif dur_s < 2e-3:
-                t = t_s * 1e6
-                t_unit = "µs"
+                t = t_s * 1e6;  t_unit = "µs"
             elif dur_s < 2.0:
-                t = t_s * 1e3
-                t_unit = "ms"
+                t = t_s * 1e3;  t_unit = "ms"
             else:
-                t = t_s
-                t_unit = "s"
+                t = t_s;        t_unit = "s"
 
-            # --- Baseline subtraction (matches legacy behavior) ---
-            # Prefer stored baseline if present; else use mean of first 5% (capped).
+            # --- Baseline subtraction ---
             def _baseline(wf: np.ndarray) -> float:
                 n = len(wf)
-                k = max(1, min(256, n // 20))  # 5% up to 256 samples
+                k = max(1, min(256, n // 20))
                 return float(np.mean(wf[:k]))
 
-            baseA = _baseline(wfA)
-            wfA0 = wfA - baseA
-
-            baseB = None
-            wfB0 = None
-            if wfB_arr is not None:
-                baseB = _baseline(wfB_arr)
-                wfB0 = wfB_arr - baseB
+            baseA = _baseline(wfA_plot)
+            wfA0  = wfA_plot - baseA
+            baseB = None;  wfB0 = None
+            if wfB_plot is not None:
+                baseB = _baseline(wfB_plot)
+                wfB0  = wfB_plot - baseB
 
             # --- Cumulative integrals ---
-            dt = 1.0 / float(sr)
+            dt   = 1.0 / float(sr)
             intA = np.cumsum(wfA0) * dt
             intB = np.cumsum(wfB0) * dt if wfB0 is not None else None
 
-            # --- Colors by board (9352/9462) ---
-            board_key = "9352" if ("9352" in str(board).lower() or "9352" in self.title().lower()) else (
-                        "9462" if ("9462" in str(board).lower() or "9462" in self.title().lower()) else "9352")
+            # --- Colors by board ---
+            board_key = ("9352" if ("9352" in str(board).lower() or "9352" in self.title().lower())
+                         else ("9462" if ("9462" in str(board).lower() or "9462" in self.title().lower())
+                               else "9352"))
             colA = COLORS.get(board_key, COLORS["9352"])["A"]
             colB = COLORS.get(board_key, COLORS["9352"])["B"]
 
-            # --- Plot waveforms (A solid, B dashed) in ONE axis ---
+            # --- Plot waveforms: individual records semi-transparent + mean bold ---
             self.axW.clear()
             self.axW.grid(True, alpha=0.25)
-            self.axW.plot(t, wfA, color=colA, linewidth=1.2, label="Channel A")
-            if wfB_arr is not None:
-                self.axW.plot(t, wfB_arr, color=colB, linewidth=1.2, linestyle="--", label="Channel B")
-            self.axW.set_title(p.name)
+
+            n_rows = wfA_rows.shape[0]
+            alpha_ind = max(0.05, min(0.5, 1.2 / max(1, n_rows ** 0.6)))
+
+            for i, row in enumerate(wfA_rows):
+                self.axW.plot(t, row, color=colA, linewidth=0.6,
+                              alpha=alpha_ind, label="_" if i else "Ch A (individual)")
+            if wfB_rows is not None:
+                for i, row in enumerate(wfB_rows):
+                    self.axW.plot(t, row, color=colB, linewidth=0.6,
+                                  alpha=alpha_ind, linestyle="--", label="_" if i else "Ch B (individual)")
+
+            # Bold mean on top (only meaningful when show_all; single record it's identical)
+            if n_rows > 1:
+                self.axW.plot(t, wfA_plot, color=colA, linewidth=1.8, label="Ch A (mean)")
+                if wfB_plot is not None:
+                    self.axW.plot(t, wfB_plot, color=colB, linewidth=1.8,
+                                  linestyle="--", label="Ch B (mean)")
+            else:
+                self.axW.plot(t, wfA_plot, color=colA, linewidth=1.4, label="Channel A")
+                if wfB_plot is not None:
+                    self.axW.plot(t, wfB_plot, color=colB, linewidth=1.4,
+                                  linestyle="--", label="Channel B")
+
+            self.axW.set_title(plot_title, fontsize=9)
             self.axW.set_ylabel("Voltage (V)")
             self.axW.set_xlabel(f"Time ({t_unit})")
             self.axW.legend(loc="upper right", fontsize=8, framealpha=0.85)
@@ -1389,16 +1484,16 @@ class ArchiveViewer(tk.Toplevel):
             # --- Plot integrals ---
             self.axI.clear()
             self.axI.grid(True, alpha=0.25)
-            self.axI.plot(t, intA, color=colA, linewidth=1.2, label="∫A dt")
+            self.axI.plot(t, intA, color=colA, linewidth=0.8, label="∫A dt")
             if intB is not None:
-                self.axI.plot(t, intB, color=colB, linewidth=1.2, linestyle="--", label="∫B dt")
+                self.axI.plot(t, intB, color=colB, linewidth=0.8, linestyle="--", label="∫B dt")
             self.axI.set_ylabel("Integral (V·s)")
             self.axI.set_xlabel(f"Time ({t_unit})")
             self.axI.legend(loc='best', fontsize=8)
 
             # --- Metadata ---
-            pkA = float(np.max(wfA) - np.min(wfA))
-            pkB = float(np.max(wfB_arr) - np.min(wfB_arr)) if wfB_arr is not None else 0.0
+            pkA  = float(np.max(wfA_plot) - np.min(wfA_plot))
+            pkB  = float(np.max(wfB_plot) - np.min(wfB_plot)) if wfB_plot is not None else 0.0
             areaA = float(np.trapezoid(wfA0, dx=dt))
             areaB = float(np.trapezoid(wfB0, dx=dt)) if wfB0 is not None else 0.0
 
@@ -1413,12 +1508,13 @@ class ArchiveViewer(tk.Toplevel):
             if channels is not None:
                 self.meta_text.insert(tk.END, f"Channels: {channels}\n")
             self.meta_text.insert(tk.END, f"Sample rate: {sr:.6g} Hz\n")
-            self.meta_text.insert(tk.END, f"Waveform points: {len(wfA)}\n")
+            self.meta_text.insert(tk.END, f"Records in buffer: {n_records}  |  Showing: {'all' if show_all else rec_idx}\n")
+            self.meta_text.insert(tk.END, f"Samples shown: {len(wfA_plot)}\n")
             self.meta_text.insert(tk.END, f"Peak-to-peak A: {pkA:.6g} V\n")
-            if wfB_arr is not None:
+            if wfB_plot is not None:
                 self.meta_text.insert(tk.END, f"Peak-to-peak B: {pkB:.6g} V\n")
             self.meta_text.insert(tk.END, f"Baseline A: {baseA:.6g} V\n")
-            if wfB_arr is not None and baseB is not None:
+            if wfB_plot is not None and baseB is not None:
                 self.meta_text.insert(tk.END, f"Baseline B: {baseB:.6g} V\n")
             self.meta_text.insert(tk.END, f"Area A (baseline-sub): {areaA:.6g} V·s\n")
             if wfB0 is not None:
@@ -1427,9 +1523,6 @@ class ArchiveViewer(tk.Toplevel):
             self.canvas.draw_idle()
 
         except Exception as e:
-            self.meta_text.delete("1.0", tk.END)
-            self.meta_text.insert(tk.END, f"Failed to preview {p.name}: {e}\n")
-
             self.meta_text.delete("1.0", tk.END)
             self.meta_text.insert(tk.END, f"Failed to preview {p.name}: {e}\n")
 
