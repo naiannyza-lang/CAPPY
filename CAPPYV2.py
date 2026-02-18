@@ -47,6 +47,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+import re
 plt.style.use('dark_background')
 
 # ==================================================================================
@@ -902,487 +903,140 @@ class CollapsibleFrame(tk.Frame):
 
 
 class ArchiveViewer(tk.Toplevel):
-    """
-    CAPPY Archive Browser (scope-style)
+    """Lightweight archive browser that auto-attaches to a data_dir (no file picking)."""
 
-    Layout (matches your reference):
-      - Left: Sessions list + Date/Hour jump + Waveform snippets
-      - Right: 3 stacked plots (Ch A, Ch B, Integrals) + metadata text
-    """
-
-    def __init__(self, master, title: str, data_dir: Path):
-        super().__init__(master)
+    def __init__(self, parent, data_dir: Path, title: str = "Archive"):
+        super().__init__(parent)
         self.title(title)
         self.configure(bg=UI_COLORS['bg_dark'])
-        self.geometry("1180x760")
-        self.minsize(980, 620)
+        self.geometry("900x650")
+        self.minsize(700, 450)
 
         self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.captures_root = self.data_dir / "captures"
 
-        # --- State ---
-        self.sessions = []          # list of dicts
-        self.current_session = None
-        self.snips = []             # list of Paths in current session
-        self._snip_paths = []       # list aligned to listbox
+        top = tk.Frame(self, bg=UI_COLORS['bg_medium'])
+        top.pack(fill=tk.X)
 
-        # --- UI root ---
-        topbar = tk.Frame(self, bg=UI_COLORS['bg_medium'])
-        topbar.pack(side=tk.TOP, fill=tk.X)
-
-        tk.Label(topbar, text=title, bg=UI_COLORS['bg_medium'], fg="white",
+        tk.Label(top, text=title, bg=UI_COLORS['bg_medium'], fg="white",
                  font=("Arial", 11, "bold")).pack(side=tk.LEFT, padx=10, pady=8)
 
-        tk.Button(
-            topbar, text="Open Folder",
-            command=self._open_folder,
-            bg=UI_COLORS['button_bg'], fg="white",
-            activebackground="#4a4a4a", activeforeground="white",
-            relief=tk.FLAT, cursor="hand2", padx=10
-        ).pack(side=tk.RIGHT, padx=8, pady=6)
+        tk.Button(top, text="Open Folder",
+                  command=self._open_folder,
+                  bg=UI_COLORS['button_bg'], fg="white",
+                  activebackground="#4a4a4a", activeforeground="white",
+                  relief=tk.FLAT, cursor="hand2").pack(side=tk.RIGHT, padx=10, pady=8)
 
-        tk.Button(
-            topbar, text="Refresh",
-            command=self.refresh,
-            bg=UI_COLORS['button_bg'], fg="white",
-            activebackground="#4a4a4a", activeforeground="white",
-            relief=tk.FLAT, cursor="hand2", padx=10
-        ).pack(side=tk.RIGHT, padx=6, pady=6)
+        body = tk.Frame(self, bg=UI_COLORS['bg_dark'])
+        body.pack(fill=tk.BOTH, expand=True)
 
-        body = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.FLAT,
-                              bg=UI_COLORS['bg_dark'], bd=0, sashwidth=6)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        left = tk.Frame(body, bg=UI_COLORS['bg_dark'])
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
 
-        # --- Left panel ---
-        left = tk.Frame(body, bg=UI_COLORS['bg_dark'], width=360)
-        body.add(left, minsize=320)
-
-        # Sessions
         tk.Label(left, text="Sessions", bg=UI_COLORS['bg_dark'], fg="white",
-                 font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+                 font=("Arial", 10, "bold")).pack(anchor="w")
 
-        self.session_list = tk.Listbox(
-            left, bg="#121212", fg="white", selectbackground="#333",
-            activestyle="none", height=10
-        )
-        self.session_list.pack(fill=tk.X, padx=10, pady=(0, 8))
-        self.session_list.bind("<<ListboxSelect>>", lambda _e=None: self._on_session_select())
+        self.session_list = tk.Listbox(left, width=42, bg="#0f0f0f", fg="white",
+                                       selectbackground="#333", activestyle="none")
+        self.session_list.pack(fill=tk.Y, expand=True, pady=(6, 0))
+        self.session_list.bind("<<ListboxSelect>>", self._on_select)
 
-        # Date/hour jump
-        jump = tk.LabelFrame(left, text="Jump", bg=UI_COLORS['bg_dark'], fg="#ddd",
-                             bd=1, highlightthickness=0, relief=tk.GROOVE)
-        jump.pack(fill=tk.X, padx=10, pady=(0, 10))
-
-        tk.Label(jump, text="Date", bg=UI_COLORS['bg_dark'], fg="#ccc").grid(row=0, column=0, sticky="w", padx=8, pady=4)
-        self.date_var = tk.StringVar(value="")
-        self.date_combo = ttk.Combobox(jump, textvariable=self.date_var, width=14, state="readonly")
-        self.date_combo.grid(row=0, column=1, sticky="w", padx=8, pady=4)
-
-        tk.Label(jump, text="Hour", bg=UI_COLORS['bg_dark'], fg="#ccc").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        self.hour_var = tk.StringVar(value="")
-        self.hour_entry = tk.Entry(jump, textvariable=self.hour_var, width=6, bg="#222", fg="white",
-                                   insertbackground="white", relief=tk.FLAT)
-        self.hour_entry.grid(row=1, column=1, sticky="w", padx=8, pady=4)
-
-        tk.Label(jump, text="MM:SS", bg=UI_COLORS['bg_dark'], fg="#ccc").grid(row=1, column=2, sticky="w", padx=(8, 2), pady=4)
-        self.mmss_var = tk.StringVar(value="")
-        self.mmss_entry = tk.Entry(jump, textvariable=self.mmss_var, width=7, bg="#222", fg="white",
-                                   insertbackground="white", relief=tk.FLAT)
-        self.mmss_entry.grid(row=1, column=3, sticky="w", padx=4, pady=4)
-
-        tk.Button(
-            jump, text="Go",
-            command=self._jump_to_time,
-            bg=UI_COLORS['button_bg'], fg="white",
-            activebackground="#4a4a4a", activeforeground="white",
-            relief=tk.FLAT, cursor="hand2", padx=10
-        ).grid(row=1, column=4, sticky="e", padx=8, pady=4)
-
-        for c in range(5):
-            jump.grid_columnconfigure(c, weight=0)
-        jump.grid_columnconfigure(1, weight=1)
-
-        # Waveform snippets
-        tk.Label(left, text="Waveform snippets", bg=UI_COLORS['bg_dark'], fg="white",
-                 font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(6, 2))
-
-        snip_frame = tk.Frame(left, bg=UI_COLORS['bg_dark'])
-        snip_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-
-        self.snip_list = tk.Listbox(
-            snip_frame, bg="#121212", fg="white", selectbackground="#333",
-            activestyle="none"
-        )
-        self.snip_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        snip_sb = tk.Scrollbar(snip_frame, orient=tk.VERTICAL, command=self.snip_list.yview)
-        snip_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.snip_list.configure(yscrollcommand=snip_sb.set)
-        self.snip_list.bind("<<ListboxSelect>>", lambda _e=None: self._on_snip_select())
-
-        # --- Right panel ---
         right = tk.Frame(body, bg=UI_COLORS['bg_dark'])
-        body.add(right)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
 
-        # Plots
-        plot_frame = tk.Frame(right, bg=UI_COLORS['bg_dark'])
-        plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
+        tk.Label(right, text="Details", bg=UI_COLORS['bg_dark'], fg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
 
-        self.fig = plt.Figure(figsize=(7.2, 5.6), dpi=100)
-        self.axA = self.fig.add_subplot(311)
-        self.axB = self.fig.add_subplot(312, sharex=self.axA)
-        self.axI = self.fig.add_subplot(313, sharex=self.axA)
-
-        for ax in (self.axA, self.axB, self.axI):
-            ax.grid(True, alpha=0.2)
-            ax.set_facecolor("#1b1b1b")
-            ax.tick_params(colors="white")
-            for spine in ax.spines.values():
-                spine.set_color("#555")
-
-        self.axA.set_title("Channel A", color="white")
-        self.axB.set_title("Channel B", color="white")
-        self.axI.set_title("Integral", color="white")
-        self.axI.set_xlabel("Time (s)", color="white")
-        self.axI.set_ylabel("Integral (V·s)", color="white")
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        # Metadata
-        meta_frame = tk.Frame(right, bg=UI_COLORS['bg_dark'])
-        meta_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-
-        self.meta_text = scrolledtext.ScrolledText(
-            meta_frame, height=7, bg="#0f0f0f", fg="#ddd",
-            font=("Courier", 9), wrap=tk.WORD
+        self.details = scrolledtext.ScrolledText(
+            right, bg="#0a0a0a", fg="#ddd", font=("Courier", 9),
+            wrap=tk.WORD
         )
-        self.meta_text.pack(fill=tk.X, expand=False)
+        self.details.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
 
-        self.refresh()
-
-    # -------------------------- scanning / parsing --------------------------
-
-    def _open_folder(self):
-        try:
-            subprocess.Popen(["xdg-open", str(self.data_dir)])
-        except Exception:
-            try:
-                subprocess.Popen(["gio", "open", str(self.data_dir)])
-            except Exception:
-                pass
-
-    def _iter_capture_files(self):
-        if not self.data_dir.exists():
-            return []
-        keep = {".npz", ".npy"}
-        files = []
-        for p in self.data_dir.rglob("*"):
-            if p.is_file() and p.suffix.lower() in keep:
-                files.append(p)
-        return sorted(files)
-
-    _re_dt = re.compile(r"(?P<date>\d{8})[ _-]?(?P<time>\d{6})")
-    _re_ids = re.compile(r"(?:id|ID)[=_-]?(?P<id>\d+).*?(?:buf|BUF)[=_-]?(?P<buf>\d+).*?(?:rec|REC)[=_-]?(?P<rec>\d+)", re.IGNORECASE)
-
-    def _session_key_for_path(self, p: Path):
-        # Prefer date/time in filename, else use parent folder
-        m = self._re_dt.search(p.name)
-        if m:
-            return f"{m.group('date')}_{m.group('time')}"
-        # fall back to hour folder structure
-        parts = p.parts
-        for i in range(len(parts)-1, -1, -1):
-            if re.fullmatch(r"\d{2}:\d{2}", parts[i]) or re.fullmatch(r"\d{2}", parts[i]):
-                # Use day + hour if present
-                day = None
-                for j in range(i-1, -1, -1):
-                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[j]) or re.fullmatch(r"\d{8}", parts[j]):
-                        day = parts[j]
-                        break
-                return f"{day or 'session'}_{parts[i]}"
-        return p.parent.name
-
-    def _label_for_session_key(self, k: str):
-        # "20260210_161739" -> "2026-02-10 16:17:39   20260210_161739"
-        m = self._re_dt.search(k)
-        if m:
-            d = m.group('date')
-            t = m.group('time')
-            label = f"{d[0:4]}-{d[4:6]}-{d[6:8]} {t[0:2]}:{t[2:4]}:{t[4:6]}   {k}"
-            return label
-        return k
-
-    def refresh(self):
-        files = self._iter_capture_files()
-
-        # Build sessions
-        by = {}
-        for p in files:
-            k = self._session_key_for_path(p)
-            by.setdefault(k, []).append(p)
-
-        self.sessions = []
-        for k, paths in sorted(by.items(), key=lambda kv: kv[0], reverse=True):
-            self.sessions.append({"key": k, "label": self._label_for_session_key(k), "paths": paths})
-
-        # Update sessions listbox
-        self.session_list.delete(0, tk.END)
-        for s in self.sessions:
+        self._sessions = self._scan_sessions()
+        for s in self._sessions:
             self.session_list.insert(tk.END, s["label"])
 
-        # Dates for combobox
-        dates = sorted({s["key"][:8] for s in self.sessions if re.match(r"\d{8}_\d{6}", s["key"])}, reverse=True)
-        self.date_combo["values"] = [f"{d[0:4]}-{d[4:6]}-{d[6:8]}" for d in dates]
-        if dates and not self.date_var.get():
-            self.date_var.set(f"{dates[0][0:4]}-{dates[0][4:6]}-{dates[0][6:8]}")
+        if not self._sessions:
+            self.details.insert(tk.END, f"No sessions found under: {self.captures_root}\n")
 
-        # Auto-select first session
-        if self.sessions:
-            self.session_list.selection_clear(0, tk.END)
-            self.session_list.selection_set(0)
-            self.session_list.activate(0)
-            self._on_session_select()
-        else:
-            self.snip_list.delete(0, tk.END)
-            self.meta_text.delete("1.0", tk.END)
-            self.meta_text.insert(tk.END, f"No capture files found under:\n{self.data_dir}\n")
-            for ax in (self.axA, self.axB, self.axI):
-                ax.clear()
-                ax.grid(True, alpha=0.2)
-            self.canvas.draw_idle()
+    def _open_folder(self):
+        target = self.captures_root if self.captures_root.exists() else self.data_dir
+        try:
+            subprocess.Popen(["xdg-open", str(target)])
+        except Exception:
+            try:
+                subprocess.Popen(["gio", "open", str(target)])
+            except Exception:
+                messagebox.showinfo("Folder", f"Path: {target}")
 
-    def _on_session_select(self):
+    def _scan_sessions(self) -> List[dict]:
+        sessions: List[dict] = []
+        root = self.captures_root
+        if not root.exists():
+            return sessions
+
+        for idx in sorted(root.rglob("session_index.parquet")):
+            try:
+                df = pq.read_table(idx).to_pandas()
+                day_dir = idx.parent
+                for _, row in df.iterrows():
+                    sid = str(row.get("session_id", "")).strip()
+                    if not sid:
+                        continue
+                    first_ns = int(row.get("first_timestamp_ns", 0) or 0)
+                    last_ns = int(row.get("last_timestamp_ns", 0) or 0)
+                    date_s = str(row.get("date", "")) if row.get("date", "") else day_dir.name
+                    label = f"{date_s}  {sid}"
+                    sessions.append({
+                        "label": label,
+                        "session_id": sid,
+                        "day_dir": day_dir,
+                        "meta": row.to_dict(),
+                        "first_ns": first_ns,
+                        "last_ns": last_ns,
+                    })
+            except Exception:
+                continue
+
+        if sessions:
+            sessions.sort(key=lambda x: x.get("last_ns", 0), reverse=True)
+            return sessions
+
+        for p in sorted(root.rglob("session_*.txt"), reverse=True):
+            try:
+                sid = p.stem.replace("session_", "")
+                day_dir = p.parent.parent if p.parent.name == "index" else p.parent
+                label = f"{day_dir.name}  {sid}"
+                sessions.append({"label": label, "session_id": sid, "day_dir": day_dir, "meta": {"marker": str(p)}})
+            except Exception:
+                pass
+        return sessions
+
+    def _on_select(self, _evt=None):
         sel = self.session_list.curselection()
         if not sel:
             return
-        s = self.sessions[sel[0]]
-        self.current_session = s
-        self._load_snips_for_session(s)
+        s = self._sessions[int(sel[0])]
+        self.details.delete("1.0", tk.END)
 
-    def _snip_label(self, p: Path):
-        # Build a compact line like: "16:18:08 id=1493 buf=2496 rec=42"
-        name = p.stem
-        t = "--:--:--"
-        m = self._re_dt.search(name)
-        if m:
-            hh, mm, ss = m.group('time')[0:2], m.group('time')[2:4], m.group('time')[4:6]
-            t = f"{hh}:{mm}:{ss}"
-        ids = ""
-        mi = self._re_ids.search(name)
-        if mi:
-            ids = f" id={mi.group('id')} buf={mi.group('buf')} rec={mi.group('rec')}"
-        else:
-            # fallback: show stem tail
-            ids = f" {name[-24:]}" if len(name) > 28 else f" {name}"
-        return f"{t}{ids}"
+        day_dir = Path(s["day_dir"])
+        sid = s["session_id"]
+        self.details.insert(tk.END, f"Data dir: {self.data_dir}\n")
+        self.details.insert(tk.END, f"Day dir:  {day_dir}\n")
+        self.details.insert(tk.END, f"Session:  {sid}\n\n")
 
-    def _load_snips_for_session(self, s):
-        self._snip_paths = list(s["paths"])
-        self.snip_list.delete(0, tk.END)
-        for p in self._snip_paths:
-            self.snip_list.insert(tk.END, self._snip_label(p))
+        meta = s.get("meta", {}) or {}
+        for k in sorted(meta.keys()):
+            self.details.insert(tk.END, f"{k}: {meta[k]}\n")
 
-        if self._snip_paths:
-            self.snip_list.selection_clear(0, tk.END)
-            self.snip_list.selection_set(0)
-            self.snip_list.activate(0)
-            self._on_snip_select()
+        idx_dir = day_dir / "index"
+        self.details.insert(tk.END, "\nLikely files:\n")
+        self.details.insert(tk.END, f"  - {idx_dir / ('snips_' + sid + '.sqlite')}\n")
+        self.details.insert(tk.END, f"  - reduced/ and waveforms/ under hour folders in: {day_dir}\n")
 
-    def _jump_to_time(self):
-        # Jump based on date + hour + mm:ss: selects nearest snip in session list
-        date = self.date_var.get().strip()
-        if not date:
-            return
-        # Normalize date to yyyymmdd
-        d = date.replace("-", "")
-        hour = self.hour_var.get().strip()
-        if not hour:
-            return
-        try:
-            hh = int(hour)
-        except Exception:
-            return
-        mmss = self.mmss_var.get().strip()
-        mm = ss = 0
-        if mmss:
-            try:
-                mm, ss = [int(x) for x in mmss.split(":")]
-            except Exception:
-                mm = ss = 0
-        target = f"{d}_{hh:02d}{mm:02d}{ss:02d}"
 
-        # Choose nearest session and snip
-        best_s = None
-        for i, s in enumerate(self.sessions):
-            if s["key"].startswith(d + "_"):
-                best_s = i
-                break
-        if best_s is not None:
-            self.session_list.selection_clear(0, tk.END)
-            self.session_list.selection_set(best_s)
-            self.session_list.activate(best_s)
-            self._on_session_select()
 
-        # Nearest snip within current session
-        if not self._snip_paths:
-            return
-        best_i = 0
-        best_dt = None
-        for i, p in enumerate(self._snip_paths):
-            mk = self._re_dt.search(p.name)
-            if not mk:
-                continue
-            k = f"{mk.group('date')}_{mk.group('time')}"
-            try:
-                dt = abs(int(k.replace("_", "")) - int(target.replace("_", "")))
-            except Exception:
-                continue
-            if best_dt is None or dt < best_dt:
-                best_dt = dt
-                best_i = i
-        self.snip_list.selection_clear(0, tk.END)
-        self.snip_list.selection_set(best_i)
-        self.snip_list.activate(best_i)
-        self._on_snip_select()
-
-    def _on_snip_select(self):
-        sel = self.snip_list.curselection()
-        if not sel:
-            return
-        p = self._snip_paths[sel[0]]
-        self._plot_file(p)
-
-    # -------------------------- plotting --------------------------
-
-    def _plot_file(self, p: Path):
-        self.meta_text.delete("1.0", tk.END)
-
-        # Clear axes but keep styling
-        for ax in (self.axA, self.axB, self.axI):
-            ax.clear()
-            ax.grid(True, alpha=0.2)
-            ax.set_facecolor("#1b1b1b")
-            ax.tick_params(colors="white")
-            for spine in ax.spines.values():
-                spine.set_color("#555")
-
-        wfA = wfB = None
-        t = None
-        intA = intB = None
-        meta_lines = [f"File: {p}\n"]
-
-        try:
-            if p.suffix.lower() == ".npz":
-                z = np.load(p, allow_pickle=True)
-                keys = set(z.files)
-
-                # Common waveform keys
-                for k in ("A", "chA", "wfA", "chanA", "waveA"):
-                    if k in keys:
-                        wfA = np.ravel(z[k])
-                        break
-                for k in ("B", "chB", "wfB", "chanB", "waveB"):
-                    if k in keys:
-                        wfB = np.ravel(z[k])
-                        break
-
-                # Time keys
-                for k in ("t", "time", "time_s", "t_s", "time_us"):
-                    if k in keys:
-                        t = np.ravel(z[k]).astype(float)
-                        # Convert µs -> s if it looks like microseconds
-                        if k == "time_us" and t.size:
-                            t = t * 1e-6
-                        break
-
-                # Integral keys
-                for k in ("intA", "integralA", "areaA"):
-                    if k in keys:
-                        intA = np.ravel(z[k]).astype(float)
-                        break
-                for k in ("intB", "integralB", "areaB"):
-                    if k in keys:
-                        intB = np.ravel(z[k]).astype(float)
-                        break
-
-                # Add metadata dump (compact)
-                meta_lines.append(f"Keys: {', '.join(z.files)}\n")
-
-                # Try some scalar metadata
-                for k in ("timestamp", "sample_rate", "sampleRate", "dt", "board", "channels", "record", "buffer"):
-                    if k in keys:
-                        try:
-                            v = z[k]
-                            if np.ndim(v) == 0:
-                                meta_lines.append(f"{k}: {v.item()}\n")
-                        except Exception:
-                            pass
-
-            elif p.suffix.lower() == ".npy":
-                arr = np.load(p, allow_pickle=True)
-                arr = np.asarray(arr)
-                # If it's a dict-like saved object
-                if hasattr(arr, "item") and arr.shape == ():
-                    obj = arr.item()
-                    if isinstance(obj, dict):
-                        wfA = np.ravel(obj.get("A") or obj.get("chA") or obj.get("wfA") or [])
-                        wfB = np.ravel(obj.get("B") or obj.get("chB") or obj.get("wfB") or [])
-                        t = np.ravel(obj.get("t") or obj.get("time") or [])
-                        intA = np.ravel(obj.get("intA") or [])
-                        intB = np.ravel(obj.get("intB") or [])
-                        meta_lines.append(f"Dict keys: {', '.join(obj.keys())}\n")
-                    else:
-                        wfA = np.ravel(arr)
-                else:
-                    wfA = np.ravel(arr)
-
-        except Exception as e:
-            meta_lines.append(f"\nLoad failed: {e}\n")
-
-        # If no explicit time vector, build one
-        n = 0
-        if wfA is not None and wfA.size:
-            n = wfA.size
-        elif wfB is not None and wfB.size:
-            n = wfB.size
-
-        if t is None and n:
-            t = np.arange(n, dtype=float)
-            # Default to seconds scale (unknown dt); show sample index axis in title
-            t = t - t[0]
-
-        # Plot
-        if t is not None and wfA is not None and wfA.size:
-            self.axA.plot(t[:wfA.size], wfA, color="#ff00ff")
-        self.axA.set_title("Channel A", color="white")
-
-        if t is not None and wfB is not None and wfB.size:
-            self.axB.plot(t[:wfB.size], wfB, color="#00ff00")
-        self.axB.set_title("Channel B", color="white")
-
-        # Integrals: if missing, compute simple cumulative sum with dt=1
-        if n:
-            if intA is None and wfA is not None and wfA.size:
-                intA = np.cumsum(wfA) * (t[1] - t[0] if t.size > 1 else 1.0)
-            if intB is None and wfB is not None and wfB.size:
-                intB = np.cumsum(wfB) * (t[1] - t[0] if t.size > 1 else 1.0)
-
-        if t is not None and intA is not None and intA.size:
-            self.axI.plot(t[:intA.size], intA, color="#ff00ff", label="∫A dt")
-        if t is not None and intB is not None and intB.size:
-            self.axI.plot(t[:intB.size], intB, color="#00ff00", linestyle="--", label="∫B dt")
-        self.axI.legend(loc="upper right", framealpha=0.8)
-
-        self.axI.set_title("Integral", color="white")
-        self.axI.set_xlabel("Time (s)", color="white")
-        self.axI.set_ylabel("Integral (V·s)", color="white")
-
-        # Write metadata
-        self.meta_text.insert(tk.END, "".join(meta_lines))
-
-        self.fig.tight_layout()
-        self.canvas.draw_idle()
 class ArchiveViewer(tk.Toplevel):
     """Simple archive browser bound to a board's data_dir.
 
@@ -1564,6 +1218,8 @@ class DualBoardGUI:
         self._board_running = {'9352': False, '9462': False}
         
         self.gui_queue = queue.Queue()
+        self._log_buffer = []
+        self.log_text = None
         
         self.acq_9352 = None
         self.acq_9462 = None
@@ -2595,189 +2251,194 @@ class DualBoardGUI:
             time.sleep(0.2)
             self.start_board(board_type)
 
-def open_archive(self, board_type: str):
-    """Open the archive viewer for the selected board (auto-creates data dir; works even if board not started)."""
-    acq = self._ensure_acq(board_type)
-    if acq is None:
-        return
-    if acq.config is None:
-        acq.load_config()
-
-    # Resolve data_dir robustly (relative -> CWD) and ensure it exists
-    data_dir = Path(acq.config.get('storage', {}).get('data_dir', str(APP_STATE_DIR / f"data_{board_type}"))).expanduser()
-    if not data_dir.is_absolute():
-        data_dir = (Path.cwd() / data_dir).resolve()
-    _ensure_dir(data_dir)
-    acq.config.setdefault('storage', {})['data_dir'] = str(data_dir)
-    self._write_config(board_type)
-
-    if not hasattr(self, "_archive_windows"):
-        self._archive_windows = {}
-
-    win = self._archive_windows.get(board_type)
-    try:
-        if win is not None and win.winfo_exists():
-            win.lift()
-            win.focus_force()
-            return
-    except Exception:
-        pass
-
-    title = f"{COLORS[board_type]['name']} Archive"
-    win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
-    self._archive_windows[board_type] = win
-    def log_message(self, message: str):
-        """Append a message to the Log tab (and keep scrolled to bottom)."""
-        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        line = f"[{timestamp}] {message}\n"
-
-        # Log widget may not exist yet during early init
-        if hasattr(self, "log_text") and self.log_text is not None:
-            try:
-                self.log_text.insert(tk.END, line)
-                self.log_text.see(tk.END)
+        def open_archive(self, board_type):
+            acq = self.acq_9352 if board_type == '9352' else self.acq_9462
+            if not acq or not acq.config:
+                messagebox.showwarning("Warning", "No configuration loaded for this board")
                 return
+
+        data_dir = Path(acq.config.get('storage', {}).get('data_dir', '.'))
+        if not data_dir.exists():
+            # Create if missing (matches your request)
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+                self.log_message(f"Created missing data directory: {data_dir}")
+            except Exception as e:
+                messagebox.showwarning("Warning", f"Data directory does not exist and could not be created:\n{data_dir}\n{e}")
+                return
+
+            if not hasattr(self, "_archive_windows"):
+                self._archive_windows = {}
+
+            # Reuse an existing viewer per board
+            win = self._archive_windows.get(board_type)
+            try:
+                if win is not None and win.winfo_exists():
+                    win.lift()
+                    win.focus_force()
+                    return
             except Exception:
                 pass
 
-        # Fallback: console
+            title = f"{COLORS[board_type]['name']} Archive"
+            win = ArchiveViewer(self.root, title=title, data_dir=data_dir)
+            self._archive_windows[board_type] = win
+
+    def log_message(self, message: str):
+        """Thread-safe-ish logger: prints to terminal and writes to the Log tab if available."""
         try:
-            print(line.rstrip("\n"))
+            ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        except Exception:
+            ts = ''
+        line = f"[{ts}] {message}" if ts else str(message)
+        # Always print so you have logs even if GUI isn't ready yet
+        try:
+            print(line)
         except Exception:
             pass
 
-    # ==================================================================================
-    # GUI UPDATE LOOP WITH ROLLING INTEGRALS
-    # ==================================================================================
+        # If log widget not created yet, buffer messages
+        if not hasattr(self, '_log_buffer'):
+            self._log_buffer = []
+        if not hasattr(self, 'log_text') or self.log_text is None:
+            self._log_buffer.append(line)
+            # prevent unbounded growth
+            if len(self._log_buffer) > 2000:
+                self._log_buffer = self._log_buffer[-1000:]
+            return
 
+        # Flush buffered lines first
+        if self._log_buffer:
+            try:
+                for b in self._log_buffer:
+                    self.log_text.insert(tk.END, b + "\n")
+            except Exception:
+                pass
+            self._log_buffer.clear()
+
+        try:
+            self.log_text.insert(tk.END, line + "\n")
+            self.log_text.see(tk.END)
+        except Exception:
+            # widget may be destroyed during shutdown
+            pass
     def update_from_queue(self):
         try:
             while True:
                 msg = self.gui_queue.get_nowait()
                 msg_type = msg[0]
-
+            
                 if msg_type == 'log':
                     self.log_message(msg[1])
-
+                
                 elif msg_type == 'stats':
                     board_type = msg[1]
                     stats = msg[2]
                     self.update_stats_display(board_type, stats)
-
+                
                 elif msg_type == 'waveform':
                     self.update_waveform_display(msg[1])
-
+                
         except queue.Empty:
             pass
         finally:
             self.root.after(50, self.update_from_queue)
-
-    def update_stats_display(self, board_type, stats: 'AcquisitionStats'):
+        
+    def update_stats_display(self, board_type, stats: AcquisitionStats):
         if board_type not in self.stats_labels:
             return
-
+        
         labels = self.stats_labels[board_type]
+    
         labels['rate'].config(text=f"{stats.rate_hz:.1f} Hz")
         labels['captures'].config(text=f"{stats.captures}")
         labels['last'].config(text=stats.last_capture.split()[1] if stats.last_capture else "--")
         labels['peak_a'].config(text=f"{stats.mean_peak_a:.6f} V")
         labels['peak_b'].config(text=f"{stats.mean_peak_b:.6f} V")
-        labels['disk'].config(text=f"{stats.data_written_gb:.1f} GB written")
-
-    def update_waveform_display(self, wf_data: dict):
+        labels['disk'].config(text=f"{stats.data_written_gb:.1f} GB written")  # CHANGED
+    
+    def update_waveform_display(self, wf_data):
         board_type = wf_data['board']
         wfA = wf_data['wfA']
         wfB = wf_data['wfB']
         integralA = wf_data['integralA']
         integralB = wf_data['integralB']
         timestamp = wf_data['time']
-
+    
         data = self.waveform_data[board_type]
         data['A'].append(wfA)
         data['B'].append(wfB if wfB is not None else np.zeros_like(wfA))
         data['intA'].append(integralA)
         data['intB'].append(integralB)
         data['time'].append(timestamp)
-
+    
         if len(data['A']) > self.max_plot_points:
             data['A'].pop(0)
             data['B'].pop(0)
             data['intA'].pop(0)
             data['intB'].pop(0)
             data['time'].pop(0)
-
-        # Throttle redraw
+        
+        # Refresh plots more responsively (throttled)
         now = time.time()
         if not hasattr(self, '_last_plot_time'):
             self._last_plot_time = 0.0
         if (now - self._last_plot_time) >= 0.08:
             self._last_plot_time = now
             self.refresh_plots()
-
+        
     def refresh_plots(self):
-        """Redraw waveform + integral plots."""
+        """Redraw plots with ROLLING TIME for integrals"""
         for board_type in ['9352', '9462']:
             data = self.waveform_data[board_type]
+        
             if not data['A']:
                 continue
-
+            
             wfA = data['A'][-1]
             wfB = data['B'][-1]
-
-            # Prefer configured sample_rate if available
-            acq = self.acq_9352 if board_type == '9352' else self.acq_9462
-            sr = None
-            try:
-                if acq and acq.config:
-                    sr = float(acq.config.get('acquisition', {}).get('sample_rate_hz', 0.0))
-            except Exception:
-                sr = None
-            sample_rate = sr if (sr and sr > 0) else (250e6 if board_type == '9352' else 180e6)
-
-            time_us = np.arange(len(wfA), dtype=np.float64) / sample_rate * 1e6
-
+        
+            sample_rate = 250e6 if board_type == '9352' else 180e6
+            time_us = np.arange(len(wfA)) / sample_rate * 1e6
+        
             prefix = f"{board_type}_"
             self.lines[prefix + 'A'].set_data(time_us, wfA)
             self.lines[prefix + 'B'].set_data(time_us, wfB)
-
-            # Rolling window for integrals: x-axis is seconds since first sample in buffer stream
+        
+            # ROLLING TIME for integrals
             if len(data['time']) > 0:
                 if board_type not in self.integral_start_time:
                     self.integral_start_time[board_type] = data['time'][0]
-
-                int_times = np.asarray(data['time'], dtype=np.float64) - float(self.integral_start_time[board_type])
-                current_time = float(int_times[-1])
-                window_start = max(0.0, current_time - float(self.integral_time_window))
-
+            
+                int_times = np.array(data['time']) - self.integral_start_time[board_type]
+            
+                current_time = int_times[-1]
+                window_start = max(0, current_time - self.integral_time_window)
+            
                 mask = int_times >= window_start
                 int_times_windowed = int_times[mask]
-                intA_windowed = np.asarray(data['intA'], dtype=np.float64)[mask]
-                intB_windowed = np.asarray(data['intB'], dtype=np.float64)[mask]
-
+                intA_windowed = np.array(data['intA'])[mask]
+                intB_windowed = np.array(data['intB'])[mask]
+            
                 self.lines[prefix + 'intA'].set_data(int_times_windowed, intA_windowed)
                 self.lines[prefix + 'intB'].set_data(int_times_windowed, intB_windowed)
-
+            
                 ax_int = self.ax_9352_int if board_type == '9352' else self.ax_9462_int
                 ax_int.set_xlim(window_start, current_time)
                 ax_int.set_xlabel('Time (s)', color='white', fontsize=9)
-
+        
             ax_map = {
                 '9352': (self.ax_9352_A, self.ax_9352_B),
                 '9462': (self.ax_9462_A, self.ax_9462_B)
             }
-
+        
             for ax in ax_map[board_type]:
                 ax.relim()
                 ax.autoscale_view()
+            
+        self.canvas.draw_idle()
 
-            ax_int = self.ax_9352_int if board_type == '9352' else self.ax_9462_int
-            ax_int.relim()
-            ax_int.autoscale_view()
 
-        try:
-            self.canvas.draw_idle()
-        except Exception:
-            pass
 def main() -> int:
     try:
         root = tk.Tk()
