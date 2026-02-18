@@ -1090,19 +1090,17 @@ class ArchiveViewer(tk.Toplevel):
 
         # --- Right panel: plots + metadata ---
         self.fig = plt.Figure(figsize=(7, 6), dpi=100)
-        gs = self.fig.add_gridspec(3, 1, height_ratios=[1, 1, 1.1], hspace=0.35)
 
-        self.axA = self.fig.add_subplot(gs[0, 0])
-        self.axB = self.fig.add_subplot(gs[1, 0])
+        # Layout: one combined waveform axis (A+B) on top, integral axis on bottom
+        gs = self.fig.add_gridspec(3, 1, height_ratios=[1, 1, 1.1], hspace=0.35)
+        self.axW = self.fig.add_subplot(gs[0:2, 0])   # combined waveform axis
         self.axI = self.fig.add_subplot(gs[2, 0])
 
-        for ax in (self.axA, self.axB, self.axI):
+        for ax in (self.axW, self.axI):
             ax.grid(True, alpha=0.25)
 
-        self.axA.set_ylabel("A (V)")
-        self.axB.set_ylabel("B (V)")
+        self.axW.set_ylabel("Voltage (V)")
         self.axI.set_ylabel("Integral (V·s)")
-        self.axI.set_xlabel("Time (µs)")
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -1257,48 +1255,84 @@ class ArchiveViewer(tk.Toplevel):
         if not sel or not self._snips:
             return
         p = self._snips[int(sel[0])]
+
         try:
             wfA, wfB, sr, ts_ns, board, channels = self._load_npz(p)
             if wfA is None or sr <= 0:
                 raise ValueError("Missing wfA_V or sample_rate_hz")
 
-            t_us = np.arange(len(wfA)) / sr * 1e6
+            wfA = np.asarray(wfA, dtype=np.float32)
+            wfB_arr = np.asarray(wfB, dtype=np.float32) if wfB is not None else None
 
-            # Integrals
-            intA = np.cumsum(wfA) / sr
-            intB = np.cumsum(wfB) / sr if wfB is not None else None
+            # --- Time axis with auto units ---
+            t_s = np.arange(len(wfA), dtype=np.float32) / float(sr)
+            dur_s = float(t_s[-1]) if len(t_s) > 1 else 0.0
+            if dur_s < 2e-6:
+                t = t_s * 1e9
+                t_unit = "ns"
+            elif dur_s < 2e-3:
+                t = t_s * 1e6
+                t_unit = "µs"
+            elif dur_s < 2.0:
+                t = t_s * 1e3
+                t_unit = "ms"
+            else:
+                t = t_s
+                t_unit = "s"
 
-            # Plot A
-            self.axA.clear()
-            self.axA.grid(True, alpha=0.25)
-            self.axA.plot(t_us, wfA, label='A')
-            self.axA.set_ylabel("A (V)")
-            self.axA.set_title(f"{p.name}")
+            # --- Baseline subtraction (matches legacy behavior) ---
+            # Prefer stored baseline if present; else use mean of first 5% (capped).
+            def _baseline(wf: np.ndarray) -> float:
+                n = len(wf)
+                k = max(1, min(256, n // 20))  # 5% up to 256 samples
+                return float(np.mean(wf[:k]))
 
-            # Plot B
-            self.axB.clear()
-            self.axB.grid(True, alpha=0.25)
-            if wfB is not None:
-                self.axB.plot(t_us, wfB, label='B')
-            self.axB.set_ylabel("B (V)")
+            baseA = _baseline(wfA)
+            wfA0 = wfA - baseA
 
-            # Plot integrals
+            baseB = None
+            wfB0 = None
+            if wfB_arr is not None:
+                baseB = _baseline(wfB_arr)
+                wfB0 = wfB_arr - baseB
+
+            # --- Cumulative integrals ---
+            dt = 1.0 / float(sr)
+            intA = np.cumsum(wfA0) * dt
+            intB = np.cumsum(wfB0) * dt if wfB0 is not None else None
+
+            # --- Colors by board (9352/9462) ---
+            board_key = "9352" if ("9352" in str(board).lower() or "9352" in self.title().lower()) else (
+                        "9462" if ("9462" in str(board).lower() or "9462" in self.title().lower()) else "9352")
+            colA = COLORS.get(board_key, COLORS["9352"])["A"]
+            colB = COLORS.get(board_key, COLORS["9352"])["B"]
+
+            # --- Plot waveforms (A solid, B dashed) in ONE axis ---
+            self.axW.clear()
+            self.axW.grid(True, alpha=0.25)
+            self.axW.plot(t, wfA, color=colA, linewidth=1.2, label="Channel A")
+            if wfB_arr is not None:
+                self.axW.plot(t, wfB_arr, color=colB, linewidth=1.2, linestyle="--", label="Channel B")
+            self.axW.set_title(p.name)
+            self.axW.set_ylabel("Voltage (V)")
+            self.axW.set_xlabel(f"Time ({t_unit})")
+            self.axW.legend(loc="upper right", fontsize=8, framealpha=0.85)
+
+            # --- Plot integrals ---
             self.axI.clear()
             self.axI.grid(True, alpha=0.25)
-            self.axI.plot(t_us, intA, label="∫A dt")
+            self.axI.plot(t, intA, color=colA, linewidth=1.2, label="∫A dt")
             if intB is not None:
-                self.axI.plot(t_us, intB, linestyle='--', label="∫B dt")
+                self.axI.plot(t, intB, color=colB, linewidth=1.2, linestyle="--", label="∫B dt")
             self.axI.set_ylabel("Integral (V·s)")
-            self.axI.set_xlabel("Time (µs)")
+            self.axI.set_xlabel(f"Time ({t_unit})")
             self.axI.legend(loc='best', fontsize=8)
 
-            # Metadata
+            # --- Metadata ---
             pkA = float(np.max(wfA) - np.min(wfA))
-            pkB = float(np.max(wfB) - np.min(wfB)) if wfB is not None else 0.0
-            areaA = float(np.trapezoid(wfA, dx=1.0/sr))
-            areaB = float(np.trapezoid(wfB, dx=1.0/sr)) if wfB is not None else 0.0
-            baseA = float(np.mean(wfA[:max(1, len(wfA)//20)]))
-            baseB = float(np.mean(wfB[:max(1, len(wfB)//20)])) if wfB is not None else 0.0
+            pkB = float(np.max(wfB_arr) - np.min(wfB_arr)) if wfB_arr is not None else 0.0
+            areaA = float(np.trapezoid(wfA0, dx=dt))
+            areaB = float(np.trapezoid(wfB0, dx=dt)) if wfB0 is not None else 0.0
 
             self.meta_text.delete("1.0", tk.END)
             self.meta_text.insert(tk.END, f"File: {p}\n")
@@ -1312,19 +1346,22 @@ class ArchiveViewer(tk.Toplevel):
                 self.meta_text.insert(tk.END, f"Channels: {channels}\n")
             self.meta_text.insert(tk.END, f"Sample rate: {sr:.6g} Hz\n")
             self.meta_text.insert(tk.END, f"Waveform points: {len(wfA)}\n")
-            self.meta_text.insert(tk.END, f"Peak A: {pkA:.6g} V\n")
-            if wfB is not None:
-                self.meta_text.insert(tk.END, f"Peak B: {pkB:.6g} V\n")
-            self.meta_text.insert(tk.END, f"Area A: {areaA:.6g} V·s\n")
-            if wfB is not None:
-                self.meta_text.insert(tk.END, f"Area B: {areaB:.6g} V·s\n")
+            self.meta_text.insert(tk.END, f"Peak-to-peak A: {pkA:.6g} V\n")
+            if wfB_arr is not None:
+                self.meta_text.insert(tk.END, f"Peak-to-peak B: {pkB:.6g} V\n")
             self.meta_text.insert(tk.END, f"Baseline A: {baseA:.6g} V\n")
-            if wfB is not None:
+            if wfB_arr is not None and baseB is not None:
                 self.meta_text.insert(tk.END, f"Baseline B: {baseB:.6g} V\n")
+            self.meta_text.insert(tk.END, f"Area A (baseline-sub): {areaA:.6g} V·s\n")
+            if wfB0 is not None:
+                self.meta_text.insert(tk.END, f"Area B (baseline-sub): {areaB:.6g} V·s\n")
 
             self.canvas.draw_idle()
 
         except Exception as e:
+            self.meta_text.delete("1.0", tk.END)
+            self.meta_text.insert(tk.END, f"Failed to preview {p.name}: {e}\n")
+
             self.meta_text.delete("1.0", tk.END)
             self.meta_text.insert(tk.END, f"Failed to preview {p.name}: {e}\n")
 
