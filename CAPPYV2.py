@@ -248,7 +248,7 @@ waveforms:
   enable: true
   full_record: true
   mode: every_n
-  every_n: 1
+  every_n: 100
   threshold_integral_Vs: 0.0
   threshold_peak_V: 0.0
   max_waveforms_per_sec: 50
@@ -263,6 +263,7 @@ storage:
   flush_every_records: 20000
   flush_every_seconds: 2
   sqlite_commit_every_snips: 200
+  save_every_buffers: 100
 
 runtime:
   readout_mode: TR
@@ -326,7 +327,7 @@ waveforms:
   enable: true
   full_record: true
   mode: every_n
-  every_n: 1
+  every_n: 100
   threshold_integral_Vs: 0.0
   threshold_peak_V: 0.0
   max_waveforms_per_sec: 50
@@ -341,6 +342,7 @@ storage:
   flush_every_records: 20000
   flush_every_seconds: 2
   sqlite_commit_every_snips: 200
+  save_every_buffers: 100
 
 runtime:
   readout_mode: NPT
@@ -952,15 +954,24 @@ class BoardAcquisition:
         """
         Main acquisition loop - runs in background thread.
 
-        KEY CHANGE vs original:
-          • postAsyncBuffer() is called AFTER processing is complete so the
-            board gets natural backpressure (v1.3 approach).
-          • All disk writes are handed off to a dedicated background thread via
-            a bounded queue, so compression/fsync never stalls the loop.
-          • buffers_allocated defaults to 16 (matching v1.3 for stability).
+        BUFFER LIFECYCLE (matches ATS SDK canonical pattern and v1.3):
+          1. waitAsyncBufferComplete(buf) — block until board fills buf
+          2. Lightweight processing on buf (reduce to scalars, maybe one
+             waveform snapshot every N buffers)
+          3. postAsyncBuffer(buf) — give buf back AFTER processing is done
+          4. Heavy work (disk save) handed off to background thread AFTER repost
+
+        This ensures the board can never outrun us: it cannot overwrite a
+        buffer we haven't given back yet.  With 16 DMA buffers the board has
+        ~15 buffers of headroom while we process one.
+
+        Per-buffer work is kept minimal (like v1.3):
+          - Reduce ALL records to scalar integrals/peaks (fast vectorised ops)
+          - Convert ONE waveform to volts every N buffers for GUI display
+          - Save to disk only every save_every_buffers (async, uncompressed)
         """
-        # Background disk-writer
-        _write_queue: queue.Queue = queue.Queue(maxsize=64)
+        # Background disk-writer (small queue — natural backpressure)
+        _write_queue: queue.Queue = queue.Queue(maxsize=32)
         _writer = threading.Thread(
             target=self._disk_writer_thread,
             args=(_write_queue,),
@@ -984,7 +995,8 @@ class BoardAcquisition:
             post_trigger = int(acq_cfg.get('post_trigger_samples', 256))
             samples_per_record = pre_trigger + post_trigger
             records_per_buffer = int(acq_cfg.get('records_per_buffer', 128))
-            # Default 16 buffers (matches v1.3 for indefinite streaming stability)
+            # Default 16 buffers (SDK recommends 3+ for OS latency tolerance;
+            # 16 matches v1.3 and keeps the DMA ring small enough to never overflow)
             buffers_allocated = int(acq_cfg.get('buffers_allocated', 16))
             
             channels_mask_str = str(acq_cfg.get('channels_mask', 'CHANNEL_A|CHANNEL_B'))
@@ -1061,37 +1073,28 @@ class BoardAcquisition:
 
             buf_count = 0
             last_stats_time = time.time()
-            
+            last_gui_wf_time = 0.0          # throttle GUI waveform updates
+            gui_wf_interval = 0.1           # send waveform to GUI at most every 100ms
+            save_every = max(1, self._save_every) if self._save_every else 0
+
             while self.running:
                 if self.paused:
                     time.sleep(0.1)
                     continue
-                
-                # ============================================================================
-                # Light backpressure: if disk writer is falling behind, briefly yield
-                # (With V1.3-style repost-after-processing, buffer overflow is already
-                # prevented; this just keeps the write queue from growing unbounded)
-                # ============================================================================
-                while _write_queue.qsize() > buffers_allocated:
-                    time.sleep(0.001)
-                    if self.paused or not self.running:
-                        break
-                    
+
                 try:
+                    # ── STEP 1: Wait for the board to fill the next buffer ──
                     buf_index = buf_count % buffers_allocated
                     buf = buffers[buf_index]
-                    
                     self.board.waitAsyncBufferComplete(buf.addr, 2000)
-                    
-                    # ── V1.3-STYLE: Process directly from buffer memory, then
-                    # repost AFTER all processing is done.  This provides natural
-                    # backpressure — the board cannot overwrite a buffer we haven't
-                    # finished with yet.  This is the primary fix for ApiBufferOverflow.
+
+                    # ── STEP 2: LIGHTWEIGHT processing on the DMA buffer ──
+                    # The buffer is owned by us now (board cannot touch it).
+                    # We do the minimum work needed, then give it back.
                     raw = buf.buffer
                     if raw.dtype != np.uint16:
                         raw = raw.astype(np.uint16, copy=False)
 
-                    # ── Process (board cannot refill this buffer until we repost it)
                     if ch_count == 2:
                         A = raw[0::2].reshape(records_per_buffer, samples_per_record)
                         B = raw[1::2].reshape(records_per_buffer, samples_per_record)
@@ -1099,94 +1102,112 @@ class BoardAcquisition:
                         A = raw.reshape(records_per_buffer, samples_per_record)
                         B = None
 
-                    # ── Stale-buffer guard ─────────────────────────────────────────
-                    _floor_code = 0
-                    _stale = bool(np.all(A[0] == _floor_code))
-                    if _stale:
+                    # Stale-buffer guard
+                    if np.all(A[0] == 0):
                         self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
                         buf_count += 1
                         continue
-                    # ──────────────────────────────────────────────────────────────
 
-                    wfA_volts = _codes_to_volts_u16(A[0], self.vpp_A)
-                    wfB_volts = _codes_to_volts_u16(B[0], self.vpp_B) if B is not None else None
+                    # ── Fast scalar reduction on uint16 (no float conversion yet) ──
+                    # Peak in ADC codes (much cheaper than full volts conversion)
+                    peak_code_a = int(np.max(A)) - 32768
+                    peak_a_v = abs(peak_code_a) * (self.vpp_A / 65536.0)
+                    peak_b_v = 0.0
+                    if B is not None:
+                        peak_code_b = int(np.max(B)) - 32768
+                        peak_b_v = abs(peak_code_b) * (self.vpp_B / 65536.0)
 
-                    # Convert all records (needed for stats and optionally disk save)
-                    A_volts_all = _codes_to_volts_u16(A, self.vpp_A)      # shape (R, S)
-                    B_volts_all = _codes_to_volts_u16(B, self.vpp_B) if B is not None else None
-                    
-                    integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
-                    integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
+                    # ── Convert ONE waveform for GUI display (only when needed) ──
+                    now = time.time()
+                    want_gui = (now - last_gui_wf_time) >= gui_wf_interval
+                    want_save = (save_every > 0 and self._session_dir is not None
+                                 and (buf_count % save_every == 0))
 
-                    # ── NOW repost the buffer — processing of raw data is complete
-                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
+                    wfA_volts = None
+                    wfB_volts = None
+                    integralA = 0.0
+                    integralB = 0.0
 
-                    # ── Enqueue disk save (non-blocking; handled by background thread)
-                    if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
+                    if want_gui or want_save:
+                        # Convert record 0 to volts (one record, not all)
+                        wfA_volts = _codes_to_volts_u16(A[0], self.vpp_A)
+                        wfB_volts = (_codes_to_volts_u16(B[0], self.vpp_B)
+                                     if B is not None else None)
+                        integralA = float(np.trapezoid(wfA_volts)) / self.sample_rate_hz
+                        integralB = (float(np.trapezoid(wfB_volts)) / self.sample_rate_hz
+                                     if wfB_volts is not None else 0.0)
+
+                    # ── If saving this buffer, copy the full data BEFORE repost ──
+                    save_data = None
+                    if want_save:
                         ts_ns = time.time_ns()
+                        # Copy the needed data out of the DMA buffer
+                        A_volts_all = _codes_to_volts_u16(A, self.vpp_A)
+                        B_volts_all = (_codes_to_volts_u16(B, self.vpp_B)
+                                       if B is not None else None)
                         fname = f"buf_{buf_count:06d}.npz"
                         fpath = self._session_dir / fname
-                        # Save ALL records in this buffer (shape: [records_per_buffer, samples])
                         if B_volts_all is None:
-                            save_kwargs = dict(
+                            save_data = (fpath, dict(
                                 wfA_V=A_volts_all.astype(np.float32, copy=False),
                                 sample_rate_hz=float(self.sample_rate_hz),
                                 timestamp_ns=int(ts_ns),
                                 board=str(self.board_type),
                                 channels="A",
-                            )
-                            chs = "A"
+                            ), self._index_path,
+                               f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},A\n"
+                               if self._index_path else None)
                         else:
-                            save_kwargs = dict(
+                            save_data = (fpath, dict(
                                 wfA_V=A_volts_all.astype(np.float32, copy=False),
                                 wfB_V=B_volts_all.astype(np.float32, copy=False),
                                 sample_rate_hz=float(self.sample_rate_hz),
                                 timestamp_ns=int(ts_ns),
                                 board=str(self.board_type),
                                 channels="A|B",
-                            )
-                            chs = "A|B"
-                        index_line = (
-                            f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},{chs}\n"
-                            if self._index_path is not None else None
-                        )
-                        try:
-                            # Queue to background writer (bounded queue provides backpressure)
-                            _write_queue.put(
-                                (fpath, save_kwargs, self._index_path, index_line),
-                                block=True, timeout=2.0,
-                            )
-                        except queue.Full:
-                            self._log(f"Warning: disk writer queue full at buf {buf_count}, dropping save")
+                            ), self._index_path,
+                               f"{buf_count},{ts_ns},{float(self.sample_rate_hz)},{fname},A|B\n"
+                               if self._index_path else None)
 
+                    # ── STEP 3: Give buffer back to the board ──────────────────
+                    # ALL reads from the DMA memory are done.  The board can now
+                    # refill this buffer.  This is the SDK-canonical position for
+                    # postAsyncBuffer().
+                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
+
+                    # ── STEP 4: Enqueue disk save (after repost — uses copies) ──
+                    if save_data is not None:
+                        try:
+                            _write_queue.put(save_data, block=True, timeout=2.0)
+                        except queue.Full:
+                            self._log(f"Warning: disk writer full at buf {buf_count}, skipping save")
+
+                    # ── STEP 5: Update stats & GUI ─────────────────────────────
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    # Peak over ALL records in the buffer for a meaningful reading
-                    self.stats.mean_peak_a = float(np.max(np.abs(A_volts_all)))
-                    if B_volts_all is not None:
-                        self.stats.mean_peak_b = float(np.max(np.abs(B_volts_all)))
-                        
-                    now = time.time()
+                    self.stats.mean_peak_a = peak_a_v
+                    self.stats.mean_peak_b = peak_b_v
+
                     if buf_count > 0 and now > last_stats_time:
                         self.stats.rate_hz = records_per_buffer / (now - last_stats_time)
                     last_stats_time = now
-                    
-                    self._send_waveform_update(wfA_volts, wfB_volts, integralA, integralB)
-                    if buf_count % 10 == 0:
+
+                    if want_gui and wfA_volts is not None:
+                        self._send_waveform_update(wfA_volts, wfB_volts,
+                                                   integralA, integralB)
+                        last_gui_wf_time = now
+
+                    if buf_count % 50 == 0:
                         self._send_stats_update()
-                        
+
                     buf_count += 1
-                    
-                    # ============================================================================
-                    # OPTION 1: Trigger detection and statistics logging
-                    # (Use processed voltage data since raw buffer may be reused by board)
-                    # ============================================================================
-                    has_trigger = float(np.max(np.abs(A_volts_all))) >= getattr(self, '_trigger_signal_threshold_v', 0.5)
-                    if has_trigger:
-                        self._last_trigger_time = time.time()
+
+                    # ── Trigger detection (using already-computed peak) ────────
+                    if peak_a_v >= getattr(self, '_trigger_signal_threshold_v', 0.5):
+                        self._last_trigger_time = now
                         self._trigger_count += 1
-                    
-                    if buf_count % 100 == 0:
+
+                    if buf_count % 500 == 0:
                         log_timeout_statistics(self, buf_count)
                         check_noise_test_timeout_elapsed(self)
                     
