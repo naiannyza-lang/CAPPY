@@ -780,10 +780,10 @@ class BoardAcquisition:
           • buffers_allocated defaults to 64 (was 16) for extra headroom.
         """
         # Background disk-writer
-        _write_queue: queue.Queue = queue.Queue(maxsize=256)
+        self._write_queue: queue.Queue = queue.Queue(maxsize=256)
         _writer = threading.Thread(
             target=self._disk_writer_thread,
-            args=(_write_queue,),
+            args=(self._write_queue,),
             daemon=True,
             name=f"DiskWriter-{self.board_type}",
         )
@@ -795,7 +795,7 @@ class BoardAcquisition:
         # Trigger timeout parameters
         self._last_trigger_time = time.time()
         self._trigger_timeout_ms = 5000.0  # 5 seconds - adjust for your beam cycle
-        self._trigger_signal_threshold_v = 0.5  # Proton signal minimum
+        self._trigger_signal_threshold_v = 0.1  # LOWERED for more sensitivity - Proton signal minimum (adjust based on noise floor)
         self._vpp_for_detection = 4.0  # Your ADC range
         
         # Beam state tracking
@@ -932,7 +932,7 @@ class BoardAcquisition:
                         
                         # Log beam OFF transition
                         self._log(f"[OPTION1] Beam OFF detected (no triggers for {time_since_trigger/1000:.2f}s)")
-                        self._log(f"[OPTION1] Queue at {len(_write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
+                        self._log(f"[OPTION1] Queue at {len(self._write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
                         
                         # ✅ SYNCHRONOUS FLUSH: Wait for queue to empty (like v1.3)
                         flush_start = now
@@ -1097,8 +1097,15 @@ class BoardAcquisition:
                     # OPTION 1: TRIGGER DETECTION AND STATISTICS
                     # ============================================================================
                     # Detect if this buffer contains triggers
+                    # ============================================================================
+                    # OPTION 1: Trigger detection using configurable threshold
+                    # ============================================================================
                     raw_buffer_u16 = buf.buffer if hasattr(buf, 'buffer') else raw
-                    has_trigger = np.max(np.abs(raw_buffer_u16.astype(np.float32) - 32768)) > 2048  # ~0.5V for Vpp=4
+                    
+                    # Convert ADC max to voltage and compare with threshold
+                    max_adc_count = np.max(np.abs(raw_buffer_u16.astype(np.float32) - 32768))
+                    max_voltage = (max_adc_count / 65536.0) * self._vpp_for_detection
+                    has_trigger = max_voltage >= self._trigger_signal_threshold_v
                     
                     if has_trigger:
                         self._last_trigger_time = time.time()
