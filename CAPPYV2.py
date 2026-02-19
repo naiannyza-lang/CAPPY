@@ -29,7 +29,8 @@ from email.message import EmailMessage
 from dataclasses import dataclass
 from datetime import datetime, date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Callable
+from enum import Enum
 
 import numpy as np
 import pandas as pd
@@ -49,6 +50,17 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import re
 plt.style.use('dark_background')
+
+# ==================================================================================
+# BEAM STATE TRACKING (Option 1: Explicit Trigger Timeout)
+# ==================================================================================
+
+class BeamState(Enum):
+    """Beam state enumeration for trigger-aware buffer management"""
+    UNKNOWN = "unknown"
+    ON = "on"
+    OFF = "off"
+    TRANSITIONING = "transitioning"
 
 # ==================================================================================
 # GLOBAL CONFIGURATION
@@ -777,6 +789,37 @@ class BoardAcquisition:
         )
         _writer.start()
 
+        # ============================================================================
+        # OPTION 1: EXPLICIT TRIGGER TIMEOUT INITIALIZATION
+        # ============================================================================
+        # Trigger timeout parameters
+        self._last_trigger_time = time.time()
+        self._trigger_timeout_ms = 5000.0  # 5 seconds - adjust for your beam cycle
+        self._trigger_signal_threshold_v = 0.5  # Proton signal minimum
+        self._vpp_for_detection = 4.0  # Your ADC range
+        
+        # Beam state tracking
+        self._beam_state = BeamState.UNKNOWN
+        self._beam_off_detected = False
+        self._last_state_transition = time.time()
+        
+        # Noise test mode
+        self._noise_test_mode = False
+        self._noise_test_end_time = None
+        
+        # Statistics
+        self._trigger_count = 0
+        self._queue_max_depth = 0
+        self._flush_count = 0
+        self._total_buffers_flushed = 0
+        self._transition_time = None
+        self._beam_state_callbacks = []
+        
+        self._log("[OPTION1] Initialized explicit trigger timeout tracking")
+        self._log(f"[OPTION1] Trigger timeout: {self._trigger_timeout_ms}ms")
+        self._log(f"[OPTION1] Beam OFF threshold: {self._trigger_timeout_ms}ms of no triggers")
+        # ============================================================================
+
         try:
             if not self._configure_board():
                 return
@@ -829,6 +872,7 @@ class BoardAcquisition:
                 
             self.board.startCapture()
             self._log("Acquisition started")
+            self._acq_start_time = time.time()  # Track for summary
             
             self.stats.started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -869,14 +913,89 @@ class BoardAcquisition:
                     time.sleep(0.1)
                     continue
                 
-                # ⚠️ CRITICAL FIX #1: Backpressure throttling
-                # If write queue is accumulating, slow down acquisition to allow I/O to catch up
-                # This prevents ApiBufferOverflow by preventing buffer ring saturation
-                max_queue_depth = buffers_allocated - 4  # Keep 4 buffers free for incoming data
+                # ============================================================================
+                # OPTION 1: TRIGGER TIMEOUT AWARE BACKPRESSURE
+                # ============================================================================
+                now = time.time()
+                time_since_trigger = (now - self._last_trigger_time) * 1000  # ms
+                
+                # Determine current beam state based on trigger timeout
+                if time_since_trigger > self._trigger_timeout_ms:
+                    # No triggers for a while - beam is OFF
+                    is_beam_on = False
+                    
+                    # First time detecting beam off?
+                    if not self._beam_off_detected:
+                        self._beam_off_detected = True
+                        self._beam_state = BeamState.OFF
+                        self._transition_time = now
+                        
+                        # Log beam OFF transition
+                        self._log(f"[OPTION1] Beam OFF detected (no triggers for {time_since_trigger/1000:.2f}s)")
+                        self._log(f"[OPTION1] Queue at {len(_write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
+                        
+                        # ✅ SYNCHRONOUS FLUSH: Wait for queue to empty (like v1.3)
+                        flush_start = now
+                        max_flush_time = 5.0  # seconds
+                        
+                        while len(_write_queue.queue) > 0 and (time.time() - flush_start) < max_flush_time:
+                            time.sleep(0.01)  # 10ms wait per iteration
+                            
+                            # Periodic status during flush
+                            elapsed_flush = time.time() - flush_start
+                            if int(elapsed_flush * 10) % 5 == 0:  # Every 500ms
+                                self._log(f"[OPTION1] Flushing... queue={len(_write_queue.queue):3d} "
+                                        f"elapsed={elapsed_flush:.2f}s")
+                        
+                        flush_end = time.time()
+                        flush_elapsed = flush_end - flush_start
+                        
+                        if len(_write_queue.queue) == 0:
+                            self._log(f"[OPTION1] ✓ Queue flushed successfully in {flush_elapsed:.2f}s")
+                        else:
+                            self._log(f"[OPTION1] ⚠ Queue not fully empty after {flush_elapsed:.2f}s, "
+                                    f"{len(_write_queue.queue)} items remaining")
+                        
+                        self._flush_count += 1
+                        self._total_buffers_flushed += len(_write_queue.queue)
+                else:
+                    # Triggers are present - beam is ON
+                    is_beam_on = True
+                    
+                    # Transition from OFF to ON?
+                    if self._beam_off_detected:
+                        self._beam_off_detected = False
+                        self._beam_state = BeamState.ON
+                        self._transition_time = now
+                        
+                        self._log(f"[OPTION1] Beam ON resumed (triggers detected)")
+                
+                # Apply adaptive backpressure
+                if self._noise_test_mode:
+                    # NOISE TEST: Very strict (like v1.3)
+                    max_queue_depth = 2
+                elif self._beam_off_detected:
+                    # Beam OFF: Stop accepting new data
+                    max_queue_depth = 1
+                else:
+                    # Beam ON: Normal operation
+                    max_queue_depth = buffers_allocated - 4
+                
+                # Track max depth
+                current_depth = len(_write_queue.queue)
+                if current_depth > self._queue_max_depth:
+                    self._queue_max_depth = current_depth
+                
+                # Apply throttling
                 while len(_write_queue.queue) > max_queue_depth:
-                    time.sleep(0.001)  # Sleep 1ms at a time
+                    time.sleep(0.001)
                     if self.paused or not self.running:
                         break
+                    
+                    # Log if excessively backpressured
+                    if len(_write_queue.queue) > max_queue_depth * 2:
+                        self._log(f"[OPTION1] Heavy backpressure: queue={len(_write_queue.queue)}/{max_queue_depth}")
+                # ============================================================================
                     
                 try:
                     buf_index = buf_count % buffers_allocated
@@ -974,13 +1093,25 @@ class BoardAcquisition:
                         
                     buf_count += 1
                     
-                    # ⚠️ FIX #2: Monitor queue depth for diagnostics
-                    if buf_count % 100 == 0:  # Every 100th buffer
-                        queue_depth = len(_write_queue.queue)
-                        queue_ratio = queue_depth / buffers_allocated if buffers_allocated > 0 else 0
-                        if queue_ratio > 0.75:  # If >75% full
-                            self._log(f"⚠️  Write queue at {queue_depth}/{buffers_allocated} "
-                                    f"({queue_ratio*100:.0f}%) - I/O may be slow")
+                    # ============================================================================
+                    # OPTION 1: TRIGGER DETECTION AND STATISTICS
+                    # ============================================================================
+                    # Detect if this buffer contains triggers
+                    raw_buffer_u16 = buf.buffer if hasattr(buf, 'buffer') else raw
+                    has_trigger = np.max(np.abs(raw_buffer_u16.astype(np.float32) - 32768)) > 2048  # ~0.5V for Vpp=4
+                    
+                    if has_trigger:
+                        self._last_trigger_time = time.time()
+                        self._trigger_count += 1
+                        if self._beam_off_detected:
+                            self._log("[OPTION1] Beam ON resumed")
+                        self._beam_off_detected = False
+                    
+                    # Periodic statistics logging
+                    if buf_count % 100 == 0:  # Every 100 buffers
+                        log_timeout_statistics(self, buf_count)
+                        check_noise_test_timeout_elapsed(self)
+                    # ============================================================================
                     
                 except Exception as e:
                     if "ApiWaitTimeout" in str(e):
@@ -1002,6 +1133,14 @@ class BoardAcquisition:
                 pass
             self.running = False
             self._log("Acquisition stopped")
+            
+            # ============================================================================
+            # OPTION 1: LOG SUMMARY STATISTICS
+            # ============================================================================
+            elapsed_time = time.time() - (getattr(self, '_acq_start_time', time.time()))
+            log_timeout_summary(self, elapsed_time)
+            # ============================================================================
+            
             # Gracefully drain and stop the disk writer
             try:
                 _write_queue.put(None)   # sentinel
@@ -1022,6 +1161,92 @@ Complete GUI with ALL improvements:
 - Trigger as percentage
 - Disk as "GB written"
 """
+
+# ==================================================================================
+# OPTION 1: TRIGGER TIMEOUT HELPER FUNCTIONS
+# ==================================================================================
+
+def log_timeout_statistics(acquisition_obj, buf_count, now=None):
+    """
+    Log detailed beam state and queue statistics.
+    
+    Call every 100-500 buffers during acquisition.
+    """
+    if now is None:
+        now = time.time()
+    
+    time_since_trigger = (now - acquisition_obj._last_trigger_time) * 1000
+    elapsed_total = now - acquisition_obj._transition_time if acquisition_obj._transition_time else 0
+    
+    # State string
+    state_str = acquisition_obj._beam_state.value.upper()
+    if acquisition_obj._noise_test_mode:
+        state_str = "NOISE_TEST"
+    
+    # Timeout status
+    if time_since_trigger > acquisition_obj._trigger_timeout_ms:
+        timeout_status = f"TIMEOUT ({time_since_trigger/1000:.1f}s)"
+    else:
+        timeout_status = f"OK ({time_since_trigger/1000:.1f}s)"
+    
+    acquisition_obj._log(
+        f"[STATS] Buf={buf_count:7d} Triggers={acquisition_obj._trigger_count:6d} "
+        f"State={state_str:10s} Timeout={timeout_status:15s} "
+        f"MaxQ={acquisition_obj._queue_max_depth:2d} Flushes={acquisition_obj._flush_count}"
+    )
+
+
+def check_noise_test_timeout_elapsed(acquisition_obj):
+    """Check if noise test should auto-disable"""
+    if acquisition_obj._noise_test_mode and acquisition_obj._noise_test_end_time is not None:
+        if time.time() > acquisition_obj._noise_test_end_time:
+            acquisition_obj._log("[NOISE-TEST] Timeout reached - disabling noise test mode")
+            acquisition_obj._noise_test_mode = False
+
+
+def enable_noise_test_timeout(acquisition_obj, enable=True, duration_seconds=60):
+    """
+    Enable noise test mode - flush synchronously like v1.3.
+    
+    During noise test:
+    - Queue limited to 2 (almost synchronous)
+    - Acts like v1.3's blocking I/O
+    - Good for testing stability without triggers
+    """
+    acquisition_obj._noise_test_mode = enable
+    
+    if enable:
+        acquisition_obj._log("[NOISE-TEST] ===== ENABLED =====")
+        acquisition_obj._log("[NOISE-TEST] Flushing buffers synchronously (like v1.3)")
+        acquisition_obj._log(f"[NOISE-TEST] Duration: {duration_seconds} seconds")
+        acquisition_obj._log("[NOISE-TEST] Expected:")
+        acquisition_obj._log("[NOISE-TEST]   - Queue limited to 2 items")
+        acquisition_obj._log("[NOISE-TEST]   - Constant backpressure")
+        acquisition_obj._log("[NOISE-TEST]   - Demonstrates v1.3 stability")
+        acquisition_obj._log("[NOISE-TEST] ========================")
+        
+        if duration_seconds > 0:
+            acquisition_obj._noise_test_end_time = time.time() + duration_seconds
+        else:
+            acquisition_obj._noise_test_end_time = None
+        
+        acquisition_obj._transition_time = time.time()
+    else:
+        acquisition_obj._log("[NOISE-TEST] DISABLED - returning to normal operation")
+
+
+def log_timeout_summary(acquisition_obj, elapsed_seconds):
+    """Log summary statistics at end of acquisition"""
+    acquisition_obj._log("\n" + "="*80)
+    acquisition_obj._log("[OPTION1] SUMMARY STATISTICS")
+    acquisition_obj._log("="*80)
+    acquisition_obj._log(f"Duration:           {elapsed_seconds:.1f} seconds")
+    acquisition_obj._log(f"Triggers detected:  {acquisition_obj._trigger_count}")
+    acquisition_obj._log(f"Trigger rate:       {acquisition_obj._trigger_count/max(elapsed_seconds, 1):.1f} Hz")
+    acquisition_obj._log(f"Queue flushes:      {acquisition_obj._flush_count}")
+    acquisition_obj._log(f"Max queue depth:    {acquisition_obj._queue_max_depth}")
+    acquisition_obj._log(f"Final beam state:   {acquisition_obj._beam_state.value}")
+    acquisition_obj._log("="*80 + "\n")
 
 # ==================================================================================
 # GUI CLASSES
