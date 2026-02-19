@@ -868,12 +868,21 @@ class BoardAcquisition:
                 if self.paused:
                     time.sleep(0.1)
                     continue
+                
+                # ⚠️ CRITICAL FIX #1: Backpressure throttling
+                # If write queue is accumulating, slow down acquisition to allow I/O to catch up
+                # This prevents ApiBufferOverflow by preventing buffer ring saturation
+                max_queue_depth = buffers_allocated - 4  # Keep 4 buffers free for incoming data
+                while len(self.write_queue) > max_queue_depth:
+                    time.sleep(0.001)  # Sleep 1ms at a time
+                    if self.paused or not self.running:
+                        break
                     
                 try:
                     buf_index = buf_count % buffers_allocated
                     buf = buffers[buf_index]
                     
-                    self.board.waitAsyncBufferComplete(buf.addr, 1000)
+                    self.board.waitAsyncBufferComplete(buf.addr, 2000)
                     
                     # ── CRITICAL: copy raw data first, then immediately recycle
                     # the buffer back to the board BEFORE doing any processing.
@@ -964,6 +973,14 @@ class BoardAcquisition:
                         self._send_stats_update()
                         
                     buf_count += 1
+                    
+                    # ⚠️ FIX #2: Monitor queue depth for diagnostics
+                    if buf_count % 100 == 0:  # Every 100th buffer
+                        queue_depth = len(self.write_queue)
+                        queue_ratio = queue_depth / buffers_allocated if buffers_allocated > 0 else 0
+                        if queue_ratio > 0.75:  # If >75% full
+                            self._log(f"⚠️  Write queue at {queue_depth}/{buffers_allocated} "
+                                    f"({queue_ratio*100:.0f}%) - I/O may be slow")
                     
                 except Exception as e:
                     if "ApiWaitTimeout" in str(e):
@@ -2740,10 +2757,12 @@ class DualBoardGUI:
             pass
 
         # Refresh plots more responsively (throttled)
+        # FIX #4: Reduced from 0.05 (50ms) to 0.1 (100ms) to reduce matplotlib overhead
+        # This halves plotting CPU usage while maintaining responsive visual feedback
         now = time.time()
         if not hasattr(self, '_last_plot_time'):
             self._last_plot_time = 0.0
-        if (now - self._last_plot_time) >= 0.05:
+        if (now - self._last_plot_time) >= 0.1:
             self._last_plot_time = now
             self.refresh_plots()
 
