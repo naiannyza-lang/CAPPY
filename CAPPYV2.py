@@ -932,32 +932,32 @@ class BoardAcquisition:
                         
                         # Log beam OFF transition
                         self._log(f"[OPTION1] Beam OFF detected (no triggers for {time_since_trigger/1000:.2f}s)")
-                        self._log(f"[OPTION1] Queue at {len(self._write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
+                        self._log(f"[OPTION1] Queue at {len(self.self._write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
                         
                         # ✅ SYNCHRONOUS FLUSH: Wait for queue to empty (like v1.3)
                         flush_start = now
                         max_flush_time = 5.0  # seconds
                         
-                        while len(_write_queue.queue) > 0 and (time.time() - flush_start) < max_flush_time:
+                        while len(self.self._write_queue.queue) > 0 and (time.time() - flush_start) < max_flush_time:
                             time.sleep(0.01)  # 10ms wait per iteration
                             
                             # Periodic status during flush
                             elapsed_flush = time.time() - flush_start
                             if int(elapsed_flush * 10) % 5 == 0:  # Every 500ms
-                                self._log(f"[OPTION1] Flushing... queue={len(_write_queue.queue):3d} "
+                                self._log(f"[OPTION1] Flushing... queue={len(self.self._write_queue.queue):3d} "
                                         f"elapsed={elapsed_flush:.2f}s")
                         
                         flush_end = time.time()
                         flush_elapsed = flush_end - flush_start
                         
-                        if len(_write_queue.queue) == 0:
+                        if len(self.self._write_queue.queue) == 0:
                             self._log(f"[OPTION1] ✓ Queue flushed successfully in {flush_elapsed:.2f}s")
                         else:
                             self._log(f"[OPTION1] ⚠ Queue not fully empty after {flush_elapsed:.2f}s, "
-                                    f"{len(_write_queue.queue)} items remaining")
+                                    f"{len(self.self._write_queue.queue)} items remaining")
                         
                         self._flush_count += 1
-                        self._total_buffers_flushed += len(_write_queue.queue)
+                        self._total_buffers_flushed += len(self.self._write_queue.queue)
                 else:
                     # Triggers are present - beam is ON
                     is_beam_on = True
@@ -982,19 +982,19 @@ class BoardAcquisition:
                     max_queue_depth = buffers_allocated - 4
                 
                 # Track max depth
-                current_depth = len(_write_queue.queue)
+                current_depth = len(self.self._write_queue.queue)
                 if current_depth > self._queue_max_depth:
                     self._queue_max_depth = current_depth
                 
                 # Apply throttling
-                while len(_write_queue.queue) > max_queue_depth:
+                while len(self.self._write_queue.queue) > max_queue_depth:
                     time.sleep(0.001)
                     if self.paused or not self.running:
                         break
                     
                     # Log if excessively backpressured
-                    if len(_write_queue.queue) > max_queue_depth * 2:
-                        self._log(f"[OPTION1] Heavy backpressure: queue={len(_write_queue.queue)}/{max_queue_depth}")
+                    if len(self.self._write_queue.queue) > max_queue_depth * 2:
+                        self._log(f"[OPTION1] Heavy backpressure: queue={len(self.self._write_queue.queue)}/{max_queue_depth}")
                 # ============================================================================
                     
                 try:
@@ -1070,7 +1070,7 @@ class BoardAcquisition:
                             if self._index_path is not None else None
                         )
                         try:
-                            _write_queue.put_nowait((fpath, save_kwargs, self._index_path, index_line))
+                            self.self.self._write_queue.put_nowait((fpath, save_kwargs, self._index_path, index_line))
                         except queue.Full:
                             self._log(f"Save warning: disk writer queue full at buf {buf_count}; "
                                       "disk too slow – increase save_every_buffers or use faster storage")
@@ -1150,8 +1150,8 @@ class BoardAcquisition:
             
             # Gracefully drain and stop the disk writer
             try:
-                _write_queue.put(None)   # sentinel
-                _write_queue.join()      # wait for all pending writes to finish
+                self.self._write_queue.put(None)   # sentinel
+                self.self._write_queue.join()      # wait for all pending writes to finish
             except Exception:
                 pass
 
