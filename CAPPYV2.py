@@ -1086,16 +1086,16 @@ class BoardAcquisition:
                     self._log(f"[OPTION1] Beam OFF detected (no triggers for {time_since_trigger/1000:.1f}s)")
                     
                     # Synchronously flush queue (like v1.3)
-                    self._log(f"[OPTION1] Queue at {len(self._write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
+                    self._log(f"[OPTION1] Queue at {len(_write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
                     flush_start = now
-                    while len(self._write_queue.queue) > 0 and (time.time() - flush_start) < 5.0:
+                    while len(_write_queue.queue) > 0 and (time.time() - flush_start) < 5.0:
                         time.sleep(0.01)
                         elapsed = time.time() - flush_start
                         if int(elapsed * 10) % 5 == 0:
-                            self._log(f"[OPTION1] Flushing... queue={len(self._write_queue.queue)} elapsed={elapsed:.2f}s")
+                            self._log(f"[OPTION1] Flushing... queue={len(_write_queue.queue)} elapsed={elapsed:.2f}s")
                     
                     flush_elapsed = time.time() - flush_start
-                    if len(self._write_queue.queue) == 0:
+                    if len(_write_queue.queue) == 0:
                         self._log(f"[OPTION1] ✓ Queue flushed successfully in {flush_elapsed:.2f}s")
                     self._flush_count += 1
 
@@ -1110,12 +1110,12 @@ class BoardAcquisition:
                     max_queue_depth = buffers_allocated - 4  # Normal during beam-on
 
                 # Track max depth
-                current = len(self._write_queue.queue)
+                current = len(_write_queue.queue)
                 if current > self._queue_max_depth:
                     self._queue_max_depth = current
 
                 # Apply throttling
-                while len(self._write_queue.queue) > max_queue_depth:
+                while len(_write_queue.queue) > max_queue_depth:
                     time.sleep(0.001)
                     if self.paused or not self.running:
                         break
