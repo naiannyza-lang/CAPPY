@@ -236,7 +236,7 @@ acquisition:
   pre_trigger_samples: 0
   post_trigger_samples: 256
   records_per_buffer: 128
-  buffers_allocated: 128
+  buffers_allocated: 16
   buffers_per_acquisition: 0
   wait_timeout_ms: 5000
 
@@ -314,7 +314,7 @@ acquisition:
   pre_trigger_samples: 0
   post_trigger_samples: 256
   records_per_buffer: 128
-  buffers_allocated: 128
+  buffers_allocated: 16
   buffers_per_acquisition: 0
   wait_timeout_ms: 5000
 
@@ -939,8 +939,8 @@ class BoardAcquisition:
                 break
             try:
                 fpath, save_kwargs, index_path, index_line = item
-                np.savez_compressed(fpath, **save_kwargs)
-                if index_path is not None:
+                np.savez(fpath, **save_kwargs)  # uncompressed for speed
+                if index_path is not None and index_line is not None:
                     with open(index_path, "a", encoding="utf-8") as _fp:
                         _fp.write(index_line)
             except Exception as _se:
@@ -953,14 +953,14 @@ class BoardAcquisition:
         Main acquisition loop - runs in background thread.
 
         KEY CHANGE vs original:
-          • postAsyncBuffer() is called IMMEDIATELY after the raw copy so the
-            board gets its buffer back before any processing or disk I/O.
+          • postAsyncBuffer() is called AFTER processing is complete so the
+            board gets natural backpressure (v1.3 approach).
           • All disk writes are handed off to a dedicated background thread via
             a bounded queue, so compression/fsync never stalls the loop.
-          • buffers_allocated defaults to 64 (was 16) for extra headroom.
+          • buffers_allocated defaults to 16 (matching v1.3 for stability).
         """
         # Background disk-writer
-        _write_queue: queue.Queue = queue.Queue(maxsize=256)
+        _write_queue: queue.Queue = queue.Queue(maxsize=64)
         _writer = threading.Thread(
             target=self._disk_writer_thread,
             args=(_write_queue,),
@@ -984,8 +984,8 @@ class BoardAcquisition:
             post_trigger = int(acq_cfg.get('post_trigger_samples', 256))
             samples_per_record = pre_trigger + post_trigger
             records_per_buffer = int(acq_cfg.get('records_per_buffer', 128))
-            # Default bumped from 16 → 64; override in YAML via buffers_allocated
-            buffers_allocated = int(acq_cfg.get('buffers_allocated', 64))
+            # Default 16 buffers (matches v1.3 for indefinite streaming stability)
+            buffers_allocated = int(acq_cfg.get('buffers_allocated', 16))
             
             channels_mask_str = str(acq_cfg.get('channels_mask', 'CHANNEL_A|CHANNEL_B'))
             ch_mask = 0
@@ -1068,9 +1068,14 @@ class BoardAcquisition:
                     continue
                 
                 # ============================================================================
-                # OPTION 1: EXPLICIT TRIGGER TIMEOUT - Backpressure with state tracking
+                # Light backpressure: if disk writer is falling behind, briefly yield
+                # (With V1.3-style repost-after-processing, buffer overflow is already
+                # prevented; this just keeps the write queue from growing unbounded)
                 # ============================================================================
-                timeout_aware_backpressure(_write_queue, buffers_allocated, self)
+                while _write_queue.qsize() > buffers_allocated:
+                    time.sleep(0.001)
+                    if self.paused or not self.running:
+                        break
                     
                 try:
                     buf_index = buf_count % buffers_allocated
@@ -1078,13 +1083,15 @@ class BoardAcquisition:
                     
                     self.board.waitAsyncBufferComplete(buf.addr, 2000)
                     
-                    # ── CRITICAL: copy raw data first, then immediately recycle
-                    # the buffer back to the board BEFORE doing any processing.
-                    # This is the primary fix for ApiBufferOverflow.
-                    raw = buf.buffer.copy()
-                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)  # ← moved up
+                    # ── V1.3-STYLE: Process directly from buffer memory, then
+                    # repost AFTER all processing is done.  This provides natural
+                    # backpressure — the board cannot overwrite a buffer we haven't
+                    # finished with yet.  This is the primary fix for ApiBufferOverflow.
+                    raw = buf.buffer
+                    if raw.dtype != np.uint16:
+                        raw = raw.astype(np.uint16, copy=False)
 
-                    # ── Process the copy (board is free to fill the buffer again)
+                    # ── Process (board cannot refill this buffer until we repost it)
                     if ch_count == 2:
                         A = raw[0::2].reshape(records_per_buffer, samples_per_record)
                         B = raw[1::2].reshape(records_per_buffer, samples_per_record)
@@ -1093,14 +1100,10 @@ class BoardAcquisition:
                         B = None
 
                     # ── Stale-buffer guard ─────────────────────────────────────────
-                    # An uninitialized DMA buffer contains all-zero uint16 words.
-                    # After volt conversion, ADC code 0x0000 maps to exactly -Vpp/2
-                    # (e.g. -0.4 V for PM_400_MV).  If every sample in record[0]
-                    # equals that floor value the buffer hasn't been written by the
-                    # board yet; skip it rather than saving garbage.
-                    _floor_code = 0          # uint16 value for uninitialized memory
+                    _floor_code = 0
                     _stale = bool(np.all(A[0] == _floor_code))
                     if _stale:
+                        self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
                         buf_count += 1
                         continue
                     # ──────────────────────────────────────────────────────────────
@@ -1114,6 +1117,9 @@ class BoardAcquisition:
                     
                     integralA = np.trapezoid(wfA_volts) / self.sample_rate_hz
                     integralB = np.trapezoid(wfB_volts) / self.sample_rate_hz if wfB_volts is not None else 0.0
+
+                    # ── NOW repost the buffer — processing of raw data is complete
+                    self.board.postAsyncBuffer(buf.addr, buf.size_bytes)
 
                     # ── Enqueue disk save (non-blocking; handled by background thread)
                     if self._session_dir is not None and self._save_every > 0 and (buf_count % self._save_every == 0):
@@ -1145,15 +1151,13 @@ class BoardAcquisition:
                             if self._index_path is not None else None
                         )
                         try:
-                            # SYNC LIKE V1.3: Write SYNCHRONOUSLY (blocking) instead of queuing
-                            # This provides natural backpressure
-                            with open(fpath, "wb") as f:
-                                np.savez_compressed(f, **save_kwargs)
-                            if index_line and self._index_path:
-                                with open(self._index_path, "a") as f:
-                                    f.write(index_line)
-                        except Exception as e:
-                            self._log(f"Save error at buf {buf_count}: {e}")
+                            # Queue to background writer (bounded queue provides backpressure)
+                            _write_queue.put(
+                                (fpath, save_kwargs, self._index_path, index_line),
+                                block=True, timeout=2.0,
+                            )
+                        except queue.Full:
+                            self._log(f"Warning: disk writer queue full at buf {buf_count}, dropping save")
 
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1175,8 +1179,12 @@ class BoardAcquisition:
                     
                     # ============================================================================
                     # OPTION 1: Trigger detection and statistics logging
+                    # (Use processed voltage data since raw buffer may be reused by board)
                     # ============================================================================
-                    has_trigger = detect_trigger_with_state(self, raw)
+                    has_trigger = float(np.max(np.abs(A_volts_all))) >= getattr(self, '_trigger_signal_threshold_v', 0.5)
+                    if has_trigger:
+                        self._last_trigger_time = time.time()
+                        self._trigger_count += 1
                     
                     if buf_count % 100 == 0:
                         log_timeout_statistics(self, buf_count)
