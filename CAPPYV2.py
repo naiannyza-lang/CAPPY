@@ -873,7 +873,7 @@ class BoardAcquisition:
                 # If write queue is accumulating, slow down acquisition to allow I/O to catch up
                 # This prevents ApiBufferOverflow by preventing buffer ring saturation
                 max_queue_depth = buffers_allocated - 4  # Keep 4 buffers free for incoming data
-                while len(self.write_queue) > max_queue_depth:
+                while len(_write_queue.queue) > max_queue_depth:
                     time.sleep(0.001)  # Sleep 1ms at a time
                     if self.paused or not self.running:
                         break
@@ -976,7 +976,7 @@ class BoardAcquisition:
                     
                     # ⚠️ FIX #2: Monitor queue depth for diagnostics
                     if buf_count % 100 == 0:  # Every 100th buffer
-                        queue_depth = len(self.write_queue)
+                        queue_depth = len(_write_queue.queue)
                         queue_ratio = queue_depth / buffers_allocated if buffers_allocated > 0 else 0
                         if queue_ratio > 0.75:  # If >75% full
                             self._log(f"⚠️  Write queue at {queue_depth}/{buffers_allocated} "
