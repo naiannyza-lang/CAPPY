@@ -970,16 +970,9 @@ class BoardAcquisition:
         _writer.start()
 
         # ============================================================================
-        # OPTION 1: Trigger timeout tracking - INLINE VERSION
+        # OPTION 1: Initialize trigger timeout tracking
         # ============================================================================
-        self._last_trigger_time = time.time()
-        self._trigger_timeout_ms = 5000.0
-        self._trigger_signal_threshold_v = 0.1  # ← Adjust if triggers not detected
-        self._vpp_for_detection = 4.0
-        self._trigger_count = 0
-        self._queue_max_depth = 0
-        self._flush_count = 0
-        self._beam_off_detected = False
+        init_trigger_timeout_tracking(self)
         self._acq_start_time = time.time()  # Track for summary logging
 
         try:
@@ -1075,50 +1068,9 @@ class BoardAcquisition:
                     continue
                 
                 # ============================================================================
-                # OPTION 1: Adaptive backpressure based on triggers - INLINE VERSION
+                # OPTION 1: EXPLICIT TRIGGER TIMEOUT - Backpressure with state tracking
                 # ============================================================================
-                now = time.time()
-                time_since_trigger = (now - self._last_trigger_time) * 1000
-
-                # Detect beam OFF (no triggers for 5 seconds)
-                if time_since_trigger > self._trigger_timeout_ms and not self._beam_off_detected:
-                    self._beam_off_detected = True
-                    self._log(f"[OPTION1] Beam OFF detected (no triggers for {time_since_trigger/1000:.1f}s)")
-                    
-                    # Synchronously flush queue (like v1.3)
-                    self._log(f"[OPTION1] Queue at {len(_write_queue.queue)} items - SYNCHRONOUS FLUSH STARTING")
-                    flush_start = now
-                    while len(_write_queue.queue) > 0 and (time.time() - flush_start) < 5.0:
-                        time.sleep(0.01)
-                        elapsed = time.time() - flush_start
-                        if int(elapsed * 10) % 5 == 0:
-                            self._log(f"[OPTION1] Flushing... queue={len(_write_queue.queue)} elapsed={elapsed:.2f}s")
-                    
-                    flush_elapsed = time.time() - flush_start
-                    if len(_write_queue.queue) == 0:
-                        self._log(f"[OPTION1] ✓ Queue flushed successfully in {flush_elapsed:.2f}s")
-                    self._flush_count += 1
-
-                # Back to beam ON
-                elif time_since_trigger <= self._trigger_timeout_ms:
-                    self._beam_off_detected = False
-
-                # Apply adaptive backpressure
-                if self._beam_off_detected:
-                    max_queue_depth = buffers_allocated // 8  # Very strict during beam-off
-                else:
-                    max_queue_depth = buffers_allocated - 4  # Normal during beam-on
-
-                # Track max depth
-                current = len(_write_queue.queue)
-                if current > self._queue_max_depth:
-                    self._queue_max_depth = current
-
-                # Apply throttling
-                while len(_write_queue.queue) > max_queue_depth:
-                    time.sleep(0.001)
-                    if self.paused or not self.running:
-                        break
+                timeout_aware_backpressure(_write_queue, buffers_allocated, self)
                     
                 try:
                     buf_index = buf_count % buffers_allocated
@@ -1193,10 +1145,15 @@ class BoardAcquisition:
                             if self._index_path is not None else None
                         )
                         try:
-                            _write_queue.put_nowait((fpath, save_kwargs, self._index_path, index_line))
-                        except queue.Full:
-                            self._log(f"Save warning: disk writer queue full at buf {buf_count}; "
-                                      "disk too slow – increase save_every_buffers or use faster storage")
+                            # SYNC LIKE V1.3: Write SYNCHRONOUSLY (blocking) instead of queuing
+                            # This provides natural backpressure
+                            with open(fpath, "wb") as f:
+                                np.savez_compressed(f, **save_kwargs)
+                            if index_line and self._index_path:
+                                with open(self._index_path, "a") as f:
+                                    f.write(index_line)
+                        except Exception as e:
+                            self._log(f"Save error at buf {buf_count}: {e}")
 
                     self.stats.captures = buf_count + 1
                     self.stats.last_capture = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1217,28 +1174,13 @@ class BoardAcquisition:
                     buf_count += 1
                     
                     # ============================================================================
+                    # OPTION 1: Trigger detection and statistics logging
                     # ============================================================================
-                    # OPTION 1: Trigger detection using configurable threshold - INLINE VERSION
-                    # ============================================================================
-                    raw_u16 = buf.buffer if hasattr(buf, 'buffer') else raw
+                    has_trigger = detect_trigger_with_state(self, raw)
                     
-                    # Detect signal in buffer
-                    max_adc_count = np.max(np.abs(raw_u16.astype(np.float32) - 32768))
-                    max_voltage = (max_adc_count / 65536.0) * self._vpp_for_detection
-                    has_trigger = max_voltage >= self._trigger_signal_threshold_v
-                    
-                    if has_trigger:
-                        self._last_trigger_time = time.time()
-                        self._trigger_count += 1
-                        if self._beam_off_detected:
-                            self._log("[OPTION1] Beam ON resumed")
-                        self._beam_off_detected = False
-                    
-                    # Periodic statistics logging (every 100 buffers)
                     if buf_count % 100 == 0:
-                        state = "ON" if (now - self._last_trigger_time)*1000 <= self._trigger_timeout_ms else "OFF"
-                        self._log(f"[STATS] Buf={buf_count:7d} Triggers={self._trigger_count:6d} "
-                                f"State={state:3s} MaxQ={self._queue_max_depth:2d} Flushes={self._flush_count}")
+                        log_timeout_statistics(self, buf_count)
+                        check_noise_test_timeout_elapsed(self)
                     
                 except Exception as e:
                     if "ApiWaitTimeout" in str(e):
