@@ -1822,50 +1822,53 @@ class ArchiveBrowser(ttk.Frame):
         self.axI.set_facecolor('#2d2d2d')
         self.fig.tight_layout(pad=1.0)
 
-        # Canvas MUST be created before toolbar
+        # Canvas for matplotlib figure
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
 
-        # Add matplotlib navigation toolbar (zoom, pan, home, save)
-        # Toolbar goes above canvas in pack order
+        # Navigation toolbar for zoom/pan/home/save
+        self._nav_toolbar = None
         try:
-            from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk as NavToolbar
-        except ImportError:
-            from matplotlib.backends.backend_tkagg import NavigationToolbar2TkAgg as NavToolbar
-        toolbar_frame = tk.Frame(right, bg='#2d2d2d')
-        toolbar_frame.pack(side=tk.TOP, fill=tk.X)
-        self._nav_toolbar = NavToolbar(self.canvas, toolbar_frame)
-        self._nav_toolbar.update()
-        # Style the toolbar for dark theme
-        try:
-            self._nav_toolbar.configure(background='#2d2d2d')
-            for child in self._nav_toolbar.winfo_children():
-                try:
-                    child.configure(background='#2d2d2d')
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            try:
+                from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk as _NavTB
+            except ImportError:
+                from matplotlib.backends.backend_tkagg import NavigationToolbar2TkAgg as _NavTB
+            toolbar_frame = tk.Frame(right, bg='#3d3d3d', height=36)
+            toolbar_frame.pack(side=tk.TOP, fill=tk.X)
+            toolbar_frame.pack_propagate(True)
+            self._nav_toolbar = _NavTB(self.canvas, toolbar_frame)
+            self._nav_toolbar.update()
+        except Exception as e:
+            print(f"[CAPPY] Toolbar init failed: {e}")
 
-        # Now pack the canvas below the toolbar
+        # Pack canvas below toolbar
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Hover state for waveform readout
-        self._hover_annots = {}  # per-axis annotation objects
-        self._hover_lines = {}  # axis -> (tvec, data, label, color)
+        # Readout label below plots
+        self._readout_var = tk.StringVar(value="")
+        readout_lbl = tk.Label(right, textvariable=self._readout_var,
+                               font=('Courier', 10, 'bold'), fg=NEON_PINK, bg='#1e1e1e',
+                               anchor='w', padx=6, pady=2)
+        readout_lbl.pack(fill=tk.X)
+
+        # Hover state
+        self._hover_annots = {}
+        self._hover_lines = {}
         self._hover_sr = 1.0
         self._hover_ts_ns = 0
         self._hover_time_unit = "s"
-        # Crosshair lines for visual precision
-        self._hover_vlineA = self.axA.axvline(0, color=NEON_PINK, alpha=0.3, linewidth=0.7, visible=False)
-        self._hover_vlineB = self.axB.axvline(0, color=NEON_GREEN, alpha=0.3, linewidth=0.7, visible=False)
-        self._hover_vlineI = self.axI.axvline(0, color='white', alpha=0.3, linewidth=0.7, visible=False)
-        self._hover_vlines = {self.axA: self._hover_vlineA, self.axB: self._hover_vlineB, self.axI: self._hover_vlineI}
+        self._hover_vlines = {}
+        self._init_hover_vlines()
         self.canvas.mpl_connect("motion_notify_event", self._on_hover)
 
-        # Readout label below plots (always visible, updates on hover)
-        self._readout_var = tk.StringVar(value="Hover over waveform for readout  |  Use toolbar to zoom/pan")
-        readout_lbl = ttk.Label(right, textvariable=self._readout_var, font=('Courier', 9), foreground=NEON_PINK)
-        readout_lbl.pack(fill=tk.X, pady=(2, 0))
+    def _init_hover_vlines(self):
+        """Create/recreate crosshair vlines for all axes."""
+        self._hover_vlines = {}
+        try:
+            self._hover_vlines[self.axA] = self.axA.axvline(0, color=NEON_PINK, alpha=0.4, linewidth=0.8, visible=False)
+            self._hover_vlines[self.axB] = self.axB.axvline(0, color=NEON_GREEN, alpha=0.4, linewidth=0.8, visible=False)
+            self._hover_vlines[self.axI] = self.axI.axvline(0, color='white', alpha=0.4, linewidth=0.8, visible=False)
+        except Exception:
+            pass
 
         self.meta = tk.Text(right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
         self.meta.pack(fill=tk.X, pady=(8,0))
@@ -2276,10 +2279,7 @@ class ArchiveBrowser(ttk.Frame):
         self.axI.clear()
 
         # Re-create crosshair lines (cleared by ax.clear())
-        self._hover_vlineA = self.axA.axvline(0, color=NEON_PINK, alpha=0.3, linewidth=0.7, visible=False)
-        self._hover_vlineB = self.axB.axvline(0, color=NEON_GREEN, alpha=0.3, linewidth=0.7, visible=False)
-        self._hover_vlineI = self.axI.axvline(0, color='white', alpha=0.3, linewidth=0.7, visible=False)
-        self._hover_vlines = {self.axA: self._hover_vlineA, self.axB: self._hover_vlineB, self.axI: self._hover_vlineI}
+        self._init_hover_vlines()
         self._hover_annots = {}  # will be recreated on next hover per-axis
 
         # Waveform A (baseline-subtracted)
@@ -2338,10 +2338,11 @@ class ArchiveBrowser(ttk.Frame):
         self.canvas.draw()
 
         # Reset the toolbar's home/zoom history so 'Home' button returns to this view
-        try:
-            self._nav_toolbar.update()
-        except Exception:
-            pass
+        if self._nav_toolbar is not None:
+            try:
+                self._nav_toolbar.update()
+            except Exception:
+                pass
 
         ts_ns_val = int(r["timestamp_ns"])
         ts = datetime.fromtimestamp(ts_ns_val / 1e9, tz=self._tz)
@@ -2360,34 +2361,40 @@ class ArchiveBrowser(ttk.Frame):
         )
 
     def _on_hover(self, event):
-        """Show timestamp + voltage readout when hovering over archive waveform plots."""
+        """Show timestamp + voltage at cursor position on archive waveform plots."""
         # Don't interfere with zoom/pan toolbar actions
-        try:
-            if self._nav_toolbar.mode:
-                return
-        except Exception:
-            pass
-
-        # Hide all crosshairs and annotations first
-        for vl in self._hover_vlines.values():
+        if self._nav_toolbar is not None:
             try:
-                vl.set_visible(False)
-            except Exception:
-                pass
-        for ann in getattr(self, '_hover_annots', {}).values():
-            try:
-                ann.set_visible(False)
+                mode = getattr(self._nav_toolbar, 'mode', '') or ''
+                if mode != '':
+                    return
             except Exception:
                 pass
 
+        # If mouse left the axes or no data loaded, hide everything
         if event.inaxes is None or not self._hover_lines:
-            self._readout_var.set("Hover over waveform for readout  |  Use toolbar to zoom/pan")
-            self.canvas.draw_idle()
+            changed = False
+            for vl in self._hover_vlines.values():
+                try:
+                    if vl.get_visible():
+                        vl.set_visible(False)
+                        changed = True
+                except Exception:
+                    pass
+            for ann in getattr(self, '_hover_annots', {}).values():
+                try:
+                    if ann.get_visible():
+                        ann.set_visible(False)
+                        changed = True
+                except Exception:
+                    pass
+            if changed:
+                self._readout_var.set("")
+                self.canvas.draw_idle()
             return
 
         ax = event.inaxes
         if ax not in self._hover_lines:
-            self.canvas.draw_idle()
             return
 
         tvec, ydata, label, color = self._hover_lines[ax]
@@ -2397,6 +2404,8 @@ class ArchiveBrowser(ttk.Frame):
         x = event.xdata
         if x is None:
             return
+
+        # Find nearest sample
         idx = int(np.clip(np.searchsorted(tvec, x), 0, len(tvec) - 1))
         if idx > 0 and idx < len(tvec) - 1:
             if abs(tvec[idx - 1] - x) < abs(tvec[idx] - x):
@@ -2405,6 +2414,7 @@ class ArchiveBrowser(ttk.Frame):
         t_val = float(tvec[idx])
         v_val = float(ydata[idx])
 
+        # Compute absolute timestamp for this sample
         unit = self._hover_time_unit
         if unit == "ns":
             t_sec = t_val * 1e-9
@@ -2417,9 +2427,14 @@ class ArchiveBrowser(ttk.Frame):
 
         abs_ns = self._hover_ts_ns + int(t_sec * 1e9)
         abs_dt = datetime.fromtimestamp(abs_ns / 1e9, tz=self._tz)
-        ts_str = abs_dt.strftime('%H:%M:%S.%f')[:-3]
+        us_part = abs_ns % 1_000_000_000 // 1000
+        ts_str = abs_dt.strftime('%H:%M:%S') + f".{us_part:06d}"
 
-        self._readout_var.set(f"{label}  t={t_val:.4g} {unit}  V={v_val:.6g} V  @{ts_str}")
+        # Build annotation text: timestamp + voltage right at cursor
+        annot_text = f"{ts_str}\n{v_val:.6g} V"
+
+        # Update bottom readout bar
+        self._readout_var.set(f"{label}  t = {t_val:.4g} {unit}   V = {v_val:.6g} V   @ {ts_str}")
 
         # Show crosshair on all axes
         for a, vl in self._hover_vlines.items():
@@ -2429,18 +2444,26 @@ class ArchiveBrowser(ttk.Frame):
             except Exception:
                 pass
 
-        # Get or create per-axis annotation (avoids remove() which older matplotlib doesn't support)
+        # Hide annotations on other axes, show on active axis
         if not hasattr(self, '_hover_annots'):
             self._hover_annots = {}
+
+        for a, ann in self._hover_annots.items():
+            try:
+                if a != ax:
+                    ann.set_visible(False)
+            except Exception:
+                pass
+
         if ax not in self._hover_annots:
-            self._hover_annots[ax] = ax.annotate("", xy=(0, 0), xytext=(12, 12),
+            self._hover_annots[ax] = ax.annotate("", xy=(0, 0), xytext=(15, 15),
                 textcoords="offset points",
-                bbox=dict(boxstyle="round,pad=0.3", fc="#1e1e1e", ec=color, alpha=0.92),
-                color="white", fontsize=8, zorder=100, visible=False)
+                bbox=dict(boxstyle="round,pad=0.4", fc="#1e1e1e", ec=color, lw=1.5, alpha=0.95),
+                color="white", fontsize=9, fontfamily="monospace", zorder=100, visible=False)
 
         ann = self._hover_annots[ax]
         ann.xy = (t_val, v_val)
-        ann.set_text(f"{v_val:.6g} V")
+        ann.set_text(annot_text)
         ann.get_bbox_patch().set_edgecolor(color)
         ann.set_visible(True)
         self.canvas.draw_idle()
