@@ -2885,24 +2885,45 @@ class LauncherGUI(tk.Tk):
     def _open_yaml(self):
         p = Path(self.var_config.get()).expanduser()
         if not p.exists():
-            messagebox.showerror("Missing", f"Config not found:\n{p}")
-            return
+            # Auto-create the default config if missing
+            try:
+                _atomic_write_text(p, DEFAULT_YAML)
+                self._append(f"[CAPPY-9462] Created default config: {p}")
+            except Exception as ex:
+                messagebox.showerror("Missing", f"Config not found and could not create:\n{p}\n{ex}")
+                return
         try:
             import os, subprocess
             if os.name == "posix":
-                subprocess.Popen(["xdg-open", str(p)])
+                # Try editors in preference order
+                for editor in ["xdg-open", "gedit", "nano", "vi", "code", "kate", "mousepad", "xed", "pluma"]:
+                    editor_path = shutil.which(editor)
+                    if editor_path:
+                        if editor in ("nano", "vi", "vim"):
+                            # Terminal editors need a terminal
+                            for term in ["x-terminal-emulator", "gnome-terminal", "xfce4-terminal", "konsole", "xterm"]:
+                                term_path = shutil.which(term)
+                                if term_path:
+                                    subprocess.Popen([term_path, "-e", f"{editor_path} {str(p)}"])
+                                    return
+                        else:
+                            subprocess.Popen([editor_path, str(p)])
+                            return
+                messagebox.showinfo("CAPPY-9462", f"No text editor found.\nConfig file is at:\n{p}\nOpen it manually with your preferred editor.")
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(p)])
             else:
                 os.startfile(str(p))
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", f"Could not open editor:\n{e}\n\nConfig file is at:\n{p}")
 
     def _browse(self):
         try:
+            data_path = Path(self.var_data_dir.get())
+            _ensure_dir(data_path)
             win = tk.Toplevel(self)
-            win.title('CAPPY Archive')
-            app = ArchiveBrowser(Path(self.var_data_dir.get()), master=win)
+            win.title('CAPPY-9462 Archive')
+            app = ArchiveBrowser(data_path, master=win)
             app.pack(fill=tk.BOTH, expand=True)
         except Exception as e:
             messagebox.showerror('CAPPY', str(e))
