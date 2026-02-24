@@ -888,6 +888,7 @@ class CappyArchive:
     def __init__(self, data_dir: Path, rollover_minutes: int, flush_every_records: int,
                  session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0):
         self.data_dir = data_dir
+        _ensure_dir(self.data_dir)
         self.captures = data_dir / "captures"
         _ensure_dir(self.captures)
         self.rollover_minutes = int(rollover_minutes)
@@ -1752,7 +1753,9 @@ class ArchiveBrowser(ttk.Frame):
         super().__init__(master)
         self._tz = datetime.now().astimezone().tzinfo
         self.data_dir = data_dir
+        _ensure_dir(self.data_dir)
         self.captures = data_dir / "captures"
+        _ensure_dir(self.captures)
         self.sessions = pd.DataFrame()
         self.snips = pd.DataFrame()
         self._snip_db_dir: Optional[Path] = None
@@ -1815,6 +1818,17 @@ class ArchiveBrowser(ttk.Frame):
         self.fig.tight_layout(pad=1.0)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Hover annotation for waveform readout
+        self._hover_annot = self.axA.annotate("", xy=(0, 0), xytext=(15, 15),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.4", fc="#1e1e1e", ec=NEON_PINK, alpha=0.92),
+            color="white", fontsize=8, zorder=100, visible=False)
+        self._hover_lines = {}  # axis -> (tvec, data, label, color)
+        self._hover_sr = 1.0
+        self._hover_ts_ns = 0
+        self._hover_time_unit = "s"
+        self.canvas.mpl_connect("motion_notify_event", self._on_hover)
 
         self.meta = tk.Text(right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
         self.meta.pack(fill=tk.X, pady=(8,0))
@@ -1901,7 +1915,7 @@ class ArchiveBrowser(ttk.Frame):
         if not sel:
             return None
         view = getattr(self, '_sessions_view', self.sessions)
-        return str(view.iloc[sel[0]]["session_id"])
+        return str(view.iloc[sel[0]]["session_id"]).strip()
 
 
     def _build_hour_index(self):
@@ -2085,32 +2099,61 @@ class ArchiveBrowser(ttk.Frame):
 
         for ddir in self._iter_day_dirs() or []:
             idx_dir = ddir / "index"
+            if not idx_dir.exists():
+                continue
+            # Try exact match first
             db = idx_dir / f"snips_{sid}.sqlite"
-            if db.exists():
-                conn = sqlite3.connect(db)
-                
-                try:
+            if not db.exists():
+                # Fallback: search for any sqlite file containing the session_id
+                candidates = sorted(idx_dir.glob("snips_*.sqlite"))
+                for c in candidates:
+                    if sid in c.stem:
+                        db = c
+                        break
+                else:
+                    continue
+            if not db.exists():
+                continue
+            conn = sqlite3.connect(db)
+            try:
+                self.snips = pd.read_sql_query(
+                    "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                    "file,offset_bytes,nbytes,"
+                    "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+                    "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
+                    "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                    conn,
+                    params=(sid,),
+                )
+                # If query returned nothing, try without session_id filter (DB might only have one session)
+                if self.snips.empty:
                     self.snips = pd.read_sql_query(
                         "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,"
                         "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
                         "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
+                        "FROM snips ORDER BY timestamp_ns DESC LIMIT 50000",
+                        conn,
+                    )
+            except Exception:
+                # Legacy DB schema (no channel-separated columns or baseline columns)
+                try:
+                    self.snips = pd.read_sql_query(
+                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
                         "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
                         conn,
                         params=(sid,),
                     )
-                except Exception:
-                    # Legacy DB schema (no channel-separated columns or baseline columns)
-                    try:
+                    if self.snips.empty:
                         self.snips = pd.read_sql_query(
                             "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                             "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                            "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                            "FROM snips ORDER BY timestamp_ns DESC LIMIT 50000",
                             conn,
-                            params=(sid,),
                         )
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
                 conn.close()
                 self._snip_db_dir = ddir
                 break
@@ -2180,6 +2223,12 @@ class ArchiveBrowser(ttk.Frame):
         # Time axis with adaptive units (ns/us/ms/s)
         tvec, unit = _auto_time_axis(len(wa), sr)
 
+        # Store hover context
+        self._hover_ts_ns = int(r["timestamp_ns"])
+        self._hover_sr = sr
+        self._hover_time_unit = unit
+        self._hover_lines = {}
+
         # Clear axes
         self.axA.clear()
         self.axB.clear()
@@ -2195,6 +2244,7 @@ class ArchiveBrowser(ttk.Frame):
         self.axA.spines['top'].set_visible(False)
         self.axA.spines['right'].set_visible(False)
         self.axA.grid(True, alpha=0.15, color=NEON_PINK)
+        self._hover_lines[self.axA] = (tvec, wa_bs, "Ch A", NEON_PINK)
 
         # Waveform B (baseline-subtracted if available)
         if wb_bs is not None:
@@ -2206,6 +2256,7 @@ class ArchiveBrowser(ttk.Frame):
             self.axB.spines['bottom'].set_color('white')
             self.axB.spines['top'].set_visible(False)
             self.axB.spines['right'].set_visible(False)
+            self._hover_lines[self.axB] = (tvec, wb_bs, "Ch B", NEON_GREEN)
         else:
             self.axB.text(0.02, 0.5, "Channel B not captured in this snip", transform=self.axB.transAxes, color='white')
             self.axB.set_ylabel("B (V)", color='white')
@@ -2220,6 +2271,7 @@ class ArchiveBrowser(ttk.Frame):
         dt = 1.0 / sr
         intA = np.cumsum(np.asarray(wa_bs, dtype=np.float64)) * dt
         self.axI.plot(tvec, intA, color=NEON_PINK, linewidth=1.5, label="∫A dt")
+        self._hover_lines[self.axI] = (tvec, intA, "∫A (V·s)", NEON_PINK)
         if wb_bs is not None:
             intB = np.cumsum(np.asarray(wb_bs, dtype=np.float64)) * dt
             self.axI.plot(tvec, intB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="∫B dt")
@@ -2251,76 +2303,74 @@ class ArchiveBrowser(ttk.Frame):
             f"Waveform points: {int(r.get('npts', len(wa)))}"
         )
 
+    def _on_hover(self, event):
+        """Show timestamp + voltage annotation when hovering over archive waveform plots."""
+        if event.inaxes is None or not self._hover_lines:
+            if hasattr(self, '_hover_annot') and self._hover_annot.get_visible():
+                self._hover_annot.set_visible(False)
+                self.canvas.draw_idle()
+            return
+
+        ax = event.inaxes
+        if ax not in self._hover_lines:
+            if self._hover_annot.get_visible():
+                self._hover_annot.set_visible(False)
+                self.canvas.draw_idle()
+            return
+
+        tvec, ydata, label, color = self._hover_lines[ax]
+        if tvec is None or ydata is None or len(tvec) == 0:
+            return
+
+        # Find nearest sample index to mouse x position
+        x = event.xdata
+        if x is None:
+            return
+        idx = int(np.clip(np.searchsorted(tvec, x), 0, len(tvec) - 1))
+        # Snap to nearest
+        if idx > 0 and idx < len(tvec) - 1:
+            if abs(tvec[idx - 1] - x) < abs(tvec[idx] - x):
+                idx -= 1
+
+        t_val = tvec[idx]
+        v_val = ydata[idx]
+
+        # Compute the absolute timestamp for this sample
+        unit = self._hover_time_unit
+        if unit == "ns":
+            t_sec = t_val * 1e-9
+        elif unit == "\u00b5s":
+            t_sec = t_val * 1e-6
+        elif unit == "ms":
+            t_sec = t_val * 1e-3
+        else:
+            t_sec = t_val
+
+        abs_ns = self._hover_ts_ns + int(t_sec * 1e9)
+        abs_dt = datetime.fromtimestamp(abs_ns / 1e9, tz=self._tz)
+        ts_str = abs_dt.strftime('%H:%M:%S.%f')[:-3]
+
+        text = f"{label}\nt = {t_val:.4g} {unit}\nV = {v_val:.6g} V\n{ts_str}"
+
+        # Move annotation to correct axes if needed
+        if self._hover_annot.axes != ax:
+            self._hover_annot.remove()
+            self._hover_annot = ax.annotate("", xy=(0, 0), xytext=(15, 15),
+                textcoords="offset points",
+                bbox=dict(boxstyle="round,pad=0.4", fc="#1e1e1e", ec=color, alpha=0.92),
+                color="white", fontsize=8, zorder=100, visible=False)
+
+        self._hover_annot.xy = (t_val, v_val)
+        self._hover_annot.set_text(text)
+        self._hover_annot.get_bbox_patch().set_edgecolor(color)
+        self._hover_annot.set_visible(True)
+        self.canvas.draw_idle()
+
     def _set_meta(self, s: str):
         self.meta.configure(state=tk.NORMAL)
         self.meta.delete("1.0", tk.END)
         self.meta.insert(tk.END, s)
         self.meta.configure(state=tk.DISABLED)
-
-
-
-
-
-
-    def _on_hour_wheel(self, evt):
-        # Mouse wheel scroll selects next/prev hour entry
-        if self.hlist.size() == 0:
-            return "break"
-        cur = self.hlist.curselection()
-        idx = int(cur[0]) if cur else 0
-        idx = max(0, min(self.hlist.size() - 1, idx + (-1 if evt.delta > 0 else 1)))
-        self.hlist.selection_clear(0, tk.END)
-        self.hlist.selection_set(idx)
-        self.hlist.see(idx)
-        self._on_hour()
-        return "break"
-
-    def _on_session(self, _=None):
-        sid = self._sel_sid()
-        if not sid:
-            return
-        self.snips = pd.DataFrame()
-        self._snip_db_dir = None
-
-        # Locate the snips sqlite DB for this session in any day directory
-        for ddir in self._iter_day_dirs() or []:
-            idx_dir = ddir / "index"
-            db = idx_dir / f"snips_{sid}.sqlite"
-            if db.exists():
-                conn = sqlite3.connect(db)
-                try:
-                    self.snips = pd.read_sql_query(
-                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
-                        "file,offset_bytes,nbytes,"
-                        "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
-                        "area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
-                        conn,
-                        params=(sid,),
-                    )
-                except Exception:
-                    # Legacy DB schema (no channel-separated columns)
-                    self.snips = pd.read_sql_query(
-                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
-                        "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
-                        conn,
-                        params=(sid,),
-                    )
-                conn.close()
-                self._snip_db_dir = ddir
-                break
-
-        self.wlist.delete(0, tk.END)
-        if self.snips.empty:
-            self.wlist.insert(tk.END, "(no saved waveforms)")
-            return
-
-        # Populate hour list and apply hour filter
-        self._populate_hours()
-        self._apply_hour_filter()
-        self._set_meta(f"Snips loaded: {len(self.snips):,}")
-
 
     # --- Legacy callback compatibility (older bindings may call these names) ---
     def _on_session_(self, *args, **kwargs):
@@ -2878,9 +2928,11 @@ class LauncherGUI(tk.Tk):
 
     def _browse(self):
         try:
+            data_path = Path(self.var_data_dir.get())
+            _ensure_dir(data_path)
             win = tk.Toplevel(self)
             win.title('CAPPY Archive')
-            app = ArchiveBrowser(Path(self.var_data_dir.get()), master=win)
+            app = ArchiveBrowser(data_path, master=win)
             app.pack(fill=tk.BOTH, expand=True)
         except Exception as e:
             messagebox.showerror('CAPPY', str(e))
@@ -2992,6 +3044,7 @@ class LauncherGUI(tk.Tk):
 
 
 def run_browse(data_dir: Path) -> int:
+    _ensure_dir(data_dir)
     root = tk.Tk()
     root.title('CAPPY Archive')
     app = ArchiveBrowser(data_dir, master=root)
