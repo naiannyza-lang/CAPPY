@@ -127,7 +127,7 @@ waveforms:
   every_n: 1
   threshold_integral_Vs: 0.0
   threshold_peak_V: 0.0
-  max_waveforms_per_sec: 50
+  max_waveforms_per_sec: 500
   store_volts: true
 
 storage:
@@ -637,6 +637,7 @@ class WaveBinSqliteStore:
             );
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_snips_session_time ON snips(session_id, timestamp_ns);")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_snips_record_global ON snips(session_id, record_global);")
         self.conn.commit()
 
         # Migration: add new columns if the DB already existed without them
@@ -750,7 +751,7 @@ class WaveBinSqliteStore:
         nbytes_legacy = len(payloadA)
 
         self.conn.execute(
-            "INSERT INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+            "INSERT OR IGNORE INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
             "file,offset_bytes,nbytes,file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.session_id, int(ts_ns), int(buffer_index), int(record_in_buffer), int(record_global),
@@ -1578,6 +1579,8 @@ def run_capture(cfg_path: Path) -> int:
             timeout_count = 0
             last_buffer_ns = time.time_ns()
             ts_ns = last_buffer_ns
+            # Per-record time offset: each record in the buffer is spaced by bunch_spacing samples
+            record_dt_ns = int(round(float(bunch_spacing) / float(sr_hz) * 1e9))
 
             if archive.should_rotate():
                 archive.finalize(ch_expr)
@@ -1596,9 +1599,10 @@ def run_capture(cfg_path: Path) -> int:
                 areaB, peakB, baseB = reduce_u16(B, sr_hz, b0, b1, g0, g1, vppB)
                 for r in range(rpb):
                     rec_g = global_rec + r
+                    rec_ts_ns = int(ts_ns + r * record_dt_ns)
                     red_rows.append(dict(
                         session_id=sid, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
-                        timestamp_ns=int(ts_ns), sample_rate_hz=float(sr_hz),
+                        timestamp_ns=rec_ts_ns, sample_rate_hz=float(sr_hz),
                         samples_per_record=spr, records_per_buffer=rpb,
                         channels_mask=ch_expr, bunch_spacing_samples=bunch_spacing,
                         area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
@@ -1608,7 +1612,7 @@ def run_capture(cfg_path: Path) -> int:
                         wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
                         wfB_V = _codes_to_volts_u16(B[r], vpp=vppB) if store_volts else B[r].astype(np.float32)
                         archive.append_snip(
-                            ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
+                            ts_ns=rec_ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
                             wfA_V=wfA_V, wfB_V=wfB_V,
                             area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
@@ -1620,9 +1624,10 @@ def run_capture(cfg_path: Path) -> int:
                 areaA, peakA, baseA = reduce_u16(A, sr_hz, b0, b1, g0, g1, vppA)
                 for r in range(rpb):
                     rec_g = global_rec + r
+                    rec_ts_ns = int(ts_ns + r * record_dt_ns)
                     red_rows.append(dict(
                         session_id=sid, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
-                        timestamp_ns=int(ts_ns), sample_rate_hz=float(sr_hz),
+                        timestamp_ns=rec_ts_ns, sample_rate_hz=float(sr_hz),
                         samples_per_record=spr, records_per_buffer=rpb,
                         channels_mask=ch_expr, bunch_spacing_samples=bunch_spacing,
                         area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
@@ -1631,7 +1636,7 @@ def run_capture(cfg_path: Path) -> int:
                     if wf_enable and wf.want(rec_g, float(areaA[r]), float(peakA[r])):
                         wfA_V = _codes_to_volts_u16(A[r], vpp=vppA) if store_volts else A[r].astype(np.float32)
                         archive.append_snip(
-                            ts_ns=ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
+                            ts_ns=rec_ts_ns, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                             channels_mask=ch_expr, sample_rate_hz=float(sr_hz),
                             wfA_V=wfA_V, wfB_V=None,
                             area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]),
@@ -1816,19 +1821,46 @@ class ArchiveBrowser(ttk.Frame):
         self.axB.set_facecolor('#2d2d2d')
         self.axI.set_facecolor('#2d2d2d')
         self.fig.tight_layout(pad=1.0)
+
+        # Toolbar frame at top of plot area for zoom/pan controls
+        toolbar_frame = ttk.Frame(right)
+        toolbar_frame.pack(fill=tk.X, side=tk.TOP)
+
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+        # Add matplotlib navigation toolbar (zoom, pan, home, save)
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        self._nav_toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self._nav_toolbar.update()
+        # Style the toolbar for dark theme
+        try:
+            self._nav_toolbar.configure(background='#2d2d2d')
+            for child in self._nav_toolbar.winfo_children():
+                try:
+                    child.configure(background='#2d2d2d')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Hover annotation for waveform readout
-        self._hover_annot = self.axA.annotate("", xy=(0, 0), xytext=(15, 15),
-            textcoords="offset points",
-            bbox=dict(boxstyle="round,pad=0.4", fc="#1e1e1e", ec=NEON_PINK, alpha=0.92),
-            color="white", fontsize=8, zorder=100, visible=False)
+        self._hover_annot = None  # created per-axis on first hover
         self._hover_lines = {}  # axis -> (tvec, data, label, color)
         self._hover_sr = 1.0
         self._hover_ts_ns = 0
         self._hover_time_unit = "s"
+        # Crosshair lines for visual precision
+        self._hover_vlineA = self.axA.axvline(0, color=NEON_PINK, alpha=0.3, linewidth=0.7, visible=False)
+        self._hover_vlineB = self.axB.axvline(0, color=NEON_GREEN, alpha=0.3, linewidth=0.7, visible=False)
+        self._hover_vlineI = self.axI.axvline(0, color='white', alpha=0.3, linewidth=0.7, visible=False)
+        self._hover_vlines = {self.axA: self._hover_vlineA, self.axB: self._hover_vlineB, self.axI: self._hover_vlineI}
         self.canvas.mpl_connect("motion_notify_event", self._on_hover)
+
+        # Readout label below plots (always visible, updates on hover)
+        self._readout_var = tk.StringVar(value="Hover over waveform for readout  |  Use toolbar to zoom/pan")
+        readout_lbl = ttk.Label(right, textvariable=self._readout_var, font=('Courier', 9), foreground=NEON_PINK)
+        readout_lbl.pack(fill=tk.X, pady=(2, 0))
 
         self.meta = tk.Text(right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
         self.meta.pack(fill=tk.X, pady=(8,0))
@@ -2235,6 +2267,13 @@ class ArchiveBrowser(ttk.Frame):
         self.axB.clear()
         self.axI.clear()
 
+        # Re-create crosshair lines (cleared by ax.clear())
+        self._hover_vlineA = self.axA.axvline(0, color=NEON_PINK, alpha=0.3, linewidth=0.7, visible=False)
+        self._hover_vlineB = self.axB.axvline(0, color=NEON_GREEN, alpha=0.3, linewidth=0.7, visible=False)
+        self._hover_vlineI = self.axI.axvline(0, color='white', alpha=0.3, linewidth=0.7, visible=False)
+        self._hover_vlines = {self.axA: self._hover_vlineA, self.axB: self._hover_vlineB, self.axI: self._hover_vlineI}
+        self._hover_annot = None  # will be recreated on next hover
+
         # Waveform A (baseline-subtracted)
         self.axA.plot(tvec, wa_bs, color=NEON_PINK, linewidth=1.5)
         self.axA.axhline(0, color='white', linewidth=0.5, linestyle='--', alpha=0.3)
@@ -2290,6 +2329,12 @@ class ArchiveBrowser(ttk.Frame):
 
         self.canvas.draw()
 
+        # Reset the toolbar's home/zoom history so 'Home' button returns to this view
+        try:
+            self._nav_toolbar.update()
+        except Exception:
+            pass
+
         ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
         a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
         b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
@@ -2305,18 +2350,32 @@ class ArchiveBrowser(ttk.Frame):
         )
 
     def _on_hover(self, event):
-        """Show timestamp + voltage annotation when hovering over archive waveform plots."""
+        """Show timestamp + voltage readout when hovering over archive waveform plots."""
+        # Hide all crosshairs first
+        for vl in self._hover_vlines.values():
+            try:
+                vl.set_visible(False)
+            except Exception:
+                pass
+
         if event.inaxes is None or not self._hover_lines:
-            if hasattr(self, '_hover_annot') and self._hover_annot.get_visible():
-                self._hover_annot.set_visible(False)
-                self.canvas.draw_idle()
+            if self._hover_annot is not None:
+                try:
+                    self._hover_annot.set_visible(False)
+                except Exception:
+                    pass
+            self._readout_var.set("Hover over waveform for readout  |  Use toolbar to zoom/pan")
+            self.canvas.draw_idle()
             return
 
         ax = event.inaxes
         if ax not in self._hover_lines:
-            if self._hover_annot.get_visible():
-                self._hover_annot.set_visible(False)
-                self.canvas.draw_idle()
+            if self._hover_annot is not None:
+                try:
+                    self._hover_annot.set_visible(False)
+                except Exception:
+                    pass
+            self.canvas.draw_idle()
             return
 
         tvec, ydata, label, color = self._hover_lines[ax]
@@ -2328,15 +2387,14 @@ class ArchiveBrowser(ttk.Frame):
         if x is None:
             return
         idx = int(np.clip(np.searchsorted(tvec, x), 0, len(tvec) - 1))
-        # Snap to nearest
         if idx > 0 and idx < len(tvec) - 1:
             if abs(tvec[idx - 1] - x) < abs(tvec[idx] - x):
                 idx -= 1
 
-        t_val = tvec[idx]
-        v_val = ydata[idx]
+        t_val = float(tvec[idx])
+        v_val = float(ydata[idx])
 
-        # Compute the absolute timestamp for this sample
+        # Compute absolute timestamp for this sample
         unit = self._hover_time_unit
         if unit == "ns":
             t_sec = t_val * 1e-9
@@ -2351,18 +2409,35 @@ class ArchiveBrowser(ttk.Frame):
         abs_dt = datetime.fromtimestamp(abs_ns / 1e9, tz=self._tz)
         ts_str = abs_dt.strftime('%H:%M:%S.%f')[:-3]
 
-        text = f"{label}\nt = {t_val:.4g} {unit}\nV = {v_val:.6g} V\n{ts_str}"
+        # Update the always-visible readout label
+        self._readout_var.set(f"{label}  t={t_val:.4g} {unit}  V={v_val:.6g} V  @{ts_str}")
 
-        # Move annotation to correct axes if needed
-        if self._hover_annot.axes != ax:
-            self._hover_annot.remove()
-            self._hover_annot = ax.annotate("", xy=(0, 0), xytext=(15, 15),
+        # Show crosshair on all axes at the same time position
+        for a, vl in self._hover_vlines.items():
+            try:
+                vl.set_xdata([t_val])
+                vl.set_visible(True)
+            except Exception:
+                pass
+
+        # Create/move annotation on the active axis
+        annot_text = f"{v_val:.6g} V"
+        if self._hover_annot is not None:
+            try:
+                if self._hover_annot.axes != ax:
+                    self._hover_annot.remove()
+                    self._hover_annot = None
+            except Exception:
+                self._hover_annot = None
+
+        if self._hover_annot is None:
+            self._hover_annot = ax.annotate("", xy=(0, 0), xytext=(12, 12),
                 textcoords="offset points",
-                bbox=dict(boxstyle="round,pad=0.4", fc="#1e1e1e", ec=color, alpha=0.92),
+                bbox=dict(boxstyle="round,pad=0.3", fc="#1e1e1e", ec=color, alpha=0.92),
                 color="white", fontsize=8, zorder=100, visible=False)
 
         self._hover_annot.xy = (t_val, v_val)
-        self._hover_annot.set_text(text)
+        self._hover_annot.set_text(annot_text)
         self._hover_annot.get_bbox_patch().set_edgecolor(color)
         self._hover_annot.set_visible(True)
         self.canvas.draw_idle()
