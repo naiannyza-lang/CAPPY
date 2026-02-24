@@ -1267,6 +1267,36 @@ def infer_channel_count_from_mask(mask: int) -> int:
     mask = int(mask)
     return 2 if (mask & 3) == 3 else 1
 
+def get_available_boards() -> List[Tuple[int, int, str]]:
+    """
+    Discover available AlazarTech boards.
+    
+    Returns:
+        List of (system_id, board_id, description) tuples
+    """
+    if not ATS_AVAILABLE or ats is None:
+        return []
+    
+    boards = []
+    try:
+        # Try up to 8 systems and 8 boards per system
+        for sys_id in range(1, 9):
+            for board_id in range(1, 9):
+                try:
+                    test_board = ats.Board(systemId=sys_id, boardId=board_id)
+                    if hasattr(test_board, 'handle') and test_board.handle is not None:
+                        try:
+                            model_id = test_board.getModelID()
+                            boards.append((sys_id, board_id, f"Model ID: {model_id}"))
+                        except Exception:
+                            boards.append((sys_id, board_id, "Unknown model"))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    
+    return boards
+
 def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, float]:
     c = cfg.get("clock", {}) or {}
     sr_hz = float(c.get("sample_rate_msps", 250.0)) * 1e6
@@ -1402,6 +1432,25 @@ def run_capture(cfg_path: Path) -> int:
     systemId = int(binfo.get("system_id", 2))
     boardId = int(binfo.get("board_id", 1))
     board = ats.Board(systemId=systemId, boardId=boardId)
+    
+    # Validate board handle
+    if not hasattr(board, 'handle') or board.handle is None:
+        available = get_available_boards()
+        error_msg = (
+            f"Failed to initialize board with system_id={systemId}, board_id={boardId}. "
+            f"The board handle is None. Check that:\n"
+            f"  1. The board is physically connected\n"
+            f"  2. The system_id and board_id in config are correct\n"
+            f"  3. The atsapi/driver installation is correct\n"
+        )
+        if available:
+            error_msg += f"\nAvailable boards:\n"
+            for sys_id, brd_id, desc in available:
+                error_msg += f"  - system_id={sys_id}, board_id={brd_id} ({desc})\n"
+        else:
+            error_msg += f"\nNo boards found. Check physical connection and driver installation.\n"
+        raise RuntimeError(error_msg)
+    
     sr_hz, vppA, vppB = configure_board(board, cfg)
 
     ch_mask = channels_from_mask_expr(ch_expr)
@@ -2848,8 +2897,7 @@ class LauncherGUI(tk.Tk):
             return
         cfg_path = Path(self.var_config.get()).expanduser()
         if not cfg_path.exists():
-            messagebox.showerror("Missing", f"Config not found:
-{cfg_path}")
+            messagebox.showerror("Missing", f"Config not found:{cfg_path}")
             return
 
         # Clear Python bytecode cache to avoid stale imports and reduce startup churn
