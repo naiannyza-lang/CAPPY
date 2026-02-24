@@ -2117,7 +2117,7 @@ class ArchiveBrowser(ttk.Frame):
             conn = sqlite3.connect(db)
             try:
                 self.snips = pd.read_sql_query(
-                    "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                    "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                     "file,offset_bytes,nbytes,"
                     "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
                     "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
@@ -2128,7 +2128,7 @@ class ArchiveBrowser(ttk.Frame):
                 # If query returned nothing, try without session_id filter (DB might only have one session)
                 if self.snips.empty:
                     self.snips = pd.read_sql_query(
-                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,"
                         "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
                         "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
@@ -2139,7 +2139,7 @@ class ArchiveBrowser(ttk.Frame):
                 # Legacy DB schema (no channel-separated columns or baseline columns)
                 try:
                     self.snips = pd.read_sql_query(
-                        "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                        "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
                         "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
                         conn,
@@ -2147,16 +2147,17 @@ class ArchiveBrowser(ttk.Frame):
                     )
                     if self.snips.empty:
                         self.snips = pd.read_sql_query(
-                            "SELECT id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
+                            "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                             "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
                             "FROM snips ORDER BY timestamp_ns DESC LIMIT 50000",
                             conn,
                         )
                 except Exception:
                     pass
+            finally:
                 conn.close()
-                self._snip_db_dir = ddir
-                break
+            self._snip_db_dir = ddir
+            break
 
         self.wlist.delete(0, tk.END)
         if self.snips.empty:
@@ -2607,15 +2608,20 @@ class LiveDashboard(ttk.Frame):
 
         # --- Channel A waveform (top) - Optimized rendering ---
         if self._streamA.size > 1:
+            # Baseline-subtract: remove DC offset using rolling mean of the stream
+            stream_a = self._streamA.copy()
+            bl_a = np.mean(stream_a)
+            stream_a = stream_a - bl_a
+
             # Use downsampled view if stream is very large for better performance
-            if self._streamA.size > 50000:
+            if stream_a.size > 50000:
                 # Decimate for display only - use every Nth point
-                step = max(1, self._streamA.size // 20000)
-                x_view = np.arange(0, self._streamA.size, step)
-                y_view = self._streamA[::step]
+                step = max(1, stream_a.size // 20000)
+                x_view = np.arange(0, stream_a.size, step)
+                y_view = stream_a[::step]
             else:
-                x_view = np.arange(self._streamA.size)
-                y_view = self._streamA
+                x_view = np.arange(stream_a.size)
+                y_view = stream_a
             
             # Plot with reduced antialiasing for speed
             line_a, = self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True, rasterized=True)
@@ -2640,14 +2646,19 @@ class LiveDashboard(ttk.Frame):
 
         # --- Channel B waveform (middle) - Optimized rendering ---
         if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+            # Baseline-subtract: remove DC offset using rolling mean of the stream
+            stream_b = self._streamB.copy()
+            bl_b = np.mean(stream_b)
+            stream_b = stream_b - bl_b
+
             # Use downsampled view if stream is very large
-            if self._streamB.size > 50000:
-                step = max(1, self._streamB.size // 20000)
-                xb_view = np.arange(0, self._streamB.size, step)
-                yb_view = self._streamB[::step]
+            if stream_b.size > 50000:
+                step = max(1, stream_b.size // 20000)
+                xb_view = np.arange(0, stream_b.size, step)
+                yb_view = stream_b[::step]
             else:
-                xb_view = np.arange(self._streamB.size)
-                yb_view = self._streamB
+                xb_view = np.arange(stream_b.size)
+                yb_view = stream_b
             
             line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
