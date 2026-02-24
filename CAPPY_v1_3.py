@@ -1822,16 +1822,18 @@ class ArchiveBrowser(ttk.Frame):
         self.axI.set_facecolor('#2d2d2d')
         self.fig.tight_layout(pad=1.0)
 
-        # Toolbar frame at top of plot area for zoom/pan controls
-        toolbar_frame = ttk.Frame(right)
-        toolbar_frame.pack(fill=tk.X, side=tk.TOP)
-
+        # Canvas MUST be created before toolbar
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # Add matplotlib navigation toolbar (zoom, pan, home, save)
-        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
-        self._nav_toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        # Toolbar goes above canvas in pack order
+        try:
+            from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk as NavToolbar
+        except ImportError:
+            from matplotlib.backends.backend_tkagg import NavigationToolbar2TkAgg as NavToolbar
+        toolbar_frame = tk.Frame(right, bg='#2d2d2d')
+        toolbar_frame.pack(side=tk.TOP, fill=tk.X)
+        self._nav_toolbar = NavToolbar(self.canvas, toolbar_frame)
         self._nav_toolbar.update()
         # Style the toolbar for dark theme
         try:
@@ -1843,6 +1845,9 @@ class ArchiveBrowser(ttk.Frame):
                     pass
         except Exception:
             pass
+
+        # Now pack the canvas below the toolbar
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # Hover state for waveform readout
         self._hover_annots = {}  # per-axis annotation objects
@@ -2028,7 +2033,7 @@ class ArchiveBrowser(ttk.Frame):
 
         for _, r in self._snips_view.iterrows():
             ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
-            self.wlist.insert(tk.END, f"{ts.strftime('%H:%M:%S')}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
+            self.wlist.insert(tk.END, f"{ts.strftime('%H:%M:%S.%f')[:12]}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
 
     def _on_date(self, _=None):
         if self.snips is None or self.snips.empty:
@@ -2351,6 +2356,13 @@ class ArchiveBrowser(ttk.Frame):
 
     def _on_hover(self, event):
         """Show timestamp + voltage readout when hovering over archive waveform plots."""
+        # Don't interfere with zoom/pan toolbar actions
+        try:
+            if self._nav_toolbar.mode:
+                return
+        except Exception:
+            pass
+
         # Hide all crosshairs and annotations first
         for vl in self._hover_vlines.values():
             try:
