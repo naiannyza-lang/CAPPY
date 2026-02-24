@@ -1844,8 +1844,8 @@ class ArchiveBrowser(ttk.Frame):
         except Exception:
             pass
 
-        # Hover annotation for waveform readout
-        self._hover_annot = None  # created per-axis on first hover
+        # Hover state for waveform readout
+        self._hover_annots = {}  # per-axis annotation objects
         self._hover_lines = {}  # axis -> (tvec, data, label, color)
         self._hover_sr = 1.0
         self._hover_ts_ns = 0
@@ -2272,7 +2272,7 @@ class ArchiveBrowser(ttk.Frame):
         self._hover_vlineB = self.axB.axvline(0, color=NEON_GREEN, alpha=0.3, linewidth=0.7, visible=False)
         self._hover_vlineI = self.axI.axvline(0, color='white', alpha=0.3, linewidth=0.7, visible=False)
         self._hover_vlines = {self.axA: self._hover_vlineA, self.axB: self._hover_vlineB, self.axI: self._hover_vlineI}
-        self._hover_annot = None  # will be recreated on next hover
+        self._hover_annots = {}  # will be recreated on next hover per-axis
 
         # Waveform A (baseline-subtracted)
         self.axA.plot(tvec, wa_bs, color=NEON_PINK, linewidth=1.5)
@@ -2351,30 +2351,25 @@ class ArchiveBrowser(ttk.Frame):
 
     def _on_hover(self, event):
         """Show timestamp + voltage readout when hovering over archive waveform plots."""
-        # Hide all crosshairs first
+        # Hide all crosshairs and annotations first
         for vl in self._hover_vlines.values():
             try:
                 vl.set_visible(False)
             except Exception:
                 pass
+        for ann in getattr(self, '_hover_annots', {}).values():
+            try:
+                ann.set_visible(False)
+            except Exception:
+                pass
 
         if event.inaxes is None or not self._hover_lines:
-            if self._hover_annot is not None:
-                try:
-                    self._hover_annot.set_visible(False)
-                except Exception:
-                    pass
             self._readout_var.set("Hover over waveform for readout  |  Use toolbar to zoom/pan")
             self.canvas.draw_idle()
             return
 
         ax = event.inaxes
         if ax not in self._hover_lines:
-            if self._hover_annot is not None:
-                try:
-                    self._hover_annot.set_visible(False)
-                except Exception:
-                    pass
             self.canvas.draw_idle()
             return
 
@@ -2382,7 +2377,6 @@ class ArchiveBrowser(ttk.Frame):
         if tvec is None or ydata is None or len(tvec) == 0:
             return
 
-        # Find nearest sample index to mouse x position
         x = event.xdata
         if x is None:
             return
@@ -2394,7 +2388,6 @@ class ArchiveBrowser(ttk.Frame):
         t_val = float(tvec[idx])
         v_val = float(ydata[idx])
 
-        # Compute absolute timestamp for this sample
         unit = self._hover_time_unit
         if unit == "ns":
             t_sec = t_val * 1e-9
@@ -2409,10 +2402,9 @@ class ArchiveBrowser(ttk.Frame):
         abs_dt = datetime.fromtimestamp(abs_ns / 1e9, tz=self._tz)
         ts_str = abs_dt.strftime('%H:%M:%S.%f')[:-3]
 
-        # Update the always-visible readout label
         self._readout_var.set(f"{label}  t={t_val:.4g} {unit}  V={v_val:.6g} V  @{ts_str}")
 
-        # Show crosshair on all axes at the same time position
+        # Show crosshair on all axes
         for a, vl in self._hover_vlines.items():
             try:
                 vl.set_xdata([t_val])
@@ -2420,26 +2412,20 @@ class ArchiveBrowser(ttk.Frame):
             except Exception:
                 pass
 
-        # Create/move annotation on the active axis
-        annot_text = f"{v_val:.6g} V"
-        if self._hover_annot is not None:
-            try:
-                if self._hover_annot.axes != ax:
-                    self._hover_annot.remove()
-                    self._hover_annot = None
-            except Exception:
-                self._hover_annot = None
-
-        if self._hover_annot is None:
-            self._hover_annot = ax.annotate("", xy=(0, 0), xytext=(12, 12),
+        # Get or create per-axis annotation (avoids remove() which older matplotlib doesn't support)
+        if not hasattr(self, '_hover_annots'):
+            self._hover_annots = {}
+        if ax not in self._hover_annots:
+            self._hover_annots[ax] = ax.annotate("", xy=(0, 0), xytext=(12, 12),
                 textcoords="offset points",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#1e1e1e", ec=color, alpha=0.92),
                 color="white", fontsize=8, zorder=100, visible=False)
 
-        self._hover_annot.xy = (t_val, v_val)
-        self._hover_annot.set_text(annot_text)
-        self._hover_annot.get_bbox_patch().set_edgecolor(color)
-        self._hover_annot.set_visible(True)
+        ann = self._hover_annots[ax]
+        ann.xy = (t_val, v_val)
+        ann.set_text(f"{v_val:.6g} V")
+        ann.get_bbox_patch().set_edgecolor(color)
+        ann.set_visible(True)
         self.canvas.draw_idle()
 
     def _set_meta(self, s: str):
