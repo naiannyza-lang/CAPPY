@@ -2032,8 +2032,11 @@ class ArchiveBrowser(ttk.Frame):
             return
 
         for _, r in self._snips_view.iterrows():
-            ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
-            self.wlist.insert(tk.END, f"{ts.strftime('%H:%M:%S.%f')[:12]}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
+            ts_ns_val = int(r["timestamp_ns"])
+            ts = datetime.fromtimestamp(ts_ns_val / 1e9, tz=self._tz)
+            # Show full microsecond precision: HH:MM:SS.uuuuuu
+            us_str = ts.strftime('%H:%M:%S') + f".{ts_ns_val % 1_000_000_000 // 1000:06d}"
+            self.wlist.insert(tk.END, f"{us_str}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
 
     def _on_date(self, _=None):
         if self.snips is None or self.snips.empty:
@@ -2340,11 +2343,13 @@ class ArchiveBrowser(ttk.Frame):
         except Exception:
             pass
 
-        ts = datetime.fromtimestamp(int(r["timestamp_ns"]) / 1e9, tz=self._tz)
+        ts_ns_val = int(r["timestamp_ns"])
+        ts = datetime.fromtimestamp(ts_ns_val / 1e9, tz=self._tz)
+        us_str = ts.strftime('%Y-%m-%d %H:%M:%S') + f".{ts_ns_val % 1_000_000_000 // 1000:06d}"
         a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
         b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
         self._set_meta(
-            f"Timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n"
+            f"Timestamp: {us_str}\n"
             f"Session: {r.get('session_id','?')}\n"
             f"Buffer: {int(r.get('buffer_index',-1))}  Record: {int(r.get('record_in_buffer',-1))}  Global: {int(r.get('record_global',-1))}\n"
             f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
