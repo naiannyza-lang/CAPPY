@@ -195,6 +195,7 @@ timing:
 acquisition:
   channels_mask: CHANNEL_A|CHANNEL_B
   pre_trigger_samples: 0
+  samples_per_record: 256      # optional convenience key; post = samples_per_record - pre
   post_trigger_samples: 256       # full record = pre + post
   records_per_buffer: 128
   buffers_allocated: 16
@@ -358,6 +359,30 @@ def _ns_to_iso(ts_ns: int) -> str:
         return datetime.fromtimestamp(int(ts_ns) / 1e9).strftime("%Y-%m-%d %H:%M:%S.%f")
     except Exception:
         return ""
+
+
+def _format_size_gib(n_bytes: int) -> str:
+    b = max(0, int(n_bytes or 0))
+    gib = b / float(1024 ** 3)
+    gb = b / 1e9
+    if gib >= 1.0:
+        return f"{gib:.3f} GiB ({gb:.3f} GB)"
+    mib = b / float(1024 ** 2)
+    return f"{mib:.1f} MiB ({gb:.3f} GB)"
+
+
+def _dir_size_bytes(root: Path) -> int:
+    total = 0
+    p = Path(root)
+    if not p.exists():
+        return 0
+    for dpath, _dirs, files in os.walk(p):
+        for name in files:
+            try:
+                total += (Path(dpath) / name).stat().st_size
+            except Exception:
+                pass
+    return int(total)
 
 def ats_const(prefix_or_name: str, maybe_name: str | None = None) -> int:
     """Resolve atsapi constants with the same prefix-mapping style as your old script."""
@@ -606,11 +631,15 @@ class StatusNotifier:
         if bool(self.notify.get("enabled", False)) and (now - self._last_email >= self.email_seconds):
             self._last_email = now
             try:
-                to_addr = str(self.notify.get("to_email", "")).strip()
+                to_addr = str(self.notify.get("to", "")).strip()
                 if to_addr:
                     with self._lock:
                         snap = dict(self._latest)
-                    send_status_email(cfg=self.cfg, snap=snap)
+                    subject_prefix = str(self.notify.get("subject_prefix", "[CAPPY]")).strip() or "[CAPPY]"
+                    state = str(snap.get("state", "status")).strip() or "status"
+                    subject = f"{subject_prefix} {state}"
+                    body = json.dumps(snap, indent=2, sort_keys=True, default=str)
+                    _send_status_email(cfg=self.cfg, subject=subject, body=body)
             except Exception:
                 pass
 
@@ -1228,13 +1257,32 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     clock["source"] = source
     clock["sample_rate_msps"] = sr_msps
 
-    pre = _clamp_int(acq.get("pre_trigger_samples", 0), 0, 8_000_000, 0)
-    post = _clamp_int(acq.get("post_trigger_samples", 256), 16, 8_000_000, 256)
+    max_spr = 8_000_000
+    pre = _clamp_int(acq.get("pre_trigger_samples", 0), 0, max_spr - 16, 0)
+    post = _clamp_int(acq.get("post_trigger_samples", 256), 16, max_spr, 256)
     spr = pre + post
+
+    # Support explicit acquisition.samples_per_record and keep post-trigger derived from it.
+    spr_cfg = _clamp_int(acq.get("samples_per_record", spr), 16, max_spr, spr)
+    if spr_cfg != spr:
+        spr = spr_cfg
+        if spr < (pre + 16):
+            warnings.append(
+                f"acquisition.samples_per_record={spr_cfg} is too small for pre_trigger_samples={pre}; using {pre + 16}."
+            )
+            spr = pre + 16
+        post = max(16, spr - pre)
+
+    if spr > max_spr:
+        warnings.append(f"samples_per_record={spr} exceeds limit {max_spr}; clamping.")
+        spr = max_spr
+        post = max(16, spr - pre)
+
     if spr <= 0:
-        errors.append("pre_trigger_samples + post_trigger_samples must be > 0.")
+        errors.append("samples_per_record must be > 0.")
     acq["pre_trigger_samples"] = pre
     acq["post_trigger_samples"] = post
+    acq["samples_per_record"] = int(spr)
 
     rpb = _clamp_int(acq.get("records_per_buffer", 128), 1, 100_000, 128)
     bufN = _clamp_int(acq.get("buffers_allocated", 16), 2, 4096, 16)
@@ -2118,6 +2166,7 @@ class ArchiveBrowser(ttk.Frame):
         filt.pack(fill=tk.X)
 
         self.var_dir = tk.StringVar(value=str(self.data_dir))
+        self.var_baseline_subtract = tk.BooleanVar(value=False)
         
         pan = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
         pan.pack(fill=tk.BOTH, expand=True, pady=(8,0))
@@ -2201,6 +2250,15 @@ class ArchiveBrowser(ttk.Frame):
         wframe.columnconfigure(0, weight=1)
         wframe.rowconfigure(0, weight=1)
         self.wlist.bind("<<TreeviewSelect>>", self._on_snip)
+
+        plot_opts = ttk.Frame(self._right)
+        plot_opts.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+        ttk.Checkbutton(
+            plot_opts,
+            text="Baseline subtract (archive view)",
+            variable=self.var_baseline_subtract,
+            command=self._redraw_selected_snip,
+        ).pack(side=tk.LEFT)
 
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
         self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
@@ -2630,6 +2688,12 @@ class ArchiveBrowser(ttk.Frame):
         self._apply_hour_filter()
         self._set_meta(f"Snips loaded: {len(self.snips):,}")
 
+    def _redraw_selected_snip(self):
+        try:
+            self._on_snip()
+        except Exception:
+            pass
+
     def _on_snip(self, _=None):
         if self.snips.empty or self._snip_db_dir is None:
             return
@@ -2663,20 +2727,18 @@ class ArchiveBrowser(ttk.Frame):
         if not np.isfinite(sr) or sr <= 0:
             sr = 1.0
 
-        # Get baseline values (mean voltage in baseline window, already computed during acquisition)
+        # Baseline values are recorded during acquisition; fall back to first 64 samples for legacy rows.
         baseline_A = float(r.get("baseline_A_V", 0.0))
         baseline_B = float(r.get("baseline_B_V", 0.0))
-        
-        # Fallback: If baseline values are missing (old data), calculate from waveform
-        # Using first 64 samples as baseline window (matching default config)
+
         if baseline_A == 0.0 and len(wa) >= 64:
             baseline_A = float(np.mean(wa[:64]))
         if baseline_B == 0.0 and wb is not None and len(wb) >= 64:
             baseline_B = float(np.mean(wb[:64]))
-        
-        # Apply baseline subtraction to waveforms for display
-        wa_bs = wa - baseline_A
-        wb_bs = wb - baseline_B if wb is not None else None
+
+        do_baseline_subtract = bool(self.var_baseline_subtract.get()) if hasattr(self, "var_baseline_subtract") else False
+        wa_plot = (wa - baseline_A) if do_baseline_subtract else wa
+        wb_plot = ((wb - baseline_B) if do_baseline_subtract else wb) if wb is not None else None
 
         # Time axis with adaptive units (ns/us/ms/s)
         tvec, unit = _auto_time_axis(len(wa), sr)
@@ -2696,8 +2758,8 @@ class ArchiveBrowser(ttk.Frame):
         self._init_hover_vlines()
         self._hover_annots = {}  # will be recreated on next hover per-axis
 
-        # Waveform A (baseline-subtracted)
-        self.axA.plot(tvec, wa_bs, color=NEON_PINK, linewidth=1.5)
+        # Waveform A
+        self.axA.plot(tvec, wa_plot, color=NEON_PINK, linewidth=1.5)
         self.axA.axhline(0, color='white', linewidth=0.5, linestyle='--', alpha=0.3)
         self.axA.set_ylabel("A (V)", color=NEON_PINK)
         self.axA.tick_params(colors=NEON_PINK)
@@ -2706,11 +2768,11 @@ class ArchiveBrowser(ttk.Frame):
         self.axA.spines['top'].set_visible(False)
         self.axA.spines['right'].set_visible(False)
         self.axA.grid(True, alpha=0.15, color=NEON_PINK)
-        self._hover_lines[self.axA] = (tvec, wa_bs, "Ch A", NEON_PINK)
+        self._hover_lines[self.axA] = (tvec, wa_plot, "Ch A", NEON_PINK)
 
-        # Waveform B (baseline-subtracted if available)
-        if wb_bs is not None:
-            self.axB.plot(tvec, wb_bs, color=NEON_GREEN, linewidth=1.5)
+        # Waveform B (if available)
+        if wb_plot is not None:
+            self.axB.plot(tvec, wb_plot, color=NEON_GREEN, linewidth=1.5)
             self.axB.axhline(0, color='white', linewidth=0.5, linestyle='--', alpha=0.3)
             self.axB.set_ylabel("B (V)", color=NEON_GREEN)
             self.axB.tick_params(colors=NEON_GREEN)
@@ -2718,7 +2780,7 @@ class ArchiveBrowser(ttk.Frame):
             self.axB.spines['bottom'].set_color('white')
             self.axB.spines['top'].set_visible(False)
             self.axB.spines['right'].set_visible(False)
-            self._hover_lines[self.axB] = (tvec, wb_bs, "Ch B", NEON_GREEN)
+            self._hover_lines[self.axB] = (tvec, wb_plot, "Ch B", NEON_GREEN)
         else:
             self.axB.text(0.02, 0.5, "Channel B not captured in this snip", transform=self.axB.transAxes, color='white')
             self.axB.set_ylabel("B (V)", color='white')
@@ -2729,13 +2791,13 @@ class ArchiveBrowser(ttk.Frame):
             self.axB.spines['right'].set_visible(False)
         self.axB.grid(True, alpha=0.15, color='white')
 
-        # Cumulative integral (V·s) - using baseline-subtracted waveforms
+        # Cumulative integral (V·s)
         dt = 1.0 / sr
-        intA = np.cumsum(np.asarray(wa_bs, dtype=np.float64)) * dt
+        intA = np.cumsum(np.asarray(wa_plot, dtype=np.float64)) * dt
         self.axI.plot(tvec, intA, color=NEON_PINK, linewidth=1.5, label="∫A dt")
         self._hover_lines[self.axI] = (tvec, intA, "∫A (V·s)", NEON_PINK)
-        if wb_bs is not None:
-            intB = np.cumsum(np.asarray(wb_bs, dtype=np.float64)) * dt
+        if wb_plot is not None:
+            intB = np.cumsum(np.asarray(wb_plot, dtype=np.float64)) * dt
             self.axI.plot(tvec, intB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="∫B dt")
         self.axI.set_ylabel("Integral (V·s)", color='white')
         self.axI.set_xlabel(f"Time ({unit})", color='white')
@@ -2768,6 +2830,7 @@ class ArchiveBrowser(ttk.Frame):
             f"Session: {r.get('session_id','?')}\n"
             f"Buffer: {int(r.get('buffer_index',-1))}  Record: {int(r.get('record_in_buffer',-1))}  Global: {int(r.get('record_global',-1))}\n"
             f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
+            f"Display mode: {'baseline-subtracted' if do_baseline_subtract else 'raw volts'}\n"
             f"Area A: {float(r.get('area_A_Vs',0.0)):.6g} V·s   Peak A: {float(r.get('peak_A_V',0.0)):.6g} V\n"
             f"Area B: {float(r.get('area_B_Vs',0.0)):.6g} V·s   Peak B: {float(r.get('peak_B_V',0.0)):.6g} V\n"
             f"Baseline A: {baseline_A:.6g} V   Baseline B: {baseline_B:.6g} V\n"
@@ -3171,6 +3234,7 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
 
         # --- Channel B waveform (middle) - Optimized rendering ---
+        has_b_channel = bool(channels_from_mask_expr(str(snap.get("channels_mask", "CHANNEL_A"))) & 0x2)
         if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
             # Baseline-subtract: remove DC offset using rolling mean of the stream
             stream_b = self._streamB.copy()
@@ -3199,7 +3263,10 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfB.spines['right'].set_visible(False)
             self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
         else:
-            self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
+            if has_b_channel:
+                self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
+            else:
+                self.ax_wfB.set_title("Channel B: disabled in channels mask", color='white')
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
             self.ax_wfB.set_xlabel("Time from latest (ms)", color='white')
             self.ax_wfB.tick_params(colors='white')
@@ -3317,6 +3384,8 @@ class LiveDashboard(ttk.Frame):
                 max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
             except Exception:
                 max_wf = 20
+            channels_mask_text = str(snap.get("channels_mask", "CHANNEL_A") or "CHANNEL_A")
+            status_has_b = bool(channels_from_mask_expr(channels_mask_text) & 0x2)
 
             def _append_stream(values: np.ndarray, is_b: bool) -> None:
                 if values is None or values.size == 0:
@@ -3330,10 +3399,13 @@ class LiveDashboard(ttk.Frame):
                     if self._streamA.size > self._stream_window:
                         self._streamA = self._streamA[-self._stream_window:]
 
+            saw_ring_record = False
+            saw_b_record = False
             for _ in range(max_wf):
                 wfA, wfB, wf_t_unix, _chmask, _seq = self._read_ring_next()
                 if wfA is None and wfB is None:
                     break
+                saw_ring_record = True
                 if wf_t_unix is not None:
                     self._latest_ring_unix = float(wf_t_unix)
                 if wfA is not None:
@@ -3344,8 +3416,17 @@ class LiveDashboard(ttk.Frame):
                 if wfB is not None:
                     try:
                         _append_stream(wfB, is_b=True)
+                        saw_b_record = True
                     except Exception:
                         pass
+
+            # Prevent stale Channel B traces when capture switches to A-only.
+            if not status_has_b:
+                if self._streamB.size:
+                    self._streamB = np.empty((0,), dtype=np.float32)
+            elif saw_ring_record and (not saw_b_record):
+                self._streamB = np.empty((0,), dtype=np.float32)
+
             self._redraw(snap)
 
             latest_ring = "-"
@@ -3426,6 +3507,7 @@ class LiveControlPanel(ttk.Frame):
         self.var_channels_mask = tk.StringVar(value="CHANNEL_A|CHANNEL_B")
 
         self.var_pre = tk.IntVar(value=0)
+        self.var_samples_per_record = tk.IntVar(value=256)
         self.var_post = tk.IntVar(value=256)
         self.var_bunch = tk.IntVar(value=424)
         self.var_rpb = tk.IntVar(value=128)
@@ -3483,12 +3565,13 @@ class LiveControlPanel(ttk.Frame):
         self._add_combobox(acq, 1, "Rate (MS/s)", self.var_rate_msps, [str(v) for v in SAMPLE_RATE_OPTIONS_MSPS], width=12)
         self._add_combobox(acq, 2, "Channels", self.var_channels_mask, CHANNEL_MASK_OPTIONS, width=18)
         self._add_entry(acq, 3, "Pre-trigger samples", self.var_pre)
-        self._add_entry(acq, 4, "Post-trigger samples", self.var_post)
-        self._add_entry(acq, 5, "Bunch spacing", self.var_bunch)
-        self._add_entry(acq, 6, "Records/buffer", self.var_rpb)
-        self._add_entry(acq, 7, "Buffers allocated", self.var_bufN)
-        self._add_entry(acq, 8, "Buffers/acquisition (0=run)", self.var_bpa)
-        self._add_entry(acq, 9, "DMA wait timeout (ms)", self.var_wait_timeout_ms)
+        self._add_entry(acq, 4, "Samples/record", self.var_samples_per_record)
+        self._add_entry(acq, 5, "Post-trigger samples", self.var_post)
+        self._add_entry(acq, 6, "Bunch spacing", self.var_bunch)
+        self._add_entry(acq, 7, "Records/buffer", self.var_rpb)
+        self._add_entry(acq, 8, "Buffers allocated", self.var_bufN)
+        self._add_entry(acq, 9, "Buffers/acquisition (0=run)", self.var_bpa)
+        self._add_entry(acq, 10, "DMA wait timeout (ms)", self.var_wait_timeout_ms)
 
         vert = ttk.LabelFrame(left, text="Vertical", padding=8)
         vert.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -3555,6 +3638,24 @@ class LiveControlPanel(ttk.Frame):
         cb = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
         cb.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
 
+    def _var_text(self, var: tk.Variable, default: str = "") -> str:
+        try:
+            name = getattr(var, "_name", None)
+            if name:
+                return str(self.tk.globalgetvar(name))
+        except Exception:
+            pass
+        try:
+            return str(var.get())
+        except Exception:
+            return str(default)
+
+    def _safe_int(self, var: tk.Variable, default: int) -> int:
+        return _to_int(self._var_text(var, str(default)), default)
+
+    def _safe_float(self, var: tk.Variable, default: float) -> float:
+        return _to_float(self._var_text(var, str(default)), default)
+
     def load_from_cfg(self, cfg: Dict[str, Any]) -> None:
         self._loading = True
         try:
@@ -3573,8 +3674,14 @@ class LiveControlPanel(ttk.Frame):
             mask_expr = str(acq.get("channels_mask", "CHANNEL_A|CHANNEL_B"))
             mask = channels_from_mask_expr(mask_expr)
             self.var_channels_mask.set(channels_mask_to_str(mask))
-            self.var_pre.set(_to_int(acq.get("pre_trigger_samples", 0), 0))
-            self.var_post.set(_to_int(acq.get("post_trigger_samples", 256), 256))
+            pre = _to_int(acq.get("pre_trigger_samples", 0), 0)
+            post = _to_int(acq.get("post_trigger_samples", 256), 256)
+            spr = _to_int(acq.get("samples_per_record", pre + post), pre + post)
+            if spr < (pre + 16):
+                spr = pre + 16
+            self.var_pre.set(pre)
+            self.var_samples_per_record.set(spr)
+            self.var_post.set(max(16, spr - pre))
             self.var_bunch.set(_to_int(timing.get("bunch_spacing_samples", 424), 424))
             self.var_rpb.set(_to_int(acq.get("records_per_buffer", 128), 128))
             self.var_bufN.set(_to_int(acq.get("buffers_allocated", 16), 16))
@@ -3595,7 +3702,7 @@ class LiveControlPanel(ttk.Frame):
             level_code = _clamp_int(trig.get("levelJ", 128), 0, 255, 128)
             self.var_trig_source.set(TRIGGER_SOURCE_CONST_TO_LABEL.get(src, "External"))
             self.var_trig_slope.set(TRIGGER_SLOPE_CONST_TO_LABEL.get(slope, "Positive"))
-            self.var_trig_level_pct.set((float(level_code) / 255.0) * 100.0)
+            self.var_trig_level_pct.set(round((float(level_code) / 255.0) * 100.0, 3))
             self.var_trig_timeout_ms.set(_to_int(trig.get("timeout_ms", 0), 0))
             self.var_timeout_pause_s.set(_to_float(trig.get("timeout_pause_s", 0.0), 0.0))
             self.var_trig_mode.set(str(trig.get("operation", "TRIG_ENGINE_OP_J")))
@@ -3642,67 +3749,94 @@ class LiveControlPanel(ttk.Frame):
         out["storage"] = storage
         out["live"] = live
 
-        clock["source"] = str(self.var_clock_source.get() or "INTERNAL_CLOCK")
-        clock["sample_rate_msps"] = _to_float(self.var_rate_msps.get(), 250.0)
+        local_warns: List[str] = []
 
-        acq["channels_mask"] = str(self.var_channels_mask.get() or "CHANNEL_A")
-        acq["pre_trigger_samples"] = _to_int(self.var_pre.get(), 0)
-        acq["post_trigger_samples"] = _to_int(self.var_post.get(), 256)
-        acq["records_per_buffer"] = _to_int(self.var_rpb.get(), 128)
-        acq["buffers_allocated"] = _to_int(self.var_bufN.get(), 16)
-        acq["buffers_per_acquisition"] = _to_int(self.var_bpa.get(), 0)
-        acq["wait_timeout_ms"] = _to_int(self.var_wait_timeout_ms.get(), 1000)
+        clock["source"] = self._var_text(self.var_clock_source, "INTERNAL_CLOCK") or "INTERNAL_CLOCK"
+        clock["sample_rate_msps"] = self._safe_float(self.var_rate_msps, 250.0)
 
-        timing["bunch_spacing_samples"] = _to_int(self.var_bunch.get(), 424)
+        acq["channels_mask"] = self._var_text(self.var_channels_mask, "CHANNEL_A") or "CHANNEL_A"
+        pre = max(0, self._safe_int(self.var_pre, 0))
+        post_user = self._safe_int(self.var_post, 256)
+        spr_default = pre + max(16, post_user)
+        spr_target = max(16, self._safe_int(self.var_samples_per_record, spr_default))
+        if spr_target < (pre + 16):
+            local_warns.append(
+                f"samples_per_record={spr_target} is too small for pre={pre}; using {pre + 16}."
+            )
+            spr_target = pre + 16
+        post = max(16, spr_target - pre)
+
+        acq["pre_trigger_samples"] = pre
+        acq["post_trigger_samples"] = post
+        acq["samples_per_record"] = spr_target
+        acq["records_per_buffer"] = self._safe_int(self.var_rpb, 128)
+        acq["buffers_allocated"] = self._safe_int(self.var_bufN, 16)
+        acq["buffers_per_acquisition"] = self._safe_int(self.var_bpa, 0)
+        acq["wait_timeout_ms"] = self._safe_int(self.var_wait_timeout_ms, 1000)
+
+        bunch_user = self._safe_int(self.var_bunch, 424)
+        bunch = max(1, bunch_user)
+        if bunch < spr_target:
+            local_warns.append(
+                f"bunch_spacing_samples={bunch} is < samples_per_record={spr_target}; using {spr_target}."
+            )
+            bunch = spr_target
+        timing["bunch_spacing_samples"] = bunch
+
+        # Keep visible fields internally consistent so users see what will be applied.
+        self.var_samples_per_record.set(int(spr_target))
+        self.var_post.set(int(post))
+        self.var_bunch.set(int(bunch))
 
         chA = channels.setdefault("A", {}) or {}
         chB = channels.setdefault("B", {}) or {}
         channels["A"] = chA
         channels["B"] = chB
-        chA["range"] = str(self.var_range_a.get() or "PM_1_V")
-        chA["coupling"] = str(self.var_coupling_a.get() or "DC")
-        chA["impedance"] = str(self.var_imp_a.get() or "50_OHM")
-        chB["range"] = str(self.var_range_b.get() or "PM_1_V")
-        chB["coupling"] = str(self.var_coupling_b.get() or "DC")
-        chB["impedance"] = str(self.var_imp_b.get() or "50_OHM")
+        chA["range"] = self._var_text(self.var_range_a, "PM_1_V") or "PM_1_V"
+        chA["coupling"] = self._var_text(self.var_coupling_a, "DC") or "DC"
+        chA["impedance"] = self._var_text(self.var_imp_a, "50_OHM") or "50_OHM"
+        chB["range"] = self._var_text(self.var_range_b, "PM_1_V") or "PM_1_V"
+        chB["coupling"] = self._var_text(self.var_coupling_b, "DC") or "DC"
+        chB["impedance"] = self._var_text(self.var_imp_b, "50_OHM") or "50_OHM"
 
-        trig["operation"] = str(self.var_trig_mode.get() or "TRIG_ENGINE_OP_J")
+        trig["operation"] = self._var_text(self.var_trig_mode, "TRIG_ENGINE_OP_J") or "TRIG_ENGINE_OP_J"
         trig["engine1"] = "TRIG_ENGINE_J"
         trig["engine2"] = "TRIG_ENGINE_K"
-        trig["sourceJ"] = TRIGGER_SOURCE_LABEL_TO_CONST.get(self.var_trig_source.get(), "TRIG_EXTERNAL")
-        trig["slopeJ"] = TRIGGER_SLOPE_LABEL_TO_CONST.get(self.var_trig_slope.get(), "TRIGGER_SLOPE_POSITIVE")
-        trig["levelJ"] = int(round(_clamp_float(self.var_trig_level_pct.get(), 0.0, 100.0, 50.0) * 255.0 / 100.0))
+        trig["sourceJ"] = TRIGGER_SOURCE_LABEL_TO_CONST.get(self._var_text(self.var_trig_source, "External"), "TRIG_EXTERNAL")
+        trig["slopeJ"] = TRIGGER_SLOPE_LABEL_TO_CONST.get(self._var_text(self.var_trig_slope, "Positive"), "TRIGGER_SLOPE_POSITIVE")
+        trig["levelJ"] = int(round(_clamp_float(self._safe_float(self.var_trig_level_pct, 50.0), 0.0, 100.0, 50.0) * 255.0 / 100.0))
         trig["sourceK"] = str(trig.get("sourceK", "TRIG_DISABLE") or "TRIG_DISABLE")
         trig["slopeK"] = str(trig.get("slopeK", "TRIGGER_SLOPE_POSITIVE") or "TRIGGER_SLOPE_POSITIVE")
         trig["levelK"] = _clamp_int(trig.get("levelK", 128), 0, 255, 128)
-        trig["timeout_ms"] = _to_int(self.var_trig_timeout_ms.get(), 0)
-        trig["timeout_pause_s"] = _to_float(self.var_timeout_pause_s.get(), 0.0)
-        trig["ext_range"] = str(self.var_ext_range.get() or "ETR_5V")
-        trig["ext_coupling"] = str(self.var_ext_coupling.get() or "DC_COUPLING")
+        trig["timeout_ms"] = self._safe_int(self.var_trig_timeout_ms, 0)
+        trig["timeout_pause_s"] = self._safe_float(self.var_timeout_pause_s, 0.0)
+        trig["ext_range"] = self._var_text(self.var_ext_range, "ETR_5V") or "ETR_5V"
+        trig["ext_coupling"] = self._var_text(self.var_ext_coupling, "DC_COUPLING") or "DC_COUPLING"
         trig["external_startcapture"] = bool(self.var_ext_startcapture.get())
 
-        runtime["rearm_if_no_trigger_s"] = _to_int(self.var_rearm_s.get(), 300)
-        runtime["rearm_cooldown_s"] = _to_int(self.var_rearm_cooldown_s.get(), 30)
-        runtime["max_rearms_per_hour"] = _to_int(self.var_rearm_per_hour.get(), 12)
+        runtime["rearm_if_no_trigger_s"] = self._safe_int(self.var_rearm_s, 300)
+        runtime["rearm_cooldown_s"] = self._safe_int(self.var_rearm_cooldown_s, 30)
+        runtime["max_rearms_per_hour"] = self._safe_int(self.var_rearm_per_hour, 12)
 
         storage["data_dir"] = str(self.launcher.var_data_dir.get() or "dataFile")
-        storage["flush_every_records"] = _to_int(self.var_flush_records.get(), 20000)
-        storage["flush_every_seconds"] = _to_float(self.var_flush_seconds.get(), 2.0)
-        storage["sqlite_commit_every_snips"] = _to_int(self.var_sqlite_commit.get(), 200)
-        storage["session_rotate_hours"] = _to_float(self.var_rotate_hours.get(), 24.0)
+        storage["flush_every_records"] = self._safe_int(self.var_flush_records, 20000)
+        storage["flush_every_seconds"] = self._safe_float(self.var_flush_seconds, 2.0)
+        storage["sqlite_commit_every_snips"] = self._safe_int(self.var_sqlite_commit, 200)
+        storage["session_rotate_hours"] = self._safe_float(self.var_rotate_hours, 24.0)
 
-        live["ring_slots"] = _to_int(self.var_ring_slots.get(), 4096)
-        live["ring_points"] = _to_int(self.var_ring_points.get(), 512)
-        live["stream_window_points"] = _to_int(self.var_stream_pts.get(), 20000)
-        live["stream_window_seconds"] = _to_float(self.var_stream_s.get(), 2.0)
-        live["max_waveforms_per_tick"] = _to_int(self.var_max_wf_tick.get(), 20)
-        live["preview_mode"] = str(self.var_preview_mode.get() or "archive_match")
+        live["ring_slots"] = self._safe_int(self.var_ring_slots, 4096)
+        live["ring_points"] = self._safe_int(self.var_ring_points, 512)
+        live["stream_window_points"] = self._safe_int(self.var_stream_pts, 20000)
+        live["stream_window_seconds"] = self._safe_float(self.var_stream_s, 2.0)
+        live["max_waveforms_per_tick"] = self._safe_int(self.var_max_wf_tick, 20)
+        live["preview_mode"] = self._var_text(self.var_preview_mode, "archive_match") or "archive_match"
 
         norm, warns, errs = validate_and_normalize_capture_cfg(out)
+        all_warns = list(local_warns) + list(warns)
         if errs:
             self._msg_var.set("Invalid settings; fix highlighted values.")
-        elif warns:
-            self._msg_var.set(f"Applied with {len(warns)} warning(s).")
+        elif all_warns:
+            self._msg_var.set(f"Applied with {len(all_warns)} warning(s).")
         else:
             self._msg_var.set("Settings OK.")
         return norm
@@ -3755,6 +3889,9 @@ class LauncherGUI(tk.Tk):
         self._live_out_dir = tk.StringVar(value="Output: -")
         self._live_written = tk.StringVar(value="Written: -")
         self._live_last_flush = tk.StringVar(value="Last flush: -")
+        self._disk_scan_interval_s = 10.0
+        self._last_disk_scan_unix = 0.0
+        self._last_disk_size_bytes = 0
 
         # Auto-create default config so you never need to run `init` in a terminal.
         cfgp = Path(self.var_config.get())
@@ -3822,6 +3959,13 @@ class LauncherGUI(tk.Tk):
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
 
+    def _capture_disk_size(self, data_dir: Path) -> int:
+        now = time.time()
+        if (now - self._last_disk_scan_unix) >= self._disk_scan_interval_s:
+            self._last_disk_scan_unix = now
+            self._last_disk_size_bytes = _dir_size_bytes(data_dir / "captures")
+        return int(self._last_disk_size_bytes)
+
 
     def _handle_line(self, ln: str):
         # Flush events emitted by patched capture: "CAPPY_EVENT {json}"
@@ -3835,7 +3979,10 @@ class LauncherGUI(tk.Tk):
                 return
             if isinstance(evt, dict) and evt.get("type") == "flush":
                 w = evt.get("written") or {}
-                self._live_written.set(f"Written: {w.get('bytes',0)} bytes, {w.get('records',0)} records, {w.get('samples',0)} samples")
+                w_bytes = _to_int(w.get('bytes', 0), 0)
+                self._live_written.set(
+                    f"Written: {w_bytes:,} bytes ({_format_size_gib(w_bytes)}), {w.get('records',0)} records, {w.get('samples',0)} samples"
+                )
                 ts = evt.get("ts_iso") or ""
                 if not ts and isinstance(evt.get("ts_ns"), int):
                     ts = _ns_to_iso(int(evt["ts_ns"]))
@@ -3849,8 +3996,9 @@ class LauncherGUI(tk.Tk):
                     pass
 
     def _on_status_snapshot(self, snap: dict):
+        data_dir_path = Path(str(snap.get("data_dir", self.var_data_dir.get()) or self.var_data_dir.get())).expanduser()
         try:
-            data_dir = str(snap.get("data_dir", self.var_data_dir.get()) or self.var_data_dir.get())
+            data_dir = str(data_dir_path)
             sid = str(snap.get("session_id", "") or "")
             if sid:
                 self._live_out_dir.set(f"Output: {data_dir}/captures (session {sid})")
@@ -3861,7 +4009,10 @@ class LauncherGUI(tk.Tk):
         try:
             reduced = int(snap.get("reduced_rows", 0))
             snips = int(snap.get("snips", 0))
-            self._live_written.set(f"Written: reduced_rows={reduced:,}   snips={snips:,}")
+            disk_bytes = self._capture_disk_size(data_dir_path)
+            self._live_written.set(
+                f"Written: reduced_rows={reduced:,}   snips={snips:,}   disk={_format_size_gib(disk_bytes)}"
+            )
         except Exception:
             pass
         try:
