@@ -1769,6 +1769,7 @@ def run_capture(cfg_path: Path) -> int:
 
     print(f"[CAPPY] Running session {sid}. " + ("Press <enter> to stop." if (sys.stdin is not None and hasattr(sys.stdin,"isatty") and sys.stdin.isatty()) else "Use Stop (GUI) or Ctrl+C to stop."))
     buf_done = 0
+    next_wait_idx = 0
     global_rec = 0
     t0 = time.time()
     last = t0
@@ -1791,7 +1792,7 @@ def run_capture(cfg_path: Path) -> int:
 
     try:
         def _do_rearm(force: bool = False):
-            nonlocal timeout_count, last_buffer_ns
+            nonlocal timeout_count, last_buffer_ns, next_wait_idx
             now = time.time()
             # keep only last hour
             while rearm_times and (now - rearm_times[0]) > 3600:
@@ -1818,6 +1819,7 @@ def run_capture(cfg_path: Path) -> int:
 
             timeout_count = 0
             last_buffer_ns = time.time_ns()
+            next_wait_idx = 0
             notifier.update(state='running')
             notifier.maybe_emit()
 
@@ -1850,10 +1852,14 @@ def run_capture(cfg_path: Path) -> int:
 
         board.startCapture()
         while buf_done < buf_target and not _should_stop():
-            buf = buffers[buf_done % len(buffers)]
+            buf = buffers[next_wait_idx % len(buffers)]
             try:
                 board.waitAsyncBufferComplete(buf.addr, wait_timeout_ms)
             except Exception as ex:
+                if "ApiBufferNotReady" in str(ex):
+                    print("[CAPPY] Warning: ApiBufferNotReady while waiting for DMA buffer; resetting DMA queue.")
+                    _do_rearm(force=True)
+                    continue
                 if "ApiWaitTimeout" in str(ex):
                     timeout_count += 1
                     ago_s = (time.time_ns() - last_buffer_ns) / 1e9
@@ -1895,7 +1901,7 @@ def run_capture(cfg_path: Path) -> int:
                 msg = str(ex)
                 if "ApiBufferOverflow" in msg:
                     print("[CAPPY] Warning: ApiBufferOverflow while recycling DMA buffer; rearming capture.")
-                    _do_rearm()
+                    _do_rearm(force=True)
                     continue
                 if "ApiWaitCanceled" in msg or "ApiWaitCancelled" in msg:
                     break
@@ -2019,6 +2025,7 @@ def run_capture(cfg_path: Path) -> int:
 
             archive.append_reduced(red_rows, ts_ns)
 
+            next_wait_idx += 1
             buf_done += 1
             global_rec += rpb
 
