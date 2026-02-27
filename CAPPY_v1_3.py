@@ -801,6 +801,50 @@ class WaveBinSqliteStore:
             self.conn.commit()
             self._rows_since_commit = 0
 
+    
+    def flush_raw_and_index(self, *, durable: bool = False) -> None:
+        """Flush raw waveform bin files and commit the SQLite index.
+
+        This is the critical 'archive commit' boundary. If durable=True, also fsync to disk
+        (safer, slower).
+        """
+        # Commit SQLite index (WAL). This is the 'index' commit boundary.
+        try:
+            self.conn.commit()
+            self._rows_since_commit = 0
+        except Exception:
+            pass
+
+        if not durable:
+            return
+
+        import os as _os
+        # Best-effort fsync of bin files.
+        for fh in (self._fhA, self._fhB):
+            if fh is None:
+                continue
+            try:
+                fh.flush()
+            except Exception:
+                pass
+            try:
+                _os.fsync(fh.fileno())
+            except Exception:
+                pass
+
+        # Best-effort fsync of SQLite files (main + WAL/SHM if present).
+        try:
+            for suffix in ("", "-wal", "-shm"):
+                p = str(self.db_path) + suffix
+                if _os.path.exists(p):
+                    with open(p, "rb") as _fh:
+                        try:
+                            _os.fsync(_fh.fileno())
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
     def close_bin(self):
         for fh_name in ("_fhA", "_fhB"):
             fh = getattr(self, fh_name, None)
@@ -919,7 +963,10 @@ def load_waveforms_from_row(row: _lazy_pandas().Series, day_dir: Path) -> Tuple[
 class CappyArchive:
 
     def __init__(self, data_dir: Path, rollover_minutes: int, flush_every_records: int,
-                 session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0):
+                 session_rotate_hours: float, sqlite_commit_every_snips: int,
+                 flush_every_seconds: float = 10.0,
+                 flush_every_samples: int = 0,
+                 durable_flush: bool = False):
         self.data_dir = data_dir
         _ensure_dir(self.data_dir)
         self.captures = data_dir / "captures"
@@ -928,6 +975,10 @@ class CappyArchive:
         self.flush_every_records = int(flush_every_records)
         self.flush_every_seconds = float(flush_every_seconds or 0.0)
         self._last_flush_unix = 0.0
+
+        self.flush_every_samples = int(flush_every_samples or 0)
+        self.durable_flush = bool(durable_flush)
+        self._samples_since_flush = 0
         self.session_rotate_hours = float(session_rotate_hours or 0.0)
         self.sqlite_commit_every_snips = int(sqlite_commit_every_snips)
         self.session_id = ""
@@ -997,10 +1048,52 @@ class CappyArchive:
         self._n_reduced += self.reduced_writer.write_rows(self._reduced_buf, ts)
         self._reduced_buf.clear()
 
+    
+    def flush_archive_commit(self, ts_ns: int, reason: str = "") -> None:
+        """Flush (commit) the archive to disk: waveform raw bins + SQLite index, and reduced parquet buffer."""
+        # Raw waveform bins + SQLite index are the archive ground-truth; commit them first.
+        if self.wave_store is not None:
+            self.wave_store.flush_raw_and_index(durable=self.durable_flush)
+        # Then flush the reduced parquet buffer.
+        self.flush_reduced(ts_ns)
+        # update flush markers
+        self._last_flush_unix = time.time()
+        self._samples_since_flush = 0
+        # Emit a compact status line the GUI can parse.
+        r = reason or "manual"
+        try:
+            dt = datetime.fromtimestamp(int(ts_ns)/1e9).strftime("%Y-%m-%d %H:%M:%S.%f")
+        except Exception:
+            dt = str(ts_ns)
+        print(f"[CAPPY] ARCHIVE_FLUSH reason={r} ts={dt} reduced={self._n_reduced} snips={self._n_snips}", flush=True)
+
     def append_snip(self, **kw) -> None:
         assert self.wave_store is not None
         self.wave_store.append(**kw)
         self._n_snips += 1
+
+        # Flush policy: commit raw+index (and reduced buffer) based on samples and/or time.
+        try:
+            n_samples = int(getattr(kw.get("wfA_V", None), "shape", [0])[0])
+        except Exception:
+            n_samples = 0
+        if n_samples > 0:
+            self._samples_since_flush += n_samples
+
+        now = time.time()
+        do_flush = False
+        reason = ""
+        if self.flush_every_samples > 0 and self._samples_since_flush >= self.flush_every_samples:
+            do_flush = True
+            reason = "samples"
+        elif self.flush_every_seconds > 0 and (now - self._last_flush_unix) >= self.flush_every_seconds:
+            do_flush = True
+            reason = "time"
+
+        if do_flush:
+            ts_ns = int(kw.get("ts_ns", time.time_ns()))
+            self.flush_archive_commit(ts_ns, reason=reason)
+
 
     def finalize(self, channels_mask: str) -> None:
         if not self.day_dir:
@@ -1525,6 +1618,8 @@ def run_capture(cfg_path: Path) -> int:
         session_rotate_hours=float(storage.get("session_rotate_hours", 0) or 0),
         sqlite_commit_every_snips=int(storage.get("sqlite_commit_every_snips", 2000)),
         flush_every_seconds=float(storage.get("flush_every_seconds", 10.0) or 0.0),
+        flush_every_samples=int(storage.get("flush_every_samples", storage.get("flush_every_n_samples", 0)) or 0),
+        durable_flush=bool(storage.get("durable_flush", False)),
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
