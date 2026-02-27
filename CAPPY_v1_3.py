@@ -100,6 +100,43 @@ TRIGGER_SLOPE_LABEL_TO_CONST = {
 TRIGGER_SLOPE_CONST_TO_LABEL = {v: k for k, v in TRIGGER_SLOPE_LABEL_TO_CONST.items()}
 TRIGGER_MODE_OPTIONS = ["TRIG_ENGINE_OP_J", "TRIG_ENGINE_OP_J_OR_K", "TRIG_ENGINE_OP_J_AND_K"]
 EXT_TRIGGER_RANGE_OPTIONS = ["ETR_5V", "ETR_1V"]
+TRIGGER_LEVEL_PRESETS_PCT = [10.0, 25.0, 50.0, 75.0, 90.0]
+RUNTIME_PROFILE_PRESETS = {
+    "Balanced": {
+        "rearm_if_no_trigger_s": 300,
+        "rearm_cooldown_s": 30,
+        "max_rearms_per_hour": 12,
+        "flush_every_records": 20000,
+        "flush_every_seconds": 2.0,
+        "sqlite_commit_every_snips": 200,
+        "stream_window_points": 20000,
+        "stream_window_seconds": 2.0,
+        "max_waveforms_per_tick": 20,
+    },
+    "Low Latency": {
+        "rearm_if_no_trigger_s": 60,
+        "rearm_cooldown_s": 10,
+        "max_rearms_per_hour": 60,
+        "flush_every_records": 4000,
+        "flush_every_seconds": 0.5,
+        "sqlite_commit_every_snips": 50,
+        "stream_window_points": 12000,
+        "stream_window_seconds": 1.0,
+        "max_waveforms_per_tick": 80,
+    },
+    "Throughput": {
+        "rearm_if_no_trigger_s": 600,
+        "rearm_cooldown_s": 60,
+        "max_rearms_per_hour": 6,
+        "flush_every_records": 80000,
+        "flush_every_seconds": 5.0,
+        "sqlite_commit_every_snips": 1000,
+        "stream_window_points": 50000,
+        "stream_window_seconds": 5.0,
+        "max_waveforms_per_tick": 10,
+    },
+}
+RUNTIME_PROFILE_OPTIONS = list(RUNTIME_PROFILE_PRESETS.keys()) + ["Custom"]
 
 
 def _to_int(v: Any, default: int) -> int:
@@ -114,6 +151,19 @@ def _to_float(v: Any, default: float) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _to_bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off", ""}:
+        return False
+    return bool(default)
 
 
 def _clamp_int(v: Any, lo: int, hi: int, default: int) -> int:
@@ -189,9 +239,6 @@ trigger:
 
   external_startcapture: false
 
-timing:
-  bunch_spacing_samples: 424      # adjust to your bunch spacing
-
 acquisition:
   channels_mask: CHANNEL_A|CHANNEL_B
   pre_trigger_samples: 0
@@ -248,6 +295,7 @@ live:
   stream_window_points: 20000
   stream_window_seconds: 2.0
   max_waveforms_per_tick: 20
+  show_channel_b: false
   preview_mode: archive_match
 """
 
@@ -275,7 +323,6 @@ try:
         ("samples_per_record", _pa0.int32()),
         ("records_per_buffer", _pa0.int32()),
         ("channels_mask", _pa0.string()),
-        ("bunch_spacing_samples", _pa0.int32()),
         ("area_A_Vs", _pa0.float64()),
         ("peak_A_V", _pa0.float64()),
         ("baseline_A_V", _pa0.float64()),
@@ -1231,7 +1278,8 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
 
     clock = out.setdefault("clock", {}) or {}
     acq = out.setdefault("acquisition", {}) or {}
-    timing = out.setdefault("timing", {}) or {}
+    timing_obj = out.get("timing", {})
+    timing = timing_obj if isinstance(timing_obj, dict) else {}
     trig = out.setdefault("trigger", {}) or {}
     runtime = out.setdefault("runtime", {}) or {}
     storage = out.setdefault("storage", {}) or {}
@@ -1239,7 +1287,6 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
 
     out["clock"] = clock
     out["acquisition"] = acq
-    out["timing"] = timing
     out["trigger"] = trig
     out["runtime"] = runtime
     out["storage"] = storage
@@ -1305,13 +1352,13 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
         ch_mask = channels_from_mask_expr(ch_expr)
     acq["channels_mask"] = channels_mask_to_str(ch_mask)
 
-    bunch = _clamp_int(timing.get("bunch_spacing_samples", spr), 1, 8_000_000, max(1, spr))
-    if bunch < spr:
-        warnings.append(
-            f"timing.bunch_spacing_samples={bunch} is < samples_per_record={spr}; using {spr}."
-        )
-        bunch = spr
-    timing["bunch_spacing_samples"] = bunch
+    # Legacy key; spacing is fixed to samples_per_record now.
+    timing.pop("bunch_spacing_samples", None)
+    if "timing" in out:
+        if timing:
+            out["timing"] = timing
+        else:
+            out.pop("timing", None)
 
     levelJ = _clamp_int(trig.get("levelJ", 128), 0, 255, 128)
     levelK = _clamp_int(trig.get("levelK", 128), 0, 255, 128)
@@ -1327,6 +1374,9 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     runtime["rearm_if_no_trigger_s"] = _clamp_int(runtime.get("rearm_if_no_trigger_s", 300), 0, 86_400, 300)
     runtime["rearm_cooldown_s"] = _clamp_int(runtime.get("rearm_cooldown_s", 30), 0, 86_400, 30)
     runtime["max_rearms_per_hour"] = _clamp_int(runtime.get("max_rearms_per_hour", 12), 1, 100_000, 12)
+    profile = str(runtime.get("profile", "Custom") or "Custom").strip()
+    profile_lut = {name.lower(): name for name in RUNTIME_PROFILE_OPTIONS}
+    runtime["profile"] = profile_lut.get(profile.lower(), "Custom")
 
     storage["flush_every_records"] = _clamp_int(storage.get("flush_every_records", 20000), 1, 50_000_000, 20000)
     storage["flush_every_seconds"] = _clamp_float(storage.get("flush_every_seconds", 2.0), 0.0, 86_400.0, 2.0)
@@ -1339,6 +1389,7 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     live["stream_window_points"] = _clamp_int(live.get("stream_window_points", 20000), 256, 5_000_000, 20000)
     live["stream_window_seconds"] = _clamp_float(live.get("stream_window_seconds", 2.0), 0.25, 120.0, 2.0)
     live["max_waveforms_per_tick"] = _clamp_int(live.get("max_waveforms_per_tick", 20), 1, 2000, 20)
+    live["show_channel_b"] = _to_bool(live.get("show_channel_b", False), False)
     mode = str(live.get("preview_mode", "archive_match")).strip().lower()
     if mode not in {"archive_match", "record0"}:
         mode = "archive_match"
@@ -1696,7 +1747,6 @@ def run_capture(cfg_path: Path) -> int:
         print(f"[CAPPY] Config warning: {w}")
 
     acq = cfg.get("acquisition", {})
-    timing = cfg.get("timing", {}) or {}
     integ = cfg.get("integration", {}) or {}
     waves = cfg.get("waveforms", {}) or {}
     storage = cfg.get("storage", {}) or {}
@@ -1710,13 +1760,9 @@ def run_capture(cfg_path: Path) -> int:
     bpa = int(acq.get("buffers_per_acquisition", 0))
     wait_timeout_ms = int(acq.get("wait_timeout_ms", 1000))
     ch_expr = str(acq.get("channels_mask", "CHANNEL_A"))
-    bunch_spacing = int(timing.get("bunch_spacing_samples", spr))
 
     b0, b1 = map(int, integ.get("baseline_window_samples", [0, min(64, spr)]))
     g0, g1 = map(int, integ.get("integral_window_samples", [min(64, spr), min(128, spr)]))
-
-    if spr > bunch_spacing:
-        raise ValueError("samples_per_record must be <= bunch_spacing_samples")
 
     wf_enable = bool(waves.get("enable", True))
     wf = WfPolicy(
@@ -1785,6 +1831,7 @@ def run_capture(cfg_path: Path) -> int:
     live_cfg = (cfg.get('live', {}) or {})
     ring_nslots = int(live_cfg.get('ring_slots', 4096))
     ring_npts = int(live_cfg.get('ring_points', 512))
+    show_channel_b_live = _to_bool(live_cfg.get('show_channel_b', False), False)
     ring_path = Path(str(storage.get('data_dir', 'dataFile'))) / 'status' / 'live_waveforms.ring'
     ring = LiveRingWriter(ring_path, nslots=ring_nslots, npts=ring_npts)
 
@@ -1807,6 +1854,7 @@ def run_capture(cfg_path: Path) -> int:
             stream_window_points=int(live_cfg.get('stream_window_points', 20000)),
             stream_window_seconds=float(live_cfg.get('stream_window_seconds', 2.0)),
             max_waveforms_per_tick=int(live_cfg.get('max_waveforms_per_tick', 20)),
+            show_channel_b=bool(show_channel_b_live),
             preview_mode=str(live_cfg.get('preview_mode', 'archive_match')),
         ),
     )
@@ -1939,8 +1987,8 @@ def run_capture(cfg_path: Path) -> int:
             timeout_count = 0
             last_buffer_ns = time.time_ns()
             ts_ns = last_buffer_ns
-            # Per-record time offset: each record in the buffer is spaced by bunch_spacing samples
-            record_dt_ns = int(round(float(bunch_spacing) / float(sr_hz) * 1e9))
+            # Per-record time offset uses the configured record length in samples.
+            record_dt_ns = int(round(float(spr) / float(sr_hz) * 1e9))
 
             # Copy completed DMA data, then immediately recycle the board buffer.
             # Keeping the re-post ahead of reductions/file I/O avoids API buffer overflow.
@@ -1981,7 +2029,7 @@ def run_capture(cfg_path: Path) -> int:
                         session_id=sid, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                         timestamp_ns=rec_ts_ns, sample_rate_hz=float(sr_hz),
                         samples_per_record=spr, records_per_buffer=rpb,
-                        channels_mask=ch_expr, bunch_spacing_samples=bunch_spacing,
+                        channels_mask=ch_expr,
                         area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
                         area_B_Vs=float(areaB[r]), peak_B_V=float(peakB[r]), baseline_B_V=float(baseB[r]),
                     ))
@@ -2009,7 +2057,7 @@ def run_capture(cfg_path: Path) -> int:
                         session_id=sid, buffer_index=buf_done, record_in_buffer=r, record_global=rec_g,
                         timestamp_ns=rec_ts_ns, sample_rate_hz=float(sr_hz),
                         samples_per_record=spr, records_per_buffer=rpb,
-                        channels_mask=ch_expr, bunch_spacing_samples=bunch_spacing,
+                        channels_mask=ch_expr,
                         area_A_Vs=float(areaA[r]), peak_A_V=float(peakA[r]), baseline_A_V=float(baseA[r]),
                         area_B_Vs=0.0, peak_B_V=0.0, baseline_B_V=0.0,
                     ))
@@ -2063,14 +2111,14 @@ def run_capture(cfg_path: Path) -> int:
             try:
                 if preview_mode == "archive_match" and live_wfA_candidate is not None:
                     wfA_live = live_wfA_candidate
-                    wfB_live = live_wfB_candidate if ch_count == 2 else None
-                    chmask_live = 3 if (ch_count == 2 and wfB_live is not None) else 1
+                    wfB_live = live_wfB_candidate if (ch_count == 2 and show_channel_b_live) else None
+                    chmask_live = 3 if (ch_count == 2 and show_channel_b_live and wfB_live is not None) else 1
                 else:
                     # Fallback for non-archived or record0 preview mode.
                     wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
                     wfB_live = None
                     chmask_live = 1
-                    if ch_count == 2:
+                    if ch_count == 2 and show_channel_b_live:
                         wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
                         chmask_live = 3
                 ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
@@ -3247,8 +3295,10 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
 
         # --- Channel B waveform (middle) - Optimized rendering ---
-        has_b_channel = bool(channels_from_mask_expr(str(snap.get("channels_mask", "CHANNEL_A"))) & 0x2)
-        if self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
+        live_cfg = snap.get("live", {}) if isinstance(snap.get("live", {}), dict) else {}
+        show_channel_b = _to_bool(live_cfg.get("show_channel_b", False), False)
+        has_b_channel = show_channel_b and bool(channels_from_mask_expr(str(snap.get("channels_mask", "CHANNEL_A"))) & 0x2)
+        if has_b_channel and self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
             # Baseline-subtract: remove DC offset using rolling mean of the stream
             stream_b = self._streamB.copy()
             bl_b = np.mean(stream_b)
@@ -3276,7 +3326,9 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfB.spines['right'].set_visible(False)
             self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
         else:
-            if has_b_channel:
+            if not show_channel_b:
+                self.ax_wfB.set_title("Channel B: display disabled", color='white')
+            elif has_b_channel:
                 self.ax_wfB.set_title("Channel B: waiting for waveforms…", color='white')
             else:
                 self.ax_wfB.set_title("Channel B: disabled in channels mask", color='white')
@@ -3294,7 +3346,7 @@ class LiveDashboard(ttk.Frame):
             try:
                 if self._streamA.size > 1:
                     self.ax_wfA.set_xlim(left=-w_ms, right=0.0)
-                if self._streamB.size > 1:
+                if has_b_channel and self._streamB.size > 1:
                     self.ax_wfB.set_xlim(left=-w_ms, right=0.0)
             except Exception:
                 pass
@@ -3313,7 +3365,7 @@ class LiveDashboard(ttk.Frame):
                 areaB_view = self.areaB
             
             self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=True, rasterized=True)
-            if areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
+            if has_b_channel and areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
                 self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=True, rasterized=True)
             self.ax_int.set_ylabel("Integral (V·s)", color='white')
             self.ax_int.set_xlabel("Time (s)", color='white')
@@ -3350,6 +3402,8 @@ class LiveDashboard(ttk.Frame):
     def _tick(self):
         snap = self._read_status()
         if snap:
+            live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
+            show_channel_b = _to_bool(live_cfg.get("show_channel_b", False), False)
             if callable(self._on_status):
                 try:
                     self._on_status(snap)
@@ -3371,7 +3425,7 @@ class LiveDashboard(ttk.Frame):
                 if pA is None:
                     self.lbl_peak.configure(text="—")
                 else:
-                    if pB is not None and float(pB) != 0.0:
+                    if show_channel_b and pB is not None and float(pB) != 0.0:
                         self.lbl_peak.configure(text=f"A {float(pA):.6g}   B {float(pB):.6g}")
                     else:
                         self.lbl_peak.configure(text=f"{float(pA):.6g}")
@@ -3379,7 +3433,6 @@ class LiveDashboard(ttk.Frame):
                 self.lbl_peak.configure(text=str(pA))
 
             try:
-                live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
                 if 'stream_window_points' in live_cfg:
                     self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
                 if 'stream_window_seconds' in live_cfg:
@@ -3398,7 +3451,7 @@ class LiveDashboard(ttk.Frame):
             except Exception:
                 max_wf = 20
             channels_mask_text = str(snap.get("channels_mask", "CHANNEL_A") or "CHANNEL_A")
-            status_has_b = bool(channels_from_mask_expr(channels_mask_text) & 0x2)
+            status_has_b = show_channel_b and bool(channels_from_mask_expr(channels_mask_text) & 0x2)
 
             def _append_stream(values: np.ndarray, is_b: bool) -> None:
                 if values is None or values.size == 0:
@@ -3426,7 +3479,7 @@ class LiveDashboard(ttk.Frame):
                         _append_stream(wfA, is_b=False)
                     except Exception:
                         pass
-                if wfB is not None:
+                if wfB is not None and status_has_b:
                     try:
                         _append_stream(wfB, is_b=True)
                         saw_b_record = True
@@ -3522,7 +3575,6 @@ class LiveControlPanel(ttk.Frame):
         self.var_pre = tk.IntVar(value=0)
         self.var_samples_per_record = tk.IntVar(value=256)
         self.var_post = tk.IntVar(value=256)
-        self.var_bunch = tk.IntVar(value=424)
         self.var_rpb = tk.IntVar(value=128)
         self.var_bufN = tk.IntVar(value=16)
         self.var_bpa = tk.IntVar(value=0)
@@ -3544,10 +3596,12 @@ class LiveControlPanel(ttk.Frame):
         self.var_ext_range = tk.StringVar(value="ETR_5V")
         self.var_ext_coupling = tk.StringVar(value="DC_COUPLING")
         self.var_ext_startcapture = tk.BooleanVar(value=False)
+        self._trig_level_code_var = tk.StringVar(value="code=128")
 
         self.var_rearm_s = tk.IntVar(value=300)
         self.var_rearm_cooldown_s = tk.IntVar(value=30)
         self.var_rearm_per_hour = tk.IntVar(value=12)
+        self.var_runtime_profile = tk.StringVar(value="Balanced")
 
         self.var_flush_records = tk.IntVar(value=20000)
         self.var_flush_seconds = tk.DoubleVar(value=2.0)
@@ -3559,7 +3613,9 @@ class LiveControlPanel(ttk.Frame):
         self.var_stream_pts = tk.IntVar(value=20000)
         self.var_stream_s = tk.DoubleVar(value=2.0)
         self.var_max_wf_tick = tk.IntVar(value=20)
+        self.var_show_channel_b_live = tk.BooleanVar(value=False)
         self.var_preview_mode = tk.StringVar(value="archive_match")
+        self.var_trig_level_pct.trace_add("write", self._sync_trigger_level_code)
 
         # Layout
         self.columnconfigure(0, weight=1)
@@ -3580,11 +3636,10 @@ class LiveControlPanel(ttk.Frame):
         self._add_entry(acq, 3, "Pre-trigger samples", self.var_pre)
         self._add_entry(acq, 4, "Samples/record", self.var_samples_per_record)
         self._add_entry(acq, 5, "Post-trigger samples", self.var_post)
-        self._add_entry(acq, 6, "Bunch spacing", self.var_bunch)
-        self._add_entry(acq, 7, "Records/buffer", self.var_rpb)
-        self._add_entry(acq, 8, "Buffers allocated", self.var_bufN)
-        self._add_entry(acq, 9, "Buffers/acquisition (0=run)", self.var_bpa)
-        self._add_entry(acq, 10, "DMA wait timeout (ms)", self.var_wait_timeout_ms)
+        self._add_entry(acq, 6, "Records/buffer", self.var_rpb)
+        self._add_entry(acq, 7, "Buffers allocated", self.var_bufN)
+        self._add_entry(acq, 8, "Buffers/acquisition (0=run)", self.var_bpa)
+        self._add_entry(acq, 9, "DMA wait timeout (ms)", self.var_wait_timeout_ms)
 
         vert = ttk.LabelFrame(left, text="Vertical", padding=8)
         vert.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -3605,31 +3660,72 @@ class LiveControlPanel(ttk.Frame):
         self._add_combobox(trig, 0, "Mode", self.var_trig_mode, TRIGGER_MODE_OPTIONS, width=18)
         self._add_combobox(trig, 1, "Source", self.var_trig_source, list(TRIGGER_SOURCE_LABEL_TO_CONST.keys()), width=12)
         self._add_combobox(trig, 2, "Slope", self.var_trig_slope, list(TRIGGER_SLOPE_LABEL_TO_CONST.keys()), width=12)
-        self._add_entry(trig, 3, "Level (%)", self.var_trig_level_pct)
-        self._add_entry(trig, 4, "Auto timeout (ms)", self.var_trig_timeout_ms)
-        self._add_entry(trig, 5, "Timeout pause (s)", self.var_timeout_pause_s)
-        self._add_combobox(trig, 6, "External range", self.var_ext_range, EXT_TRIGGER_RANGE_OPTIONS)
-        self._add_combobox(trig, 7, "External coupling", self.var_ext_coupling, ["DC_COUPLING", "AC_COUPLING"])
+        ttk.Label(trig, text="Level (%)").grid(row=3, column=0, sticky="w", pady=2)
+        trig_level = ttk.Frame(trig)
+        trig_level.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=2)
+        trig_level.columnconfigure(0, weight=1)
+        ttk.Scale(
+            trig_level,
+            from_=0.0,
+            to=100.0,
+            orient=tk.HORIZONTAL,
+            variable=self.var_trig_level_pct,
+            command=lambda _v: self._sync_trigger_level_code(),
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Entry(trig_level, textvariable=self.var_trig_level_pct, width=7).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(trig_level, textvariable=self._trig_level_code_var, width=10).grid(row=0, column=2, padx=(6, 0))
+
+        trig_presets = ttk.Frame(trig)
+        trig_presets.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        ttk.Label(trig_presets, text="Quick level").pack(side=tk.LEFT)
+        for pct in TRIGGER_LEVEL_PRESETS_PCT:
+            ttk.Button(
+                trig_presets,
+                text=f"{int(pct)}%",
+                command=lambda p=pct: self._set_trigger_level_pct(p),
+                width=5,
+            ).pack(side=tk.LEFT, padx=(4, 0))
+
+        self._add_entry(trig, 5, "Auto timeout (ms)", self.var_trig_timeout_ms)
+        self._add_entry(trig, 6, "Timeout pause (s)", self.var_timeout_pause_s)
+        self._add_combobox(trig, 7, "External range", self.var_ext_range, EXT_TRIGGER_RANGE_OPTIONS)
+        self._add_combobox(trig, 8, "External coupling", self.var_ext_coupling, ["DC_COUPLING", "AC_COUPLING"])
         ttk.Checkbutton(trig, text="External start-capture", variable=self.var_ext_startcapture).grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(4, 0)
+            row=9, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
 
         live = ttk.LabelFrame(right, text="Runtime / Storage / Live", padding=8)
         live.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         live.columnconfigure(1, weight=1)
-        self._add_entry(live, 0, "Rearm if no trigger (s)", self.var_rearm_s)
-        self._add_entry(live, 1, "Rearm cooldown (s)", self.var_rearm_cooldown_s)
-        self._add_entry(live, 2, "Max rearms/hour", self.var_rearm_per_hour)
-        self._add_entry(live, 3, "Flush every records", self.var_flush_records)
-        self._add_entry(live, 4, "Flush every seconds", self.var_flush_seconds)
-        self._add_entry(live, 5, "SQLite commit every snips", self.var_sqlite_commit)
-        self._add_entry(live, 6, "Session rotate (hours)", self.var_rotate_hours)
-        self._add_entry(live, 7, "Ring slots", self.var_ring_slots)
-        self._add_entry(live, 8, "Ring points", self.var_ring_points)
-        self._add_entry(live, 9, "Live window points", self.var_stream_pts)
-        self._add_entry(live, 10, "Live window seconds", self.var_stream_s)
-        self._add_entry(live, 11, "Max waveforms/tick", self.var_max_wf_tick)
-        self._add_combobox(live, 12, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
+        ttk.Label(live, text="Runtime profile").grid(row=0, column=0, sticky="w", pady=2)
+        live_profile = ttk.Frame(live)
+        live_profile.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=2)
+        live_profile.columnconfigure(0, weight=1)
+        ttk.Combobox(
+            live_profile,
+            textvariable=self.var_runtime_profile,
+            values=RUNTIME_PROFILE_OPTIONS,
+            state="readonly",
+            width=16,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Button(live_profile, text="Apply", command=self._apply_runtime_profile, width=7).grid(row=0, column=1, padx=(6, 0))
+
+        self._add_entry(live, 1, "Rearm if no trigger (s)", self.var_rearm_s)
+        self._add_entry(live, 2, "Rearm cooldown (s)", self.var_rearm_cooldown_s)
+        self._add_entry(live, 3, "Max rearms/hour", self.var_rearm_per_hour)
+        self._add_entry(live, 4, "Flush every records", self.var_flush_records)
+        self._add_entry(live, 5, "Flush every seconds", self.var_flush_seconds)
+        self._add_entry(live, 6, "SQLite commit every snips", self.var_sqlite_commit)
+        self._add_entry(live, 7, "Session rotate (hours)", self.var_rotate_hours)
+        self._add_entry(live, 8, "Ring slots", self.var_ring_slots)
+        self._add_entry(live, 9, "Ring points", self.var_ring_points)
+        self._add_entry(live, 10, "Live window points", self.var_stream_pts)
+        self._add_entry(live, 11, "Live window seconds", self.var_stream_s)
+        self._add_entry(live, 12, "Max waveforms/tick", self.var_max_wf_tick)
+        ttk.Checkbutton(live, text="Show Channel B live waveform", variable=self.var_show_channel_b_live).grid(
+            row=13, column=0, columnspan=2, sticky="w", pady=(4, 2)
+        )
+        self._add_combobox(live, 14, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
 
         disk = ttk.LabelFrame(right, text="Disk write status", padding=8)
         disk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -3642,6 +3738,7 @@ class LiveControlPanel(ttk.Frame):
         ttk.Button(tools, text="Save Controls To YAML", command=self.launcher._save_controls_to_yaml).pack(side=tk.LEFT)
         ttk.Button(tools, text="Reload Controls From YAML", command=self.launcher._load_controls_from_yaml).pack(side=tk.LEFT)
         ttk.Label(tools, textvariable=self._msg_var).pack(side=tk.LEFT, padx=(12, 0))
+        self._sync_trigger_level_code()
 
     def _add_entry(self, parent: ttk.Widget, row: int, label: str, var: tk.Variable, width: int = 12) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
@@ -3651,6 +3748,60 @@ class LiveControlPanel(ttk.Frame):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
         cb = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
         cb.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
+
+    def _set_trigger_level_pct(self, pct: float) -> None:
+        self.var_trig_level_pct.set(float(pct))
+        self._sync_trigger_level_code()
+
+    def _sync_trigger_level_code(self, *_args) -> None:
+        pct = _clamp_float(self._safe_float(self.var_trig_level_pct, 50.0), 0.0, 100.0, 50.0)
+        code = int(round(pct * 255.0 / 100.0))
+        self._trig_level_code_var.set(f"code={code}")
+
+    def _guess_runtime_profile(self) -> str:
+        curr = dict(
+            rearm_if_no_trigger_s=self._safe_int(self.var_rearm_s, 300),
+            rearm_cooldown_s=self._safe_int(self.var_rearm_cooldown_s, 30),
+            max_rearms_per_hour=self._safe_int(self.var_rearm_per_hour, 12),
+            flush_every_records=self._safe_int(self.var_flush_records, 20000),
+            flush_every_seconds=self._safe_float(self.var_flush_seconds, 2.0),
+            sqlite_commit_every_snips=self._safe_int(self.var_sqlite_commit, 200),
+            stream_window_points=self._safe_int(self.var_stream_pts, 20000),
+            stream_window_seconds=self._safe_float(self.var_stream_s, 2.0),
+            max_waveforms_per_tick=self._safe_int(self.var_max_wf_tick, 20),
+        )
+        for name, preset in RUNTIME_PROFILE_PRESETS.items():
+            match = True
+            for key, want in preset.items():
+                got = curr.get(key)
+                if isinstance(want, float):
+                    if abs(float(got) - float(want)) > 1e-9:
+                        match = False
+                        break
+                else:
+                    if int(got) != int(want):
+                        match = False
+                        break
+            if match:
+                return name
+        return "Custom"
+
+    def _apply_runtime_profile(self) -> None:
+        name = str(self.var_runtime_profile.get() or "").strip()
+        preset = RUNTIME_PROFILE_PRESETS.get(name)
+        if not preset:
+            self._msg_var.set("Runtime profile is custom.")
+            return
+        self.var_rearm_s.set(int(preset["rearm_if_no_trigger_s"]))
+        self.var_rearm_cooldown_s.set(int(preset["rearm_cooldown_s"]))
+        self.var_rearm_per_hour.set(int(preset["max_rearms_per_hour"]))
+        self.var_flush_records.set(int(preset["flush_every_records"]))
+        self.var_flush_seconds.set(float(preset["flush_every_seconds"]))
+        self.var_sqlite_commit.set(int(preset["sqlite_commit_every_snips"]))
+        self.var_stream_pts.set(int(preset["stream_window_points"]))
+        self.var_stream_s.set(float(preset["stream_window_seconds"]))
+        self.var_max_wf_tick.set(int(preset["max_waveforms_per_tick"]))
+        self._msg_var.set(f"Applied runtime profile: {name}.")
 
     def _var_text(self, var: tk.Variable, default: str = "") -> str:
         try:
@@ -3675,7 +3826,6 @@ class LiveControlPanel(ttk.Frame):
         try:
             c = cfg.get("clock", {}) or {}
             acq = cfg.get("acquisition", {}) or {}
-            timing = cfg.get("timing", {}) or {}
             ch = cfg.get("channels", {}) or {}
             trig = cfg.get("trigger", {}) or {}
             rt = cfg.get("runtime", {}) or {}
@@ -3696,7 +3846,6 @@ class LiveControlPanel(ttk.Frame):
             self.var_pre.set(pre)
             self.var_samples_per_record.set(spr)
             self.var_post.set(max(16, spr - pre))
-            self.var_bunch.set(_to_int(timing.get("bunch_spacing_samples", 424), 424))
             self.var_rpb.set(_to_int(acq.get("records_per_buffer", 128), 128))
             self.var_bufN.set(_to_int(acq.get("buffers_allocated", 16), 16))
             self.var_bpa.set(_to_int(acq.get("buffers_per_acquisition", 0), 0))
@@ -3723,10 +3872,17 @@ class LiveControlPanel(ttk.Frame):
             self.var_ext_range.set(str(trig.get("ext_range", "ETR_5V")))
             self.var_ext_coupling.set(str(trig.get("ext_coupling", "DC_COUPLING")))
             self.var_ext_startcapture.set(bool(trig.get("external_startcapture", False)))
+            self._sync_trigger_level_code()
 
             self.var_rearm_s.set(_to_int(rt.get("rearm_if_no_trigger_s", 300), 300))
             self.var_rearm_cooldown_s.set(_to_int(rt.get("rearm_cooldown_s", 30), 30))
             self.var_rearm_per_hour.set(_to_int(rt.get("max_rearms_per_hour", 12), 12))
+            rt_profile = str(rt.get("profile", "") or "").strip()
+            rt_profile_norm = {name.lower(): name for name in RUNTIME_PROFILE_PRESETS}.get(rt_profile.lower(), "")
+            if rt_profile_norm:
+                self.var_runtime_profile.set(rt_profile_norm)
+            else:
+                self.var_runtime_profile.set(self._guess_runtime_profile())
 
             self.var_flush_records.set(_to_int(storage.get("flush_every_records", 20000), 20000))
             self.var_flush_seconds.set(_to_float(storage.get("flush_every_seconds", 2.0), 2.0))
@@ -3738,7 +3894,10 @@ class LiveControlPanel(ttk.Frame):
             self.var_stream_pts.set(_to_int(live.get("stream_window_points", 20000), 20000))
             self.var_stream_s.set(_to_float(live.get("stream_window_seconds", 2.0), 2.0))
             self.var_max_wf_tick.set(_to_int(live.get("max_waveforms_per_tick", 20), 20))
+            self.var_show_channel_b_live.set(_to_bool(live.get("show_channel_b", False), False))
             self.var_preview_mode.set(str(live.get("preview_mode", "archive_match")))
+            if not rt_profile_norm:
+                self.var_runtime_profile.set(self._guess_runtime_profile())
             self._msg_var.set("Controls loaded from YAML.")
         finally:
             self._loading = False
@@ -3747,7 +3906,6 @@ class LiveControlPanel(ttk.Frame):
         out = dict(cfg)
         clock = out.setdefault("clock", {}) or {}
         acq = out.setdefault("acquisition", {}) or {}
-        timing = out.setdefault("timing", {}) or {}
         channels = out.setdefault("channels", {}) or {}
         trig = out.setdefault("trigger", {}) or {}
         runtime = out.setdefault("runtime", {}) or {}
@@ -3756,7 +3914,6 @@ class LiveControlPanel(ttk.Frame):
 
         out["clock"] = clock
         out["acquisition"] = acq
-        out["timing"] = timing
         out["channels"] = channels
         out["trigger"] = trig
         out["runtime"] = runtime
@@ -3788,19 +3945,9 @@ class LiveControlPanel(ttk.Frame):
         acq["buffers_per_acquisition"] = self._safe_int(self.var_bpa, 0)
         acq["wait_timeout_ms"] = self._safe_int(self.var_wait_timeout_ms, 1000)
 
-        bunch_user = self._safe_int(self.var_bunch, 424)
-        bunch = max(1, bunch_user)
-        if bunch < spr_target:
-            local_warns.append(
-                f"bunch_spacing_samples={bunch} is < samples_per_record={spr_target}; using {spr_target}."
-            )
-            bunch = spr_target
-        timing["bunch_spacing_samples"] = bunch
-
         # Keep visible fields internally consistent so users see what will be applied.
         self.var_samples_per_record.set(int(spr_target))
         self.var_post.set(int(post))
-        self.var_bunch.set(int(bunch))
 
         chA = channels.setdefault("A", {}) or {}
         chB = channels.setdefault("B", {}) or {}
@@ -3819,6 +3966,7 @@ class LiveControlPanel(ttk.Frame):
         trig["sourceJ"] = TRIGGER_SOURCE_LABEL_TO_CONST.get(self._var_text(self.var_trig_source, "External"), "TRIG_EXTERNAL")
         trig["slopeJ"] = TRIGGER_SLOPE_LABEL_TO_CONST.get(self._var_text(self.var_trig_slope, "Positive"), "TRIGGER_SLOPE_POSITIVE")
         trig["levelJ"] = int(round(_clamp_float(self._safe_float(self.var_trig_level_pct, 50.0), 0.0, 100.0, 50.0) * 255.0 / 100.0))
+        self._sync_trigger_level_code()
         trig["sourceK"] = str(trig.get("sourceK", "TRIG_DISABLE") or "TRIG_DISABLE")
         trig["slopeK"] = str(trig.get("slopeK", "TRIGGER_SLOPE_POSITIVE") or "TRIGGER_SLOPE_POSITIVE")
         trig["levelK"] = _clamp_int(trig.get("levelK", 128), 0, 255, 128)
@@ -3831,6 +3979,7 @@ class LiveControlPanel(ttk.Frame):
         runtime["rearm_if_no_trigger_s"] = self._safe_int(self.var_rearm_s, 300)
         runtime["rearm_cooldown_s"] = self._safe_int(self.var_rearm_cooldown_s, 30)
         runtime["max_rearms_per_hour"] = self._safe_int(self.var_rearm_per_hour, 12)
+        runtime["profile"] = self._var_text(self.var_runtime_profile, "Custom") or "Custom"
 
         storage["data_dir"] = str(self.launcher.var_data_dir.get() or "dataFile")
         storage["flush_every_records"] = self._safe_int(self.var_flush_records, 20000)
@@ -3843,6 +3992,7 @@ class LiveControlPanel(ttk.Frame):
         live["stream_window_points"] = self._safe_int(self.var_stream_pts, 20000)
         live["stream_window_seconds"] = self._safe_float(self.var_stream_s, 2.0)
         live["max_waveforms_per_tick"] = self._safe_int(self.var_max_wf_tick, 20)
+        live["show_channel_b"] = bool(self.var_show_channel_b_live.get())
         live["preview_mode"] = self._var_text(self.var_preview_mode, "archive_match") or "archive_match"
 
         norm, warns, errs = validate_and_normalize_capture_cfg(out)
