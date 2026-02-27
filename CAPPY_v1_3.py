@@ -2991,6 +2991,7 @@ class LiveDashboard(ttk.Frame):
         self._ring_last_seq = 0
         self._ring_play_seq = 0
         self._ring_nslots = 0
+        self._ring_session_id: str = ""
 
         # rolling history (x in seconds since capture start, to-scale)
         self.t: list[float] = []
@@ -3113,9 +3114,13 @@ class LiveDashboard(ttk.Frame):
         rp = snap.get("live_ring_path", None)
         if not rp:
             return
+        sid = str(snap.get("session_id", "") or "")
         p = Path(str(rp)).expanduser()
-        if self.ring_path != p:
+        session_changed = bool(sid) and (sid != self._ring_session_id)
+        if self.ring_path != p or session_changed:
             self.ring_path = p
+            if sid:
+                self._ring_session_id = sid
             # reset playback on ring change
             self._ring_last_seq = 0
             self._ring_play_seq = 0
@@ -3147,6 +3152,14 @@ class LiveDashboard(ttk.Frame):
                 rec_bytes = (8 + 8 + 8 + 4 + 4) + (self._ring_npts * 4) + (self._ring_npts * 4)
                 self._ring_rec_bytes = rec_bytes
                 self._ring_last_seq = int(write_seq)
+
+                # If the writer restarted (seq counter wrapped back), reset reader state.
+                if self._ring_play_seq > self._ring_last_seq:
+                    self._ring_play_seq = 0
+                    self._wfA_hist.clear()
+                    self._wfB_hist.clear()
+                    self._streamA = np.empty((0,), dtype=np.float32)
+                    self._streamB = np.empty((0,), dtype=np.float32)
 
                 # initialize play seq to most recent history window on first open
                 if self._ring_play_seq == 0 and self._ring_last_seq > 0:
@@ -3626,6 +3639,7 @@ class LiveControlPanel(ttk.Frame):
 
         tools = ttk.Frame(self, padding=(8, 0))
         tools.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Button(tools, text="Save Controls To YAML", command=self.launcher._save_controls_to_yaml).pack(side=tk.LEFT)
         ttk.Button(tools, text="Reload Controls From YAML", command=self.launcher._load_controls_from_yaml).pack(side=tk.LEFT)
         ttk.Label(tools, textvariable=self._msg_var).pack(side=tk.LEFT, padx=(12, 0))
 
@@ -4034,6 +4048,34 @@ class LauncherGUI(tk.Tk):
             self._append(f"[CAPPY] Loaded controls from {cfg_path}")
         except Exception as ex:
             self._append(f"[CAPPY] Could not load controls from {cfg_path}: {ex}")
+
+    def _save_controls_to_yaml(self):
+        cfg_path = Path(self.var_config.get()).expanduser()
+        try:
+            base_cfg = load_config(cfg_path) if cfg_path.exists() else yaml.safe_load(DEFAULT_YAML)
+            if not isinstance(base_cfg, dict):
+                base_cfg = {}
+            out_cfg = dict(base_cfg)
+            if hasattr(self, "live_panel") and self.live_panel is not None:
+                out_cfg = self.live_panel.apply_to_cfg(out_cfg)
+            out_cfg, warns, errs = validate_and_normalize_capture_cfg(out_cfg)
+            if errs:
+                messagebox.showerror("CAPPY", "Cannot save config:\n- " + "\n- ".join(errs))
+                return
+            _atomic_write_text(
+                cfg_path,
+                yaml.safe_dump(out_cfg, sort_keys=False, default_flow_style=False),
+            )
+            self._append(f"[CAPPY] Saved controls to {cfg_path}")
+            for w in warns:
+                self._append(f"[CAPPY] Config warning: {w}")
+            try:
+                if hasattr(self, "live_panel") and self.live_panel is not None:
+                    self.live_panel._msg_var.set("Saved to YAML.")
+            except Exception:
+                pass
+        except Exception as ex:
+            messagebox.showerror("CAPPY", f"Failed to save config:\n{cfg_path}\n{ex}")
 
     def _pick_yaml(self):
         p = filedialog.askopenfilename(title="Select YAML", filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")])
