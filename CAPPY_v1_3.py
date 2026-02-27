@@ -30,20 +30,50 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import yaml
-import pyarrow as pa
-import pyarrow.parquet as pq
+
+# Heavy deps (pandas/pyarrow) are imported lazily to speed GUI startup.
+_pd = None
+_pa = None
+_pq = None
+
+def _lazy_pandas():
+    global _pd
+    if _pd is None:
+        import pandas as pd
+        _pd = pd
+    return _pd
+
+def _lazy_arrow():
+    global _pa, _pq
+    if _pa is None or _pq is None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        _pa, _pq = pa, pq
+    return _pa, _pq
 
 # GUI + plotting (optional)
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-plt.style.use('dark_background')
+# Matplotlib is expensive to import; defer it until a plot window is actually created.
+_MPL = None
+def _lazy_mpl():
+    global _MPL
+    if _MPL is not None:
+        return _MPL
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    # Keep appearance consistent with your previous styling
+    try:
+        plt.style.use("dark_background")
+    except Exception:
+        pass
+    _MPL = (matplotlib, plt, FigureCanvasTkAgg)
+    return _MPL
+
 
 # Define neon colors
 NEON_PINK = "#FF00EE"
@@ -154,33 +184,33 @@ runtime:
   autotrigger_timeout_ms: 10
 """
 
-REDUCED_SCHEMA = pa.schema([
-    ("session_id", pa.string()),
-    ("buffer_index", pa.int32()),
-    ("record_in_buffer", pa.int32()),
-    ("record_global", pa.int64()),
-    ("timestamp_ns", pa.int64()),
-    ("sample_rate_hz", pa.float64()),
-    ("samples_per_record", pa.int32()),
-    ("records_per_buffer", pa.int32()),
-    ("channels_mask", pa.string()),
-    ("bunch_spacing_samples", pa.int32()),
-    ("area_A_Vs", pa.float64()),
-    ("peak_A_V", pa.float64()),
-    ("baseline_A_V", pa.float64()),
-    ("area_B_Vs", pa.float64()),
-    ("peak_B_V", pa.float64()),
-    ("baseline_B_V", pa.float64()),
+REDUCED_SCHEMA = _lazy_arrow()[0].schema([
+    ("session_id", _lazy_arrow()[0].string()),
+    ("buffer_index", _lazy_arrow()[0].int32()),
+    ("record_in_buffer", _lazy_arrow()[0].int32()),
+    ("record_global", _lazy_arrow()[0].int64()),
+    ("timestamp_ns", _lazy_arrow()[0].int64()),
+    ("sample_rate_hz", _lazy_arrow()[0].float64()),
+    ("samples_per_record", _lazy_arrow()[0].int32()),
+    ("records_per_buffer", _lazy_arrow()[0].int32()),
+    ("channels_mask", _lazy_arrow()[0].string()),
+    ("bunch_spacing_samples", _lazy_arrow()[0].int32()),
+    ("area_A_Vs", _lazy_arrow()[0].float64()),
+    ("peak_A_V", _lazy_arrow()[0].float64()),
+    ("baseline_A_V", _lazy_arrow()[0].float64()),
+    ("area_B_Vs", _lazy_arrow()[0].float64()),
+    ("peak_B_V", _lazy_arrow()[0].float64()),
+    ("baseline_B_V", _lazy_arrow()[0].float64()),
 ])
 
-SESSION_INDEX_SCHEMA = pa.schema([
-    ("session_id", pa.string()),
-    ("date", pa.string()),
-    ("first_timestamp_ns", pa.int64()),
-    ("last_timestamp_ns", pa.int64()),
-    ("reduced_rows", pa.int64()),
-    ("waveform_snips", pa.int64()),
-    ("channels_mask", pa.string()),
+SESSION_INDEX_SCHEMA = _lazy_arrow()[0].schema([
+    ("session_id", _lazy_arrow()[0].string()),
+    ("date", _lazy_arrow()[0].string()),
+    ("first_timestamp_ns", _lazy_arrow()[0].int64()),
+    ("last_timestamp_ns", _lazy_arrow()[0].int64()),
+    ("reduced_rows", _lazy_arrow()[0].int64()),
+    ("waveform_snips", _lazy_arrow()[0].int64()),
+    ("channels_mask", _lazy_arrow()[0].string()),
 ])
 
 def _ensure_dir(p: Path) -> None:
@@ -502,13 +532,13 @@ class ParquetRollingWriter:
     Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/<HH:00>/):
       - reduced/<prefix>_<YYYYMMDD_HHMM>.parquet
     """
-    def __init__(self, day_dir: Path, prefix: str, schema: pa.Schema, rollover_minutes: int):
+    def __init__(self, day_dir: Path, prefix: str, schema: _lazy_arrow()[0].Schema, rollover_minutes: int):
         self.day_dir = day_dir
         self.prefix = prefix
         self.schema = schema
         self.rollover_minutes = max(1, int(rollover_minutes))
         _ensure_dir(day_dir)
-        self._writer: Optional[pq.ParquetWriter] = None
+        self._writer: Optional[_lazy_arrow()[1].ParquetWriter] = None
         self._open_key: Optional[str] = None  # YYYYMMDD_HHMM
         self._open_hour: Optional[str] = None  # HH:00
 
@@ -525,7 +555,7 @@ class ParquetRollingWriter:
     def _open_new(self, ts_ns: int, key: str) -> None:
         hour, base = self._hour_dir(ts_ns)
         path = base / f"{self.prefix}_{key}.parquet"
-        self._writer = pq.ParquetWriter(path, self.schema, compression="snappy", use_dictionary=True)
+        self._writer = _lazy_arrow()[1].ParquetWriter(path, self.schema, compression="snappy", use_dictionary=True)
         self._open_key = key
         self._open_hour = hour
 
@@ -556,12 +586,12 @@ class ParquetRollingWriter:
         self._maybe_roll(ts_ns)
         assert self._writer is not None
 
-        df = pd.DataFrame(rows)
+        df = _lazy_pandas().DataFrame(rows)
         for name in self.schema.names:
             if name not in df.columns:
                 df[name] = np.nan
         df = df[self.schema.names]
-        tbl = pa.Table.from_pandas(df, schema=self.schema, preserve_index=False)
+        tbl = _lazy_arrow()[0].Table.from_pandas(df, schema=self.schema, preserve_index=False)
         self._writer.write_table(tbl)
         return int(tbl.num_rows)
 
@@ -797,7 +827,7 @@ class WaveBinSqliteStore:
         except Exception:
             pass
 
-    def load_waveforms(self, row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def load_waveforms(self, row: _lazy_pandas().Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Load channel-separated waveforms if available; otherwise fall back to legacy combined payload.
         """
@@ -808,7 +838,7 @@ class WaveBinSqliteStore:
         offA = row.get("offset_A", None)
         nbytesA = row.get("nbytes_A", None)
 
-        if isinstance(fileA, str) and fileA and pd.notna(offA) and pd.notna(nbytesA):
+        if isinstance(fileA, str) and fileA and _lazy_pandas().notna(offA) and _lazy_pandas().notna(nbytesA):
             binA = day_dir / str(fileA)
             with open(binA, "rb") as fh:
                 fh.seek(int(offA))
@@ -818,7 +848,7 @@ class WaveBinSqliteStore:
             fileB = row.get("file_B", None)
             offB = row.get("offset_B", None)
             nbytesB = row.get("nbytes_B", None)
-            if isinstance(fileB, str) and fileB and pd.notna(offB) and pd.notna(nbytesB):
+            if isinstance(fileB, str) and fileB and _lazy_pandas().notna(offB) and _lazy_pandas().notna(nbytesB):
                 binB = day_dir / str(fileB)
                 with open(binB, "rb") as fh:
                     fh.seek(int(offB))
@@ -841,7 +871,7 @@ class WaveBinSqliteStore:
         return arr[:n_samples], None
 
 
-def load_waveforms_from_row(row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def load_waveforms_from_row(row: _lazy_pandas().Series, day_dir: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Read waveform payloads referenced by a snip row WITHOUT opening/creating any SQLite DB."""
     n_samples = int(row.get("n_samples", 0))
 
@@ -850,7 +880,7 @@ def load_waveforms_from_row(row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, 
     offA = row.get("offset_A", None)
     nbytesA = row.get("nbytes_A", None)
 
-    if isinstance(fileA, str) and fileA and pd.notna(offA) and pd.notna(nbytesA):
+    if isinstance(fileA, str) and fileA and _lazy_pandas().notna(offA) and _lazy_pandas().notna(nbytesA):
         binA = day_dir / str(fileA)
         with open(binA, "rb") as fh:
             fh.seek(int(offA))
@@ -860,7 +890,7 @@ def load_waveforms_from_row(row: pd.Series, day_dir: Path) -> Tuple[np.ndarray, 
         fileB = row.get("file_B", None)
         offB = row.get("offset_B", None)
         nbytesB = row.get("nbytes_B", None)
-        if isinstance(fileB, str) and fileB and pd.notna(offB) and pd.notna(nbytesB):
+        if isinstance(fileB, str) and fileB and _lazy_pandas().notna(offB) and _lazy_pandas().notna(nbytesB):
             binB = day_dir / str(fileB)
             with open(binB, "rb") as fh:
                 fh.seek(int(offB))
@@ -990,12 +1020,12 @@ class CappyArchive:
             channels_mask=str(channels_mask),
         )
         if idx.exists():
-            df = pd.read_parquet(idx)
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            df = _lazy_pandas().read_parquet(idx)
+            df = _lazy_pandas().concat([df, _lazy_pandas().DataFrame([row])], ignore_index=True)
         else:
-            df = pd.DataFrame([row])
+            df = _lazy_pandas().DataFrame([row])
         df = df.drop_duplicates(subset=["session_id"], keep="last")
-        pq.write_table(pa.Table.from_pandas(df, schema=SESSION_INDEX_SCHEMA, preserve_index=False), idx, compression="snappy")
+        _lazy_arrow()[1].write_table(_lazy_arrow()[0].Table.from_pandas(df, schema=SESSION_INDEX_SCHEMA, preserve_index=False), idx, compression="snappy")
         print(f"[CAPPY] Finalized session {self.session_id} reduced={self._n_reduced} snips={self._n_snips}")
 
 def reduce_u16(raw: np.ndarray, sr_hz: float, b0: int, b1: int, g0: int, g1: int, vpp: float):
@@ -1761,10 +1791,10 @@ class ArchiveBrowser(ttk.Frame):
         _ensure_dir(self.data_dir)
         self.captures = data_dir / "captures"
         _ensure_dir(self.captures)
-        self.sessions = pd.DataFrame()
-        self.snips = pd.DataFrame()
+        self.sessions = _lazy_pandas().DataFrame()
+        self.snips = _lazy_pandas().DataFrame()
         self._snip_db_dir: Optional[Path] = None
-        self._snips_view = pd.DataFrame()
+        self._snips_view = _lazy_pandas().DataFrame()
         self._sel_date = None
         self._sel_hour = None
         self._build()
@@ -1782,6 +1812,7 @@ class ArchiveBrowser(ttk.Frame):
         pan.pack(fill=tk.BOTH, expand=True, pady=(8,0))
         left = ttk.Frame(pan, padding=6)
         right = ttk.Frame(pan, padding=6)
+        self._right = right
         pan.add(left, weight=1)
         pan.add(right, weight=2)
 
@@ -1815,6 +1846,7 @@ class ArchiveBrowser(ttk.Frame):
         self.wlist.pack(fill=tk.BOTH, expand=True)
         self.wlist.bind("<<ListboxSelect>>", self._on_snip)
 
+        _, plt, _FigureCanvasTkAgg = _lazy_mpl()
         self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
         self.fig.patch.set_facecolor('#1e1e1e')
         self.axA.set_facecolor('#2d2d2d')
@@ -1823,7 +1855,7 @@ class ArchiveBrowser(ttk.Frame):
         self.fig.tight_layout(pad=1.0)
 
         # Canvas for matplotlib figure
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas = _FigureCanvasTkAgg(self.fig, master=self._right)
 
         # Navigation toolbar for zoom/pan/home/save
         self._nav_toolbar = None
@@ -1832,7 +1864,7 @@ class ArchiveBrowser(ttk.Frame):
                 from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk as _NavTB
             except ImportError:
                 from matplotlib.backends.backend_tkagg import NavigationToolbar2TkAgg as _NavTB
-            toolbar_frame = tk.Frame(right, bg='#3d3d3d', height=36)
+            toolbar_frame = tk.Frame(self._right, bg='#3d3d3d', height=36)
             toolbar_frame.pack(side=tk.TOP, fill=tk.X)
             toolbar_frame.pack_propagate(True)
             self._nav_toolbar = _NavTB(self.canvas, toolbar_frame)
@@ -1845,7 +1877,7 @@ class ArchiveBrowser(ttk.Frame):
 
         # Readout label below plots
         self._readout_var = tk.StringVar(value="")
-        readout_lbl = tk.Label(right, textvariable=self._readout_var,
+        readout_lbl = tk.Label(self._right, textvariable=self._readout_var,
                                font=('Courier', 10, 'bold'), fg=NEON_PINK, bg='#1e1e1e',
                                anchor='w', padx=6, pady=2)
         readout_lbl.pack(fill=tk.X)
@@ -1870,7 +1902,7 @@ class ArchiveBrowser(ttk.Frame):
         except Exception:
             pass
 
-        self.meta = tk.Text(right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
+        self.meta = tk.Text(self._right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
         self.meta.pack(fill=tk.X, pady=(8,0))
         self.meta.configure(state=tk.DISABLED)
 
@@ -1902,7 +1934,7 @@ class ArchiveBrowser(ttk.Frame):
                         continue
                     yield ddir
 
-    def _list_sessions(self, sd: Optional[date], ed: Optional[date]) -> pd.DataFrame:
+    def _list_sessions(self, sd: Optional[date], ed: Optional[date]) -> _lazy_pandas().DataFrame:
         rows = []
         for ddir in self._iter_day_dirs() or []:
             try:
@@ -1916,12 +1948,12 @@ class ArchiveBrowser(ttk.Frame):
             idx = ddir / "session_index.parquet"
             if idx.exists():
                 try:
-                    rows += pd.read_parquet(idx).to_dict("records")
+                    rows += _lazy_pandas().read_parquet(idx).to_dict("records")
                 except Exception:
                     pass
         if not rows:
-            return pd.DataFrame(columns=SESSION_INDEX_SCHEMA.names)
-        return pd.DataFrame(rows).sort_values("first_timestamp_ns", ascending=False)
+            return _lazy_pandas().DataFrame(columns=SESSION_INDEX_SCHEMA.names)
+        return _lazy_pandas().DataFrame(rows).sort_values("first_timestamp_ns", ascending=False)
 
     def _refresh(self):
         try:
@@ -1930,7 +1962,7 @@ class ArchiveBrowser(ttk.Frame):
             self._sessions_view = self.sessions.copy().reset_index(drop=True)
         except Exception as ex:
             messagebox.showerror("Error", str(ex))
-            self.sessions = pd.DataFrame()
+            self.sessions = _lazy_pandas().DataFrame()
 
         self.slist.delete(0, tk.END)
         self.wlist.delete(0, tk.END)
@@ -1945,7 +1977,7 @@ class ArchiveBrowser(ttk.Frame):
             self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
 
         # If a session is already selected and snips are loaded, re-apply snip filter.
-        if getattr(self, 'snips', pd.DataFrame()).empty is False:
+        if getattr(self, 'snips', _lazy_pandas().DataFrame()).empty is False:
             self._apply_hour_filter()
 
     def _sel_sid(self) -> Optional[str]:
@@ -1963,7 +1995,7 @@ class ArchiveBrowser(ttk.Frame):
         if self.snips is None or self.snips.empty:
             return
         # Treat stored ns as UTC epoch, then convert to local timezone for display/grouping.
-        dt = pd.to_datetime(self.snips["timestamp_ns"], unit="ns", utc=True).dt.tz_convert(self._tz)
+        dt = _lazy_pandas().to_datetime(self.snips["timestamp_ns"], unit="ns", utc=True).dt.tz_convert(self._tz)
         self.snips = self.snips.copy()
         self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
         self.snips["_hour"] = dt.dt.strftime("%H")
@@ -2018,7 +2050,7 @@ class ArchiveBrowser(ttk.Frame):
     def _apply_hour_filter(self):
         """Render wlist using selected date/hour."""
         self.wlist.delete(0, tk.END)
-        self._snips_view = pd.DataFrame()
+        self._snips_view = _lazy_pandas().DataFrame()
         if self.snips is None or self.snips.empty:
             self.wlist.insert(tk.END, "(no saved waveforms)")
             return
@@ -2067,7 +2099,7 @@ class ArchiveBrowser(ttk.Frame):
 
     def _seek_mmss(self):
         """Jump to the snip closest to MM:SS within the currently selected date/hour."""
-        if getattr(self, "_snips_view", pd.DataFrame()).empty:
+        if getattr(self, "_snips_view", _lazy_pandas().DataFrame()).empty:
             return
         txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
         if not txt:
@@ -2137,7 +2169,7 @@ class ArchiveBrowser(ttk.Frame):
         sid = self._sel_sid()
         if not sid:
             return
-        self.snips = pd.DataFrame()
+        self.snips = _lazy_pandas().DataFrame()
         self._snip_db_dir = None
 
         for ddir in self._iter_day_dirs() or []:
@@ -2159,7 +2191,7 @@ class ArchiveBrowser(ttk.Frame):
                 continue
             conn = sqlite3.connect(db)
             try:
-                self.snips = pd.read_sql_query(
+                self.snips = _lazy_pandas().read_sql_query(
                     "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                     "file,offset_bytes,nbytes,"
                     "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
@@ -2170,7 +2202,7 @@ class ArchiveBrowser(ttk.Frame):
                 )
                 # If query returned nothing, try without session_id filter (DB might only have one session)
                 if self.snips.empty:
-                    self.snips = pd.read_sql_query(
+                    self.snips = _lazy_pandas().read_sql_query(
                         "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,"
                         "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
@@ -2181,7 +2213,7 @@ class ArchiveBrowser(ttk.Frame):
             except Exception:
                 # Legacy DB schema (no channel-separated columns or baseline columns)
                 try:
-                    self.snips = pd.read_sql_query(
+                    self.snips = _lazy_pandas().read_sql_query(
                         "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
                         "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
@@ -2189,7 +2221,7 @@ class ArchiveBrowser(ttk.Frame):
                         params=(sid,),
                     )
                     if self.snips.empty:
-                        self.snips = pd.read_sql_query(
+                        self.snips = _lazy_pandas().read_sql_query(
                             "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                             "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
                             "FROM snips ORDER BY timestamp_ns DESC LIMIT 50000",
@@ -2550,6 +2582,7 @@ class LiveDashboard(ttk.Frame):
         self.lbl_temp = mkrow("Board temp (°C)")
 
         # --- plots ---
+        _, plt, _FigureCanvasTkAgg = _lazy_mpl()
         self.fig = plt.Figure(figsize=(8.2, 7.2))
         self.fig.patch.set_facecolor('#1e1e1e')
 
@@ -2561,7 +2594,7 @@ class LiveDashboard(ttk.Frame):
         self.ax_int = self.fig.add_subplot(313)
         self.ax_int.set_facecolor('#2d2d2d')
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
+        self.canvas = _FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         self.meta = tk.Text(self, height=3, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
