@@ -234,6 +234,7 @@ trigger:
   ext_coupling: DC_COUPLING
   ext_range: ETR_5V
   delay_samples: 0
+  trigger_delay_us: 0.0           # convenience: trigger delay in microseconds (overrides delay_samples if > 0)
   timeout_ms: 0                   # 0 = wait forever (unless runtime.noise_test=true)
   timeout_pause_s: 0.0            # if >0 and no triggers arrive for this long, pause then rearm
 
@@ -1400,6 +1401,7 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     trig["levelK"] = levelK
     trig["timeout_ms"] = _clamp_int(trig.get("timeout_ms", 0), 0, 2_147_483_647, 0)
     trig["timeout_pause_s"] = _clamp_float(trig.get("timeout_pause_s", 0.0), 0.0, 3600.0, 0.0)
+    trig["trigger_delay_us"] = _clamp_float(trig.get("trigger_delay_us", 0.0), 0.0, 100_000.0, 0.0)
     if _to_int(trig.get("timeout_ms", 0), 0) > 0:
         warnings.append(
             "trigger.timeout_ms > 0 enables auto-trigger mode; this can create non-hardware trigger records."
@@ -1645,7 +1647,15 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
         ats_const(str(t.get("ext_range", "ETR_5V")))
     )
 
-    board.setTriggerDelay(int(t.get("delay_samples", 0)))
+    # Trigger delay: prefer trigger_delay_us if set, otherwise use delay_samples
+    delay_us = float(t.get("trigger_delay_us", 0.0) or 0.0)
+    delay_samples_cfg = int(t.get("delay_samples", 0))
+    if delay_us > 0:
+        delay_samples_computed = int(round(delay_us * 1e-6 * sr_hz))
+        print(f"[CAPPY] Trigger delay: {delay_us:.3f} µs = {delay_samples_computed} samples at {sr_hz/1e6:.1f} MS/s")
+        board.setTriggerDelay(delay_samples_computed)
+    else:
+        board.setTriggerDelay(delay_samples_cfg)
 
     timeout_ms = int(t.get("timeout_ms", 0))
     rt = cfg.get("runtime", {}) or {}
@@ -3643,6 +3653,7 @@ class LiveControlPanel(ttk.Frame):
         self.var_ext_range = tk.StringVar(value="ETR_5V")
         self.var_ext_coupling = tk.StringVar(value="DC_COUPLING")
         self.var_ext_startcapture = tk.BooleanVar(value=False)
+        self.var_trigger_delay_us = tk.DoubleVar(value=0.0)
         self._trig_level_code_var = tk.StringVar(value="code=128")
 
         self.var_rearm_s = tk.IntVar(value=300)
@@ -3742,8 +3753,9 @@ class LiveControlPanel(ttk.Frame):
         self._add_spinbox(trig, 6, "Timeout pause (s)", self.var_timeout_pause_s, from_=0.0, to=3600.0, increment=0.1, width=10)
         self._add_combobox(trig, 7, "External range", self.var_ext_range, EXT_TRIGGER_RANGE_OPTIONS)
         self._add_combobox(trig, 8, "External coupling", self.var_ext_coupling, ["DC_COUPLING", "AC_COUPLING"])
+        self._add_spinbox(trig, 9, "Trigger delay (µs)", self.var_trigger_delay_us, from_=0.0, to=100000.0, increment=0.1, width=10)
         ttk.Checkbutton(trig, text="External start-capture", variable=self.var_ext_startcapture).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(4, 0)
+            row=10, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
 
         live = ttk.LabelFrame(right, text="Runtime / Storage / Live", padding=8)
@@ -3955,9 +3967,11 @@ class LiveControlPanel(ttk.Frame):
 
             record_us = record_s * 1e6
             buffer_ms = record_s * float(rpb) * 1e3
+            delay_us = self._safe_float(self.var_trigger_delay_us, 0.0)
+            delay_str = f", trig delay={delay_us:.1f} µs" if delay_us > 0 else ""
             self._math_var.set(
                 f"Math: post = samples - pre ({post}); flush/commit step = records_per_buffer ({rpb}); "
-                f"record={record_us:.3f} us, buffer={buffer_ms:.3f} ms, live window={stream_s:.3f} s."
+                f"record={record_us:.3f} us, buffer={buffer_ms:.3f} ms, live window={stream_s:.3f} s{delay_str}."
             )
         finally:
             self._harmonizing = False
@@ -4078,6 +4092,7 @@ class LiveControlPanel(ttk.Frame):
             self.var_ext_range.set(str(trig.get("ext_range", "ETR_5V")))
             self.var_ext_coupling.set(str(trig.get("ext_coupling", "DC_COUPLING")))
             self.var_ext_startcapture.set(bool(trig.get("external_startcapture", False)))
+            self.var_trigger_delay_us.set(float(trig.get("trigger_delay_us", 0.0) or 0.0))
             self._sync_trigger_level_code()
 
             self.var_rearm_s.set(_to_int(rt.get("rearm_if_no_trigger_s", 300), 300))
@@ -4184,6 +4199,7 @@ class LiveControlPanel(ttk.Frame):
         trig["ext_range"] = self._var_text(self.var_ext_range, "ETR_5V") or "ETR_5V"
         trig["ext_coupling"] = self._var_text(self.var_ext_coupling, "DC_COUPLING") or "DC_COUPLING"
         trig["external_startcapture"] = bool(self.var_ext_startcapture.get())
+        trig["trigger_delay_us"] = self._safe_float(self.var_trigger_delay_us, 0.0)
 
         runtime["rearm_if_no_trigger_s"] = self._safe_int(self.var_rearm_s, 300)
         runtime["rearm_cooldown_s"] = self._safe_int(self.var_rearm_cooldown_s, 30)
