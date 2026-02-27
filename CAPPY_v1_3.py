@@ -1847,6 +1847,8 @@ def run_capture(cfg_path: Path) -> int:
         records_per_buffer=rpb,
         vpp_A=vppA,
         vpp_B=vppB,
+        trigger_source=str(trig.get("sourceJ", "TRIG_EXTERNAL")),
+        trigger_timeout_ms=int(trig.get("timeout_ms", 0)),
         live_ring_path=str(ring_path),
         live=dict(
             ring_slots=int(live_cfg.get('ring_slots', ring_nslots)),
@@ -3058,6 +3060,8 @@ class LiveDashboard(ttk.Frame):
 
         self._started_unix: Optional[float] = None
         self._last_seen_seq: int = 0
+        self._tick_after_id = None
+        self._is_destroyed = False
 
         # --- top stats ---
         stats = ttk.Frame(self)
@@ -3098,18 +3102,44 @@ class LiveDashboard(ttk.Frame):
         self.meta.pack(fill=tk.X, pady=(6, 0))
         self.meta.configure(state=tk.DISABLED)
 
+        self.bind("<Destroy>", self._on_destroy, add="+")
         # Schedule periodic UI updates
-        if hasattr(self, "_tick"):
-            self.after(100, self._tick)
-        else:
-            # Fallback to avoid startup crash if _tick is missing due to editing/merge issues
-            self.after(100, lambda: None)
+        self._schedule_tick()
+
+    def _on_destroy(self, evt=None):
+        if evt is not None and getattr(evt, "widget", None) is not self:
+            return
+        self._is_destroyed = True
+        aid = self._tick_after_id
+        self._tick_after_id = None
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+
+    def _schedule_tick(self):
+        if self._is_destroyed:
+            return
+        try:
+            if not bool(self.winfo_exists()):
+                return
+            self._tick_after_id = self.after(100, self._tick)
+        except Exception:
+            self._tick_after_id = None
 
     def _set_meta(self, s: str):
-        self.meta.configure(state=tk.NORMAL)
-        self.meta.delete("1.0", tk.END)
-        self.meta.insert(tk.END, s)
-        self.meta.configure(state=tk.DISABLED)
+        if self._is_destroyed:
+            return
+        try:
+            if not bool(self.winfo_exists()) or not bool(self.meta.winfo_exists()):
+                return
+            self.meta.configure(state=tk.NORMAL)
+            self.meta.delete("1.0", tk.END)
+            self.meta.insert(tk.END, s)
+            self.meta.configure(state=tk.DISABLED)
+        except Exception:
+            return
 
     def _read_status(self) -> Optional[dict]:
         data_dir = Path(self.data_dir_var.get()).expanduser()
@@ -3121,6 +3151,17 @@ class LiveDashboard(ttk.Frame):
             return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+    def _is_scope_mode(self, snap: dict) -> bool:
+        """
+        Use trigger-locked scope display for hardware-triggered runs.
+        Keep scrolling stream mode for auto-trigger/noise-test captures.
+        """
+        timeout_ms = _to_int(snap.get("trigger_timeout_ms", 0), 0)
+        if timeout_ms > 0:
+            return False
+        src = str(snap.get("trigger_source", "") or "").strip().upper()
+        return src in {"TRIG_EXTERNAL", "TRIG_CHAN_A", "TRIG_CHAN_B"}
 
     def _append_point(self, snap: dict):
         seq = snap.get("status_seq", None)
@@ -3253,6 +3294,8 @@ class LiveDashboard(ttk.Frame):
         # --- Channel A waveform (top) - Optimized rendering ---
         sr_hz = _to_float(snap.get("sample_rate_hz", 0.0), 0.0)
         dt_ms = (1e3 / sr_hz) if sr_hz > 0 else 1.0
+        scope_mode = self._is_scope_mode(snap)
+        x_label = "Time from trigger (ms)" if scope_mode else "Time from latest (ms)"
 
         if self._streamA.size > 1:
             # Baseline-subtract: remove DC offset using rolling mean of the stream
@@ -3260,8 +3303,10 @@ class LiveDashboard(ttk.Frame):
             bl_a = np.mean(stream_a)
             stream_a = stream_a - bl_a
 
-            x_full = (np.arange(stream_a.size, dtype=np.float64) - (stream_a.size - 1)) * dt_ms
-            x_label = "Time from latest (ms)"
+            if scope_mode:
+                x_full = np.arange(stream_a.size, dtype=np.float64) * dt_ms
+            else:
+                x_full = (np.arange(stream_a.size, dtype=np.float64) - (stream_a.size - 1)) * dt_ms
 
             # Use downsampled view if stream is very large for better performance
             if stream_a.size > 50000:
@@ -3286,7 +3331,7 @@ class LiveDashboard(ttk.Frame):
         else:
             self.ax_wfA.set_title("Channel A: waiting for waveforms…", color='white')
             self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel("Time from latest (ms)", color='white')
+            self.ax_wfA.set_xlabel(x_label, color='white')
             self.ax_wfA.tick_params(colors='white')
             self.ax_wfA.spines['left'].set_color(NEON_PINK)
             self.ax_wfA.spines['bottom'].set_color('white')
@@ -3304,8 +3349,10 @@ class LiveDashboard(ttk.Frame):
             bl_b = np.mean(stream_b)
             stream_b = stream_b - bl_b
 
-            xb_full = (np.arange(stream_b.size, dtype=np.float64) - (stream_b.size - 1)) * dt_ms
-            xb_label = "Time from latest (ms)"
+            if scope_mode:
+                xb_full = np.arange(stream_b.size, dtype=np.float64) * dt_ms
+            else:
+                xb_full = (np.arange(stream_b.size, dtype=np.float64) - (stream_b.size - 1)) * dt_ms
 
             # Use downsampled view if stream is very large
             if stream_b.size > 50000:
@@ -3318,7 +3365,7 @@ class LiveDashboard(ttk.Frame):
             
             line_b, = self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True, rasterized=True)
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel(xb_label, color='white')
+            self.ax_wfB.set_xlabel(x_label, color='white')
             self.ax_wfB.tick_params(colors='white')
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
@@ -3333,7 +3380,7 @@ class LiveDashboard(ttk.Frame):
             else:
                 self.ax_wfB.set_title("Channel B: disabled in channels mask", color='white')
             self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel("Time from latest (ms)", color='white')
+            self.ax_wfB.set_xlabel(x_label, color='white')
             self.ax_wfB.tick_params(colors='white')
             self.ax_wfB.spines['left'].set_color(NEON_GREEN)
             self.ax_wfB.spines['bottom'].set_color('white')
@@ -3341,7 +3388,15 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfB.spines['right'].set_visible(False)
             self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
 
-        if self._stream_window > 1:
+        if scope_mode:
+            try:
+                if self._streamA.size > 1:
+                    self.ax_wfA.set_xlim(left=0.0, right=dt_ms * float(max(1, self._streamA.size - 1)))
+                if has_b_channel and self._streamB.size > 1:
+                    self.ax_wfB.set_xlim(left=0.0, right=dt_ms * float(max(1, self._streamB.size - 1)))
+            except Exception:
+                pass
+        elif self._stream_window > 1:
             w_ms = dt_ms * float(max(1, self._stream_window - 1))
             try:
                 if self._streamA.size > 1:
@@ -3400,117 +3455,134 @@ class LiveDashboard(ttk.Frame):
         self.canvas.flush_events()
 
     def _tick(self):
-        snap = self._read_status()
-        if snap:
-            live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
-            show_channel_b = _to_bool(live_cfg.get("show_channel_b", False), False)
-            if callable(self._on_status):
+        self._tick_after_id = None
+        if self._is_destroyed:
+            return
+        try:
+            if not bool(self.winfo_exists()):
+                return
+        except Exception:
+            return
+
+        try:
+            snap = self._read_status()
+            if snap:
+                live_cfg = snap.get('live', {}) if isinstance(snap.get('live', {}), dict) else {}
+                show_channel_b = _to_bool(live_cfg.get("show_channel_b", False), False)
+                if callable(self._on_status):
+                    try:
+                        self._on_status(snap)
+                    except Exception:
+                        pass
+                # stats
                 try:
-                    self._on_status(snap)
+                    self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
+                except Exception:
+                    self.lbl_rate.configure(text=str(snap.get("rate_hz", "—")))
+                self.lbl_caps.configure(text=str(snap.get("buffers", "—")))
+                self.lbl_started.configure(text=str(snap.get("started", "—")))
+                self.lbl_last.configure(text=str(snap.get("last_capture", snap.get("time", "—"))))
+
+                # mean peak stat (A [+ B])
+                pA = snap.get("buffer_mean_peak_A", None)
+                pB = snap.get("buffer_mean_peak_B", None)
+                try:
+                    if pA is None:
+                        self.lbl_peak.configure(text="—")
+                    else:
+                        if show_channel_b and pB is not None and float(pB) != 0.0:
+                            self.lbl_peak.configure(text=f"A {float(pA):.6g}   B {float(pB):.6g}")
+                        else:
+                            self.lbl_peak.configure(text=f"{float(pA):.6g}")
+                except Exception:
+                    self.lbl_peak.configure(text=str(pA))
+
+                try:
+                    if 'stream_window_points' in live_cfg:
+                        self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
+                    if 'stream_window_seconds' in live_cfg:
+                        self._stream_window_s = float(live_cfg.get('stream_window_seconds', self._stream_window_s))
                 except Exception:
                     pass
-            # stats
-            try:
-                self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
-            except Exception:
-                self.lbl_rate.configure(text=str(snap.get("rate_hz", "—")))
-            self.lbl_caps.configure(text=str(snap.get("buffers", "—")))
-            self.lbl_started.configure(text=str(snap.get("started", "—")))
-            self.lbl_last.configure(text=str(snap.get("last_capture", snap.get("time", "—"))))
 
-            # mean peak stat (A [+ B])
-            pA = snap.get("buffer_mean_peak_A", None)
-            pB = snap.get("buffer_mean_peak_B", None)
-            try:
-                if pA is None:
-                    self.lbl_peak.configure(text="—")
-                else:
-                    if show_channel_b and pB is not None and float(pB) != 0.0:
-                        self.lbl_peak.configure(text=f"A {float(pA):.6g}   B {float(pB):.6g}")
-                    else:
-                        self.lbl_peak.configure(text=f"{float(pA):.6g}")
-            except Exception:
-                self.lbl_peak.configure(text=str(pA))
+                bt = snap.get("board_temp_c", None)
+                self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
 
-            try:
-                if 'stream_window_points' in live_cfg:
-                    self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
-                if 'stream_window_seconds' in live_cfg:
-                    self._stream_window_s = float(live_cfg.get('stream_window_seconds', self._stream_window_s))
-            except Exception:
-                pass
-
-            bt = snap.get("board_temp_c", None)
-            self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
-
-            self._open_ring_from_status(snap)
-            self._append_point(snap)
-            # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
-            try:
-                max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
-            except Exception:
-                max_wf = 20
-            channels_mask_text = str(snap.get("channels_mask", "CHANNEL_A") or "CHANNEL_A")
-            status_has_b = show_channel_b and bool(channels_from_mask_expr(channels_mask_text) & 0x2)
-
-            def _append_stream(values: np.ndarray, is_b: bool) -> None:
-                if values is None or values.size == 0:
-                    return
-                if is_b:
-                    self._streamB = np.concatenate([self._streamB, values.astype(np.float32, copy=False)])
-                    if self._streamB.size > self._stream_window:
-                        self._streamB = self._streamB[-self._stream_window:]
-                else:
-                    self._streamA = np.concatenate([self._streamA, values.astype(np.float32, copy=False)])
-                    if self._streamA.size > self._stream_window:
-                        self._streamA = self._streamA[-self._stream_window:]
-
-            saw_ring_record = False
-            saw_b_record = False
-            for _ in range(max_wf):
-                wfA, wfB, wf_t_unix, _chmask, _seq = self._read_ring_next()
-                if wfA is None and wfB is None:
-                    break
-                saw_ring_record = True
-                if wf_t_unix is not None:
-                    self._latest_ring_unix = float(wf_t_unix)
-                if wfA is not None:
-                    try:
-                        _append_stream(wfA, is_b=False)
-                    except Exception:
-                        pass
-                if wfB is not None and status_has_b:
-                    try:
-                        _append_stream(wfB, is_b=True)
-                        saw_b_record = True
-                    except Exception:
-                        pass
-
-            # Prevent stale Channel B traces when capture switches to A-only.
-            if not status_has_b:
-                if self._streamB.size:
-                    self._streamB = np.empty((0,), dtype=np.float32)
-            elif saw_ring_record and (not saw_b_record):
-                self._streamB = np.empty((0,), dtype=np.float32)
-
-            self._redraw(snap)
-
-            latest_ring = "-"
-            if self._latest_ring_unix is not None:
+                self._open_ring_from_status(snap)
+                self._append_point(snap)
+                # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
                 try:
-                    latest_ring = datetime.fromtimestamp(float(self._latest_ring_unix)).strftime("%H:%M:%S.%f")[:-3]
+                    max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
                 except Exception:
-                    latest_ring = str(self._latest_ring_unix)
-            self._set_meta(
-                f"State: {snap.get('state','?')}    Last ring wf: {latest_ring}    "
-                f"Points A/B: {self._streamA.size}/{self._streamB.size} (window={self._stream_window})    Status: {self.status_path}"
-            )
-        # Schedule periodic UI updates
-        if hasattr(self, "_tick"):
-            self.after(100, self._tick)
-        else:
-            # Fallback to avoid startup crash if _tick is missing due to editing/merge issues
-            self.after(100, lambda: None)
+                    max_wf = 20
+                channels_mask_text = str(snap.get("channels_mask", "CHANNEL_A") or "CHANNEL_A")
+                status_has_b = show_channel_b and bool(channels_from_mask_expr(channels_mask_text) & 0x2)
+                scope_mode = self._is_scope_mode(snap)
+
+                def _append_stream(values: np.ndarray, is_b: bool) -> None:
+                    if values is None or values.size == 0:
+                        return
+                    vals = values.astype(np.float32, copy=False)
+                    if scope_mode:
+                        if is_b:
+                            self._streamB = vals.copy()
+                        else:
+                            self._streamA = vals.copy()
+                        return
+                    if is_b:
+                        self._streamB = np.concatenate([self._streamB, vals])
+                        if self._streamB.size > self._stream_window:
+                            self._streamB = self._streamB[-self._stream_window:]
+                    else:
+                        self._streamA = np.concatenate([self._streamA, vals])
+                        if self._streamA.size > self._stream_window:
+                            self._streamA = self._streamA[-self._stream_window:]
+
+                saw_ring_record = False
+                saw_b_record = False
+                for _ in range(max_wf):
+                    wfA, wfB, wf_t_unix, _chmask, _seq = self._read_ring_next()
+                    if wfA is None and wfB is None:
+                        break
+                    saw_ring_record = True
+                    if wf_t_unix is not None:
+                        self._latest_ring_unix = float(wf_t_unix)
+                    if wfA is not None:
+                        try:
+                            _append_stream(wfA, is_b=False)
+                        except Exception:
+                            pass
+                    if wfB is not None and status_has_b:
+                        try:
+                            _append_stream(wfB, is_b=True)
+                            saw_b_record = True
+                        except Exception:
+                            pass
+
+                # Prevent stale Channel B traces when capture switches to A-only.
+                if not status_has_b:
+                    if self._streamB.size:
+                        self._streamB = np.empty((0,), dtype=np.float32)
+                elif saw_ring_record and (not saw_b_record):
+                    self._streamB = np.empty((0,), dtype=np.float32)
+
+                self._redraw(snap)
+
+                latest_ring = "-"
+                if self._latest_ring_unix is not None:
+                    try:
+                        latest_ring = datetime.fromtimestamp(float(self._latest_ring_unix)).strftime("%H:%M:%S.%f")[:-3]
+                    except Exception:
+                        latest_ring = str(self._latest_ring_unix)
+                mode = "scope" if scope_mode else "stream"
+                self._set_meta(
+                    f"State: {snap.get('state','?')}    Last ring wf: {latest_ring}    "
+                    f"Points A/B: {self._streamA.size}/{self._streamB.size} (mode={mode}, window={self._stream_window})    Status: {self.status_path}"
+                )
+        except tk.TclError:
+            return
+        finally:
+            self._schedule_tick()
 
 class _ProcLogPump:
     """
@@ -4018,6 +4090,9 @@ class LauncherGUI(tk.Tk):
         self.proc = None
         self.pump = None
         self._kill_after_id = None
+        self._poll_after_id = None
+        self._close_after_id = None
+        self._is_closing = False
 
         # Apply dark mode theme
         self.tk_setPalette(background='#2d2d2d', foreground='white', activeBackground='#404040', activeForeground='white')
@@ -4115,13 +4190,48 @@ class LauncherGUI(tk.Tk):
 
         self._load_controls_from_yaml()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
-        self.after(100, self._poll)
+        self.bind("<Destroy>", self._on_destroy, add="+")
+        self._schedule_poll()
+
+    def _on_destroy(self, evt=None):
+        if evt is not None and getattr(evt, "widget", None) is not self:
+            return
+        self._is_closing = True
+        self._cancel_after_callback("_poll_after_id")
+        self._cancel_after_callback("_kill_after_id")
+        self._cancel_after_callback("_close_after_id")
+
+    def _cancel_after_callback(self, attr_name: str) -> None:
+        aid = getattr(self, attr_name, None)
+        setattr(self, attr_name, None)
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+
+    def _schedule_poll(self) -> None:
+        if self._is_closing:
+            return
+        try:
+            if not bool(self.winfo_exists()):
+                return
+            self._poll_after_id = self.after(100, self._poll)
+        except Exception:
+            self._poll_after_id = None
 
     def _append(self, s: str):
-        self.log.configure(state=tk.NORMAL)
-        self.log.insert(tk.END, s + "\n")
-        self.log.see(tk.END)
-        self.log.configure(state=tk.DISABLED)
+        if self._is_closing:
+            return
+        try:
+            if not bool(self.winfo_exists()) or not bool(self.log.winfo_exists()):
+                return
+            self.log.configure(state=tk.NORMAL)
+            self.log.insert(tk.END, s + "\n")
+            self.log.see(tk.END)
+            self.log.configure(state=tk.DISABLED)
+        except Exception:
+            return
 
     def _capture_disk_size(self, data_dir: Path) -> int:
         now = time.time()
@@ -4351,6 +4461,7 @@ class LauncherGUI(tk.Tk):
         except Exception as e:
             self._append("[GUI] stop failed: " + str(e))
 
+        self._cancel_after_callback("_kill_after_id")
         if self._kill_after_id is None:
             self._kill_after_id = self.after(2500, self._kill_if_running)
 
@@ -4366,10 +4477,13 @@ class LauncherGUI(tk.Tk):
             self._append("[GUI] kill failed: " + str(e))
 
     def _on_close(self):
+        self._is_closing = True
+        self._cancel_after_callback("_poll_after_id")
+        self._cancel_after_callback("_close_after_id")
         try:
             if self.proc is not None and self.proc.poll() is None:
                 self._stop()
-                self.after(600, self.destroy)
+                self._close_after_id = self.after(600, self.destroy)
                 return
         except Exception:
             pass
@@ -4377,6 +4491,15 @@ class LauncherGUI(tk.Tk):
 
 
     def _poll(self):
+        self._poll_after_id = None
+        if self._is_closing:
+            return
+        try:
+            if not bool(self.winfo_exists()):
+                return
+        except Exception:
+            return
+
         if self.pump is not None:
             for ln in self.pump.drain(max_lines=400):
                 self._append(ln)
@@ -4399,7 +4522,7 @@ class LauncherGUI(tk.Tk):
                 self.lbl.config(text="State: idle")
                 self.btn.config(text="Start Capture")
 
-        self.after(100, self._poll)
+        self._schedule_poll()
 
 
 def run_browse(data_dir: Path) -> int:
