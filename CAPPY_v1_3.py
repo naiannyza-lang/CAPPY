@@ -619,12 +619,21 @@ class LiveRingWriter:
 
             t_unix = time.time()
             rec_hdr = struct.pack("<QdQII", seq, t_unix, int(buf_idx), int(chmask), 0)
+            # Two-phase slot commit:
+            #   1) mark slot invalid (seq=0)
+            #   2) write payload bytes
+            #   3) write final header with real seq
+            # Reader only accepts records whose slot seq matches expected seq, so this
+            # prevents torn reads while capture and GUI access the same file concurrently.
+            invalid_hdr = struct.pack("<QdQII", 0, t_unix, int(buf_idx), int(chmask), 0)
 
             try:
                 self._fh.seek(off)
-                self._fh.write(rec_hdr)
+                self._fh.write(invalid_hdr)
                 self._fh.write(a.tobytes(order="C"))
                 self._fh.write(b.tobytes(order="C"))
+                self._fh.seek(off)
+                self._fh.write(rec_hdr)
                 # also update header write_seq for reader to know latest
                 self._fh.seek(24)  # write_seq offset in header
                 self._fh.write(struct.pack("<Q", seq))
@@ -1462,103 +1471,6 @@ def _codes_to_volts_u16(u16: np.ndarray, vpp: float) -> np.ndarray:
     return (u16.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
 
 
-def get_board_temperatures_c(board) -> Dict[str, Optional[float]]:
-    """
-    Read FPGA/ADC temperatures if available.
-    
-    Notes:
-      - Temperature reading is not available in all atsapi Python wrapper versions
-      - The ATS-9352 board supports temperature sensing in firmware, but the Python
-        API may not expose it depending on the wrapper version
-      - This function gracefully returns None if temperature is unavailable
-    
-    Returns:
-        Dict with 'fpga' and 'adc' temperature in Celsius (or None if unavailable),
-        and 'diag' with diagnostic information
-    """
-    import ctypes, struct, math
-
-    out: Dict[str, Optional[float]] = {"fpga": None, "adc": None}
-
-    # Strategy 1: Try high-level board methods (if exposed by wrapper)
-    for method_name in ['getBoardTemperature', 'getTemperature', 'get_temperature']:
-        if hasattr(board, method_name):
-            try:
-                method = getattr(board, method_name)
-                temp = float(method())
-                if -40.0 <= temp <= 150.0:
-                    out["adc"] = temp  # Usually returns ADC temp
-                    out["diag"] = {"method": method_name, "value": temp, "status": "success"}
-                    return out
-            except Exception as e:
-                # Method exists but failed - record it
-                out["diag"] = {"method": method_name, "error": str(e), "status": "failed"}
-                continue
-
-    # Strategy 2: Try ctypes-based low-level API (if AlazarGetParameter exists)
-    if hasattr(ats, 'AlazarGetParameter'):
-        try:
-            # Parameter IDs from ATS-SDK docs
-            GET_FPGA_TEMPERATURE = getattr(ats, "GET_FPGA_TEMPERATURE", 0x10000080)
-            GET_ADC_TEMPERATURE  = getattr(ats, "GET_ADC_TEMPERATURE",  0x10000104)
-            API_SUCCESS_CODES = [0, 512, 200]
-            
-            def _get_handle():
-                for name in ("handle", "boardHandle", "_handle", "_board_handle", "hBoard", "_hBoard"):
-                    h = getattr(board, name, None)
-                    if h is not None:
-                        return h
-                return None
-
-            def _decode_long_as_temp(val_long: int) -> Optional[float]:
-                # Try as integer
-                if -40 <= val_long <= 150:
-                    return float(val_long)
-                # Try low 32 bits as float
-                try:
-                    u32 = val_long & 0xFFFFFFFF
-                    f = struct.unpack("<f", struct.pack("<I", u32))[0]
-                    if math.isfinite(f) and (-40.0 <= f <= 150.0):
-                        return float(f)
-                except:
-                    pass
-                # Try high 32 bits as float (ATS-9352)
-                try:
-                    u32_high = (val_long >> 32) & 0xFFFFFFFF
-                    f = struct.unpack("<f", struct.pack("<I", u32_high))[0]
-                    if math.isfinite(f) and (-40.0 <= f <= 150.0):
-                        return float(f)
-                except:
-                    pass
-                return None
-
-            h = _get_handle()
-            if h is not None:
-                # Try to get ADC temperature (channel 1)
-                ret_long = ctypes.c_long(0)
-                try:
-                    rc = ats.AlazarGetParameter(h, 1, GET_ADC_TEMPERATURE, ctypes.byref(ret_long))
-                    if rc in API_SUCCESS_CODES:
-                        temp = _decode_long_as_temp(int(ret_long.value))
-                        if temp is not None:
-                            out["adc"] = temp
-                            out["diag"] = {"method": "AlazarGetParameter", "param": "ADC_TEMP", "value": temp, "status": "success"}
-                            return out
-                except Exception as e:
-                    pass  # Silently continue if this fails
-        except Exception:
-            pass  # Low-level API not available or failed
-
-    # Temperature reading not available
-    out["diag"] = {
-        "status": "unavailable",
-        "message": "Temperature reading not supported by this atsapi wrapper version. "
-                   "The ATS-9352 board has temperature sensors, but your Python wrapper "
-                   "does not expose getBoardTemperature(), getTemperature(), or AlazarGetParameter(). "
-                   "This is normal for some atsapi versions - temperature monitoring is optional."
-    }
-    
-    return out
 def channels_mask_to_str(mask: int) -> str:
     parts = []
     if mask & ats.CHANNEL_A:
@@ -2086,12 +1998,11 @@ def run_capture(cfg_path: Path) -> int:
                     )
                     if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
                         last_gui_emit_buf = buf_done
-                        try:
-                            temps = get_board_temperatures_c(board)
-                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
-                        except Exception:
-                            bt = None
-                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
+                        notifier.update(
+                            last_capture=time.strftime('%Y-%m-%d %H:%M:%S'),
+                            last_capture_unix=time.time(),
+                            buffers=buf_done,
+                        )
                         notifier.emit_now()
                 else:
                     notifier.update(
@@ -2099,12 +2010,11 @@ def run_capture(cfg_path: Path) -> int:
                     )
                     if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
                         last_gui_emit_buf = buf_done
-                        try:
-                            temps = get_board_temperatures_c(board)
-                            bt = temps.get('adc') if temps.get('adc') is not None else temps.get('fpga')
-                        except Exception:
-                            bt = None
-                        notifier.update(last_capture=time.strftime('%Y-%m-%d %H:%M:%S'), last_capture_unix=time.time(), buffers=buf_done, board_temp_c=bt, board_temp_diag=(temps.get('diag') if isinstance(temps, dict) else None))
+                        notifier.update(
+                            last_capture=time.strftime('%Y-%m-%d %H:%M:%S'),
+                            last_capture_unix=time.time(),
+                            buffers=buf_done,
+                        )
                         notifier.emit_now()
             except Exception:
                 pass
@@ -2139,16 +2049,6 @@ def run_capture(cfg_path: Path) -> int:
                 # status fields for GUI
                 last_capture_unix = time.time()
                 last_capture = time.strftime('%Y-%m-%d %H:%M:%S')
-                # board temperature (best-effort; may be unavailable depending on atsapi)
-                board_temp_c = None
-                try:
-                    # Some atsapi wrappers expose getBoardTemperature / getTemperature
-                    if hasattr(board, 'getBoardTemperature'):
-                        board_temp_c = float(board.getBoardTemperature())
-                    elif hasattr(board, 'getTemperature'):
-                        board_temp_c = float(board.getTemperature())
-                except Exception:
-                    board_temp_c = None
 
                 # latest waveform for GUI (downsampled). Uses last computed wfA_V/wfB_V if available.
                 latest_wf_A = None
@@ -2167,7 +2067,7 @@ def run_capture(cfg_path: Path) -> int:
                     latest_wf_B = None
 
                 notifier.update(state="running", time=time.strftime("%Y-%m-%d %H:%M:%S"),
-                               buffers=buf_done, records=global_rec, rate_hz=rate, last_capture=last_capture, last_capture_unix=last_capture_unix, board_temp_c=board_temp_c, latest_waveform_A=latest_wf_A, latest_waveform_B=latest_wf_B,
+                               buffers=buf_done, records=global_rec, rate_hz=rate, last_capture=last_capture, last_capture_unix=last_capture_unix, latest_waveform_A=latest_wf_A, latest_waveform_B=latest_wf_B,
                                reduced_rows=getattr(archive, "_n_reduced", 0),
                                snips=getattr(archive, "_n_snips", 0),
                                last_buffer_ago_s=(time.time_ns()-last_buffer_ns)/1e9)
@@ -3023,7 +2923,7 @@ class ArchiveBrowser(ttk.Frame):
 class LiveDashboard(ttk.Frame):
     """
     Dashboard optimized for capture monitoring:
-      - Top stats: rate, captures, started, last capture, mean peak, board temperature
+      - Top stats: rate, captures, started, last capture, mean peak
       - Plots: mean integral history + latest waveform
     Colors:
       - Channel A: integral RED, waveform BLUE
@@ -3080,7 +2980,6 @@ class LiveDashboard(ttk.Frame):
         self.lbl_started = mkrow("Started")
         self.lbl_last = mkrow("Last capture")
         self.lbl_peak = mkrow("Mean peak (V)")
-        self.lbl_temp = mkrow("Board temp (°C)")
 
         # --- plots ---
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
@@ -3505,9 +3404,6 @@ class LiveDashboard(ttk.Frame):
                 except Exception:
                     pass
 
-                bt = snap.get("board_temp_c", None)
-                self.lbl_temp.configure(text="—" if bt is None else f"{float(bt):.2f}")
-
                 self._open_ring_from_status(snap)
                 self._append_point(snap)
                 # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
@@ -3524,6 +3420,10 @@ class LiveDashboard(ttk.Frame):
                         return
                     vals = values.astype(np.float32, copy=False)
                     if scope_mode:
+                        # Scope mode shows a trigger-locked record; window points control
+                        # how much of that record is displayed from trigger time onward.
+                        if self._stream_window > 0 and vals.size > self._stream_window:
+                            vals = vals[: self._stream_window]
                         if is_b:
                             self._streamB = vals.copy()
                         else:
@@ -3687,6 +3587,11 @@ class LiveControlPanel(ttk.Frame):
         self.var_max_wf_tick = tk.IntVar(value=20)
         self.var_show_channel_b_live = tk.BooleanVar(value=False)
         self.var_preview_mode = tk.StringVar(value="archive_match")
+        self._math_var = tk.StringVar(value="")
+        self._harmonizing = False
+        self._spin_flush_records = None
+        self._spin_stream_pts = None
+        self._stream_edit_source = "points"
         self.var_trig_level_pct.trace_add("write", self._sync_trigger_level_code)
 
         # Layout
@@ -3705,13 +3610,13 @@ class LiveControlPanel(ttk.Frame):
         self._add_combobox(acq, 0, "Clock source", self.var_clock_source, ["INTERNAL_CLOCK", "EXTERNAL_CLOCK_10MHZ_REF"])
         self._add_combobox(acq, 1, "Rate (MS/s)", self.var_rate_msps, [str(v) for v in SAMPLE_RATE_OPTIONS_MSPS], width=12)
         self._add_combobox(acq, 2, "Channels", self.var_channels_mask, CHANNEL_MASK_OPTIONS, width=18)
-        self._add_entry(acq, 3, "Pre-trigger samples", self.var_pre)
-        self._add_entry(acq, 4, "Samples/record", self.var_samples_per_record)
-        self._add_entry(acq, 5, "Post-trigger samples", self.var_post)
-        self._add_entry(acq, 6, "Records/buffer", self.var_rpb)
-        self._add_entry(acq, 7, "Buffers allocated", self.var_bufN)
-        self._add_entry(acq, 8, "Buffers/acquisition (0=run)", self.var_bpa)
-        self._add_entry(acq, 9, "DMA wait timeout (ms)", self.var_wait_timeout_ms)
+        self._add_spinbox(acq, 3, "Pre-trigger samples", self.var_pre, from_=0, to=7_999_984, increment=16)
+        self._add_spinbox(acq, 4, "Samples/record", self.var_samples_per_record, from_=16, to=8_000_000, increment=16)
+        self._add_readonly_value(acq, 5, "Post-trigger samples", self.var_post)
+        self._add_spinbox(acq, 6, "Records/buffer", self.var_rpb, from_=1, to=100_000, increment=1)
+        self._add_spinbox(acq, 7, "Buffers allocated", self.var_bufN, from_=2, to=4096, increment=1)
+        self._add_spinbox(acq, 8, "Buffers/acquisition (0=run)", self.var_bpa, from_=0, to=2_000_000_000, increment=1)
+        self._add_spinbox(acq, 9, "DMA wait timeout (ms)", self.var_wait_timeout_ms, from_=10, to=120_000, increment=10)
 
         vert = ttk.LabelFrame(left, text="Vertical", padding=8)
         vert.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -3758,8 +3663,8 @@ class LiveControlPanel(ttk.Frame):
                 width=5,
             ).pack(side=tk.LEFT, padx=(4, 0))
 
-        self._add_entry(trig, 5, "Auto timeout (ms)", self.var_trig_timeout_ms)
-        self._add_entry(trig, 6, "Timeout pause (s)", self.var_timeout_pause_s)
+        self._add_spinbox(trig, 5, "Auto timeout (ms)", self.var_trig_timeout_ms, from_=0, to=2_147_483_647, increment=1)
+        self._add_spinbox(trig, 6, "Timeout pause (s)", self.var_timeout_pause_s, from_=0.0, to=3600.0, increment=0.1, width=10)
         self._add_combobox(trig, 7, "External range", self.var_ext_range, EXT_TRIGGER_RANGE_OPTIONS)
         self._add_combobox(trig, 8, "External coupling", self.var_ext_coupling, ["DC_COUPLING", "AC_COUPLING"])
         ttk.Checkbutton(trig, text="External start-capture", variable=self.var_ext_startcapture).grid(
@@ -3782,22 +3687,27 @@ class LiveControlPanel(ttk.Frame):
         ).grid(row=0, column=0, sticky="ew")
         ttk.Button(live_profile, text="Apply", command=self._apply_runtime_profile, width=7).grid(row=0, column=1, padx=(6, 0))
 
-        self._add_entry(live, 1, "Rearm if no trigger (s)", self.var_rearm_s)
-        self._add_entry(live, 2, "Rearm cooldown (s)", self.var_rearm_cooldown_s)
-        self._add_entry(live, 3, "Max rearms/hour", self.var_rearm_per_hour)
-        self._add_entry(live, 4, "Flush every records", self.var_flush_records)
-        self._add_entry(live, 5, "Flush every seconds", self.var_flush_seconds)
-        self._add_entry(live, 6, "SQLite commit every snips", self.var_sqlite_commit)
-        self._add_entry(live, 7, "Session rotate (hours)", self.var_rotate_hours)
-        self._add_entry(live, 8, "Ring slots", self.var_ring_slots)
-        self._add_entry(live, 9, "Ring points", self.var_ring_points)
-        self._add_entry(live, 10, "Live window points", self.var_stream_pts)
-        self._add_entry(live, 11, "Live window seconds", self.var_stream_s)
-        self._add_entry(live, 12, "Max waveforms/tick", self.var_max_wf_tick)
+        self._add_spinbox(live, 1, "Rearm if no trigger (s)", self.var_rearm_s, from_=0, to=86_400, increment=1)
+        self._add_spinbox(live, 2, "Rearm cooldown (s)", self.var_rearm_cooldown_s, from_=0, to=86_400, increment=1)
+        self._add_spinbox(live, 3, "Max rearms/hour", self.var_rearm_per_hour, from_=1, to=100_000, increment=1)
+        self._spin_flush_records = self._add_spinbox(
+            live, 4, "Flush every records", self.var_flush_records, from_=1, to=50_000_000, increment=128
+        )
+        self._add_spinbox(live, 5, "Flush every seconds", self.var_flush_seconds, from_=0.0, to=86_400.0, increment=0.1, width=10)
+        self._add_spinbox(live, 6, "SQLite commit every snips", self.var_sqlite_commit, from_=1, to=10_000_000, increment=128)
+        self._add_spinbox(live, 7, "Session rotate (hours)", self.var_rotate_hours, from_=0.0, to=720.0, increment=0.5, width=10)
+        self._add_spinbox(live, 8, "Ring slots", self.var_ring_slots, from_=16, to=1_000_000, increment=16)
+        self._add_spinbox(live, 9, "Ring points", self.var_ring_points, from_=32, to=16_384, increment=32)
+        self._spin_stream_pts = self._add_spinbox(
+            live, 10, "Live window points", self.var_stream_pts, from_=256, to=5_000_000, increment=512
+        )
+        self._add_spinbox(live, 11, "Live window seconds", self.var_stream_s, from_=0.25, to=120.0, increment=0.1, width=10)
+        self._add_spinbox(live, 12, "Max waveforms/tick", self.var_max_wf_tick, from_=1, to=2000, increment=1)
         ttk.Checkbutton(live, text="Show Channel B live waveform", variable=self.var_show_channel_b_live).grid(
             row=13, column=0, columnspan=2, sticky="w", pady=(4, 2)
         )
         self._add_combobox(live, 14, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
+        ttk.Label(live, textvariable=self._math_var).grid(row=15, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         disk = ttk.LabelFrame(right, text="Disk write status", padding=8)
         disk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -3810,11 +3720,44 @@ class LiveControlPanel(ttk.Frame):
         ttk.Button(tools, text="Save Controls To YAML", command=self.launcher._save_controls_to_yaml).pack(side=tk.LEFT)
         ttk.Button(tools, text="Reload Controls From YAML", command=self.launcher._load_controls_from_yaml).pack(side=tk.LEFT)
         ttk.Label(tools, textvariable=self._msg_var).pack(side=tk.LEFT, padx=(12, 0))
+        self._wire_harmonizers()
+        self._harmonize_controls()
         self._sync_trigger_level_code()
 
-    def _add_entry(self, parent: ttk.Widget, row: int, label: str, var: tk.Variable, width: int = 12) -> None:
+    def _add_spinbox(
+        self,
+        parent: ttk.Widget,
+        row: int,
+        label: str,
+        var: tk.Variable,
+        *,
+        from_: float,
+        to: float,
+        increment: float,
+        width: int = 12,
+    ):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
-        ttk.Entry(parent, textvariable=var, width=width).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
+        sb = tk.Spinbox(
+            parent,
+            from_=from_,
+            to=to,
+            increment=increment,
+            textvariable=var,
+            width=width,
+            bg="#3d3d3d",
+            fg="white",
+            insertbackground="white",
+            buttonbackground="#404040",
+            relief=tk.FLAT,
+        )
+        sb.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
+        sb.bind("<FocusOut>", lambda _e: self._harmonize_controls())
+        sb.bind("<Return>", lambda _e: self._harmonize_controls())
+        return sb
+
+    def _add_readonly_value(self, parent: ttk.Widget, row: int, label: str, var: tk.Variable) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
+        ttk.Label(parent, textvariable=var).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
 
     def _add_combobox(self, parent: ttk.Widget, row: int, label: str, var: tk.Variable, values: List[str], width: int = 14) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
@@ -3829,6 +3772,120 @@ class LiveControlPanel(ttk.Frame):
         pct = _clamp_float(self._safe_float(self.var_trig_level_pct, 50.0), 0.0, 100.0, 50.0)
         code = int(round(pct * 255.0 / 100.0))
         self._trig_level_code_var.set(f"code={code}")
+
+    def _round_up_to_step(self, value: int, step: int, min_value: int = 0) -> int:
+        st = max(1, int(step))
+        v = max(int(min_value), int(value))
+        return ((v + st - 1) // st) * st
+
+    def _round_nearest_step(self, value: int, step: int, min_value: int = 0) -> int:
+        st = max(1, int(step))
+        v = max(int(min_value), int(value))
+        return int(round(float(v) / float(st))) * st
+
+    def _wire_harmonizers(self) -> None:
+        self.var_pre.trace_add("write", self._on_harmonize_var)
+        self.var_samples_per_record.trace_add("write", self._on_harmonize_var)
+        self.var_rpb.trace_add("write", self._on_harmonize_var)
+        self.var_flush_records.trace_add("write", self._on_harmonize_var)
+        self.var_sqlite_commit.trace_add("write", self._on_harmonize_var)
+        self.var_ring_points.trace_add("write", self._on_harmonize_var)
+        self.var_rate_msps.trace_add("write", self._on_harmonize_var)
+        self.var_stream_pts.trace_add("write", self._on_stream_pts_change)
+        self.var_stream_s.trace_add("write", self._on_stream_seconds_change)
+
+    def _on_stream_pts_change(self, *_args) -> None:
+        if self._loading or self._harmonizing:
+            return
+        self._stream_edit_source = "points"
+        self._harmonize_controls()
+
+    def _on_stream_seconds_change(self, *_args) -> None:
+        if self._loading or self._harmonizing:
+            return
+        self._stream_edit_source = "seconds"
+        self._harmonize_controls()
+
+    def _on_harmonize_var(self, *_args) -> None:
+        self._harmonize_controls()
+
+    def _harmonize_controls(self) -> None:
+        if self._loading or self._harmonizing:
+            return
+        self._harmonizing = True
+        try:
+            max_spr = 8_000_000
+            pre = _clamp_int(self._safe_int(self.var_pre, 0), 0, max_spr - 16, 0)
+            pre = self._round_nearest_step(pre, 16, 0)
+
+            spr = _clamp_int(self._safe_int(self.var_samples_per_record, 256), 16, max_spr, 256)
+            spr = self._round_nearest_step(spr, 16, 16)
+            spr = max(spr, pre + 16)
+            if spr > max_spr:
+                spr = max_spr
+                pre = min(pre, spr - 16)
+
+            post = max(16, spr - pre)
+
+            rpb = _clamp_int(self._safe_int(self.var_rpb, 128), 1, 100_000, 128)
+            flush = _clamp_int(self._safe_int(self.var_flush_records, 20000), 1, 50_000_000, 20000)
+            flush = self._round_up_to_step(flush, rpb, rpb)
+            flush = min(flush, 50_000_000)
+
+            sqlite_commit = _clamp_int(self._safe_int(self.var_sqlite_commit, 200), 1, 10_000_000, 200)
+            sqlite_commit = self._round_up_to_step(sqlite_commit, rpb, rpb)
+            sqlite_commit = min(sqlite_commit, 10_000_000)
+
+            ring_points = _clamp_int(self._safe_int(self.var_ring_points, 512), 32, 16384, 512)
+            ring_points = self._round_nearest_step(ring_points, 32, 32)
+
+            stream_pts = _clamp_int(self._safe_int(self.var_stream_pts, 20000), 256, 5_000_000, 20000)
+            stream_s = _clamp_float(self._safe_float(self.var_stream_s, 2.0), 0.25, 120.0, 2.0)
+            sr_hz = max(1.0, self._safe_float(self.var_rate_msps, 250.0) * 1e6)
+            record_s = float(spr) / float(sr_hz)
+
+            if self._stream_edit_source == "seconds":
+                recs = max(1, int(round(stream_s / max(record_s, 1e-12))))
+                stream_pts = recs * ring_points
+            else:
+                stream_pts = self._round_up_to_step(stream_pts, ring_points, ring_points)
+
+            stream_pts = _clamp_int(stream_pts, 256, 5_000_000, max(256, ring_points))
+            stream_pts = self._round_up_to_step(stream_pts, ring_points, ring_points)
+            if stream_pts > 5_000_000:
+                stream_pts = max(ring_points, (5_000_000 // ring_points) * ring_points)
+            window_records = max(1, int(stream_pts // max(1, ring_points)))
+            stream_s = _clamp_float(window_records * record_s, 0.25, 120.0, 2.0)
+
+            self.var_pre.set(int(pre))
+            self.var_samples_per_record.set(int(spr))
+            self.var_post.set(int(post))
+            self.var_rpb.set(int(rpb))
+            self.var_flush_records.set(int(flush))
+            self.var_sqlite_commit.set(int(sqlite_commit))
+            self.var_ring_points.set(int(ring_points))
+            self.var_stream_pts.set(int(stream_pts))
+            self.var_stream_s.set(float(stream_s))
+
+            if self._spin_flush_records is not None:
+                try:
+                    self._spin_flush_records.configure(increment=max(1, int(rpb)))
+                except Exception:
+                    pass
+            if self._spin_stream_pts is not None:
+                try:
+                    self._spin_stream_pts.configure(increment=max(1, int(ring_points)))
+                except Exception:
+                    pass
+
+            record_us = record_s * 1e6
+            buffer_ms = record_s * float(rpb) * 1e3
+            self._math_var.set(
+                f"Math: post = samples - pre ({post}); flush/commit step = records_per_buffer ({rpb}); "
+                f"record={record_us:.3f} us, buffer={buffer_ms:.3f} ms, live window={stream_s:.3f} s."
+            )
+        finally:
+            self._harmonizing = False
 
     def _guess_runtime_profile(self) -> str:
         curr = dict(
@@ -3873,6 +3930,8 @@ class LiveControlPanel(ttk.Frame):
         self.var_stream_pts.set(int(preset["stream_window_points"]))
         self.var_stream_s.set(float(preset["stream_window_seconds"]))
         self.var_max_wf_tick.set(int(preset["max_waveforms_per_tick"]))
+        self._stream_edit_source = "points"
+        self._harmonize_controls()
         self._msg_var.set(f"Applied runtime profile: {name}.")
 
     def _var_text(self, var: tk.Variable, default: str = "") -> str:
@@ -3970,11 +4029,14 @@ class LiveControlPanel(ttk.Frame):
             self.var_preview_mode.set(str(live.get("preview_mode", "archive_match")))
             if not rt_profile_norm:
                 self.var_runtime_profile.set(self._guess_runtime_profile())
+            self._stream_edit_source = "points"
             self._msg_var.set("Controls loaded from YAML.")
         finally:
             self._loading = False
+        self._harmonize_controls()
 
     def apply_to_cfg(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        self._harmonize_controls()
         out = dict(cfg)
         clock = out.setdefault("clock", {}) or {}
         acq = out.setdefault("acquisition", {}) or {}
