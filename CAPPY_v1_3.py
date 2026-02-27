@@ -398,6 +398,31 @@ def _auto_time_axis(n: int, sample_rate_hz: float) -> Tuple[np.ndarray, str]:
         return t * 1e3, "ms"
     return t, "s"
 
+
+def _active_tail_index(y: np.ndarray) -> int:
+    """
+    Estimate the last meaningfully active sample index in a waveform.
+    Used only for display trimming of long flat tails.
+    """
+    arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(arr.size)
+    if n <= 8:
+        return max(0, n - 1)
+
+    tail_start = int(max(0, n * 0.8))
+    tail = arr[tail_start:] if tail_start < n else arr
+    baseline = float(np.median(tail))
+    dev = np.abs(arr - baseline)
+    mad = float(np.median(np.abs(tail - baseline)))
+    noise = 1.4826 * mad
+    amp = float(np.percentile(dev, 99)) if n > 0 else 0.0
+    thr = max(5.0 * noise, 0.02 * amp, 1e-6)
+    idx = np.flatnonzero(dev > thr)
+    if idx.size == 0:
+        return n - 1
+    pad = max(4, n // 100)
+    return min(n - 1, int(idx[-1]) + pad)
+
 def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
@@ -2117,6 +2142,7 @@ class ArchiveBrowser(ttk.Frame):
 
         self.var_dir = tk.StringVar(value=str(self.data_dir))
         self.var_baseline_subtract = tk.BooleanVar(value=False)
+        self.var_auto_trim_tail = tk.BooleanVar(value=True)
         
         pan = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
         pan.pack(fill=tk.BOTH, expand=True, pady=(8,0))
@@ -2209,6 +2235,12 @@ class ArchiveBrowser(ttk.Frame):
             variable=self.var_baseline_subtract,
             command=self._redraw_selected_snip,
         ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            plot_opts,
+            text="Auto trim flat tail",
+            variable=self.var_auto_trim_tail,
+            command=self._redraw_selected_snip,
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
         self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
@@ -2673,6 +2705,11 @@ class ArchiveBrowser(ttk.Frame):
             traceback.print_exc()
             return
 
+        channels_mask_text = str(r.get("channels_mask", "CHANNEL_A") or "CHANNEL_A")
+        row_has_b = bool(channels_from_mask_expr(channels_mask_text) & 0x2)
+        if not row_has_b:
+            wb = None
+
         sr = float(r.get("sample_rate_hz", np.nan))
         if not np.isfinite(sr) or sr <= 0:
             sr = 1.0
@@ -2685,6 +2722,10 @@ class ArchiveBrowser(ttk.Frame):
             baseline_A = float(np.mean(wa[:64]))
         if baseline_B == 0.0 and wb is not None and len(wb) >= 64:
             baseline_B = float(np.mean(wb[:64]))
+
+        # Integrals should represent signal charge/area, so always use baseline-subtracted waveforms.
+        wa_int = wa - baseline_A
+        wb_int = (wb - baseline_B) if wb is not None else None
 
         do_baseline_subtract = bool(self.var_baseline_subtract.get()) if hasattr(self, "var_baseline_subtract") else False
         wa_plot = (wa - baseline_A) if do_baseline_subtract else wa
@@ -2743,11 +2784,11 @@ class ArchiveBrowser(ttk.Frame):
 
         # Cumulative integral (V·s)
         dt = 1.0 / sr
-        intA = np.cumsum(np.asarray(wa_plot, dtype=np.float64)) * dt
+        intA = np.cumsum(np.asarray(wa_int, dtype=np.float64)) * dt
         self.axI.plot(tvec, intA, color=NEON_PINK, linewidth=1.5, label="∫A dt")
         self._hover_lines[self.axI] = (tvec, intA, "∫A (V·s)", NEON_PINK)
-        if wb_plot is not None:
-            intB = np.cumsum(np.asarray(wb_plot, dtype=np.float64)) * dt
+        if wb_int is not None:
+            intB = np.cumsum(np.asarray(wb_int, dtype=np.float64)) * dt
             self.axI.plot(tvec, intB, color=NEON_GREEN, linewidth=1.5, linestyle="--", label="∫B dt")
         self.axI.set_ylabel("Integral (V·s)", color='white')
         self.axI.set_xlabel(f"Time ({unit})", color='white')
@@ -2760,6 +2801,18 @@ class ArchiveBrowser(ttk.Frame):
         legend = self.axI.legend(loc="best")
         for text in legend.get_texts():
             text.set_color('white')
+
+        auto_trim_tail = bool(self.var_auto_trim_tail.get()) if hasattr(self, "var_auto_trim_tail") else False
+        if auto_trim_tail and len(tvec) > 8:
+            trim_idx = _active_tail_index(wa_int)
+            if wb_int is not None:
+                trim_idx = max(trim_idx, _active_tail_index(wb_int))
+            if trim_idx < (len(tvec) - 2):
+                right = float(tvec[max(1, trim_idx)])
+                left = float(tvec[0])
+                self.axA.set_xlim(left=left, right=right)
+                self.axB.set_xlim(left=left, right=right)
+                self.axI.set_xlim(left=left, right=right)
 
         self.canvas.draw()
 
@@ -2781,6 +2834,7 @@ class ArchiveBrowser(ttk.Frame):
             f"Buffer: {int(r.get('buffer_index',-1))}  Record: {int(r.get('record_in_buffer',-1))}  Global: {int(r.get('record_global',-1))}\n"
             f"Channels: {r.get('channels_mask','?')}  Sample rate: {sr:.6g} Hz\n"
             f"Display mode: {'baseline-subtracted' if do_baseline_subtract else 'raw volts'}\n"
+            f"Integral mode: baseline-subtracted cumulative\n"
             f"Area A: {float(r.get('area_A_Vs',0.0)):.6g} V·s   Peak A: {float(r.get('peak_A_V',0.0)):.6g} V\n"
             f"Area B: {float(r.get('area_B_Vs',0.0)):.6g} V·s   Peak B: {float(r.get('peak_B_V',0.0)):.6g} V\n"
             f"Baseline A: {baseline_A:.6g} V   Baseline B: {baseline_B:.6g} V\n"
@@ -2962,6 +3016,7 @@ class LiveDashboard(ttk.Frame):
         self._last_seen_seq: int = 0
         self._tick_after_id = None
         self._is_destroyed = False
+        self._auto_trim_scope_tail = True
 
         # --- top stats ---
         stats = ttk.Frame(self)
@@ -3191,10 +3246,25 @@ class LiveDashboard(ttk.Frame):
         self.ax_int.clear()
 
         # --- Channel A waveform (top) - Optimized rendering ---
+        live_cfg = snap.get("live", {}) if isinstance(snap.get("live", {}), dict) else {}
         sr_hz = _to_float(snap.get("sample_rate_hz", 0.0), 0.0)
-        dt_ms = (1e3 / sr_hz) if sr_hz > 0 else 1.0
+        spr = _to_int(snap.get("samples_per_record", 0), 0)
+        ring_pts = _to_int(live_cfg.get("ring_points", self._ring_npts or 1), self._ring_npts or 1)
+        downsample = 1.0
+        if spr > 0 and ring_pts > 0:
+            downsample = max(1.0, float(spr) / float(ring_pts))
+        dt_ms = ((1e3 / sr_hz) * downsample) if sr_hz > 0 else 1.0
         scope_mode = self._is_scope_mode(snap)
         x_label = "Time from trigger (ms)" if scope_mode else "Time from latest (ms)"
+        scope_right_ms = None
+        if scope_mode and self._auto_trim_scope_tail:
+            trim_idx = -1
+            if self._streamA.size > 8:
+                trim_idx = max(trim_idx, _active_tail_index(self._streamA))
+            if self._streamB.size > 8 and not np.all(np.isnan(self._streamB)):
+                trim_idx = max(trim_idx, _active_tail_index(self._streamB))
+            if trim_idx >= 0:
+                scope_right_ms = dt_ms * float(max(1, trim_idx))
 
         if self._streamA.size > 1:
             # Baseline-subtract: remove DC offset using rolling mean of the stream
@@ -3239,7 +3309,6 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle='-', linewidth=0.5)
 
         # --- Channel B waveform (middle) - Optimized rendering ---
-        live_cfg = snap.get("live", {}) if isinstance(snap.get("live", {}), dict) else {}
         show_channel_b = _to_bool(live_cfg.get("show_channel_b", False), False)
         has_b_channel = show_channel_b and bool(channels_from_mask_expr(str(snap.get("channels_mask", "CHANNEL_A"))) & 0x2)
         if has_b_channel and self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
@@ -3290,9 +3359,15 @@ class LiveDashboard(ttk.Frame):
         if scope_mode:
             try:
                 if self._streamA.size > 1:
-                    self.ax_wfA.set_xlim(left=0.0, right=dt_ms * float(max(1, self._streamA.size - 1)))
+                    right_a = dt_ms * float(max(1, self._streamA.size - 1))
+                    if scope_right_ms is not None:
+                        right_a = min(right_a, max(dt_ms, float(scope_right_ms)))
+                    self.ax_wfA.set_xlim(left=0.0, right=right_a)
                 if has_b_channel and self._streamB.size > 1:
-                    self.ax_wfB.set_xlim(left=0.0, right=dt_ms * float(max(1, self._streamB.size - 1)))
+                    right_b = dt_ms * float(max(1, self._streamB.size - 1))
+                    if scope_right_ms is not None:
+                        right_b = min(right_b, max(dt_ms, float(scope_right_ms)))
+                    self.ax_wfB.set_xlim(left=0.0, right=right_b)
             except Exception:
                 pass
         elif self._stream_window > 1:
@@ -4635,3 +4710,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
