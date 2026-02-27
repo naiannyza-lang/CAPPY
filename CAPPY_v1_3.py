@@ -353,6 +353,12 @@ def _auto_time_axis(n: int, sample_rate_hz: float) -> Tuple[np.ndarray, str]:
 def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
+def _ns_to_iso(ts_ns: int) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts_ns) / 1e9).strftime("%Y-%m-%d %H:%M:%S.%f")
+    except Exception:
+        return ""
+
 def ats_const(prefix_or_name: str, maybe_name: str | None = None) -> int:
     """Resolve atsapi constants with the same prefix-mapping style as your old script."""
     if not ATS_AVAILABLE or ats is None:
@@ -2101,6 +2107,7 @@ class ArchiveBrowser(ttk.Frame):
         self._snips_view = _lazy_pandas().DataFrame()
         self._sel_date = None
         self._sel_hour = None
+        self._session_summary = tk.StringVar(value="No sessions loaded")
         self._build()
         self._refresh()
 
@@ -2119,11 +2126,33 @@ class ArchiveBrowser(ttk.Frame):
         self._right = right
         pan.add(left, weight=1)
         pan.add(right, weight=2)
+        left.rowconfigure(6, weight=1)
+        left.columnconfigure(0, weight=1)
 
         ttk.Label(left, text="Sessions").pack(anchor="w")
-        self.slist = tk.Listbox(left)
-        self.slist.pack(fill=tk.BOTH, expand=True)
-        self.slist.bind("<<ListboxSelect>>", self._on_session)
+        sframe = ttk.Frame(left)
+        sframe.pack(fill=tk.BOTH, expand=True)
+        self.slist = ttk.Treeview(
+            sframe,
+            columns=("started", "session_id", "snips"),
+            show="headings",
+            height=12,
+            selectmode="browse",
+        )
+        self.slist.heading("started", text="Started")
+        self.slist.heading("session_id", text="Session")
+        self.slist.heading("snips", text="Snips")
+        self.slist.column("started", width=140, anchor="w")
+        self.slist.column("session_id", width=140, anchor="w")
+        self.slist.column("snips", width=64, anchor="e")
+        sscroll = ttk.Scrollbar(sframe, orient=tk.VERTICAL, command=self.slist.yview)
+        self.slist.configure(yscrollcommand=sscroll.set)
+        self.slist.grid(row=0, column=0, sticky="nsew")
+        sscroll.grid(row=0, column=1, sticky="ns")
+        sframe.columnconfigure(0, weight=1)
+        sframe.rowconfigure(0, weight=1)
+        self.slist.bind("<<TreeviewSelect>>", self._on_session)
+        ttk.Label(left, textvariable=self._session_summary).pack(anchor="w", pady=(4, 0))
         ttk.Label(left, text="Date").pack(anchor="w", pady=(8,0))
         self.var_date = tk.StringVar(value="")
         self.cmb_date = ttk.Combobox(left, textvariable=self.var_date, state="readonly", width=18)
@@ -2146,9 +2175,32 @@ class ArchiveBrowser(ttk.Frame):
         self.hlist.bind("<MouseWheel>", self._on_hour_wheel)
 
         ttk.Label(left, text="Waveform snippets").pack(anchor="w", pady=(8,0))
-        self.wlist = tk.Listbox(left, exportselection=False)
-        self.wlist.pack(fill=tk.BOTH, expand=True)
-        self.wlist.bind("<<ListboxSelect>>", self._on_snip)
+        wframe = ttk.Frame(left)
+        wframe.pack(fill=tk.BOTH, expand=True)
+        self.wlist = ttk.Treeview(
+            wframe,
+            columns=("time", "id", "buf", "rec", "global"),
+            show="headings",
+            height=14,
+            selectmode="browse",
+        )
+        self.wlist.heading("time", text="Timestamp")
+        self.wlist.heading("id", text="ID")
+        self.wlist.heading("buf", text="Buf")
+        self.wlist.heading("rec", text="Rec")
+        self.wlist.heading("global", text="Global")
+        self.wlist.column("time", width=125, anchor="w")
+        self.wlist.column("id", width=52, anchor="e")
+        self.wlist.column("buf", width=52, anchor="e")
+        self.wlist.column("rec", width=52, anchor="e")
+        self.wlist.column("global", width=72, anchor="e")
+        wscroll = ttk.Scrollbar(wframe, orient=tk.VERTICAL, command=self.wlist.yview)
+        self.wlist.configure(yscrollcommand=wscroll.set)
+        self.wlist.grid(row=0, column=0, sticky="nsew")
+        wscroll.grid(row=0, column=1, sticky="ns")
+        wframe.columnconfigure(0, weight=1)
+        wframe.rowconfigure(0, weight=1)
+        self.wlist.bind("<<TreeviewSelect>>", self._on_snip)
 
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
         self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
@@ -2186,6 +2238,10 @@ class ArchiveBrowser(ttk.Frame):
                                anchor='w', padx=6, pady=2)
         readout_lbl.pack(fill=tk.X)
 
+        self.meta = tk.Text(self._right, height=10, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
+        self.meta.pack(fill=tk.X, pady=(8,0))
+        self.meta.configure(state=tk.DISABLED)
+
         # Hover state
         self._hover_annots = {}
         self._hover_lines = {}
@@ -2206,9 +2262,9 @@ class ArchiveBrowser(ttk.Frame):
         except Exception:
             pass
 
-        self.meta = tk.Text(self._right, height=11, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
-        self.meta.pack(fill=tk.X, pady=(8,0))
-        self.meta.configure(state=tk.DISABLED)
+    def _clear_tree(self, tree: ttk.Treeview) -> None:
+        for iid in tree.get_children():
+            tree.delete(iid)
 
     def _pick_dir(self):
         p = filedialog.askdirectory(title="Select data directory")
@@ -2269,17 +2325,27 @@ class ArchiveBrowser(ttk.Frame):
             messagebox.showerror("Error", str(ex))
             self.sessions = _lazy_pandas().DataFrame()
 
-        self.slist.delete(0, tk.END)
-        self.wlist.delete(0, tk.END)
+        self._clear_tree(self.slist)
+        self._clear_tree(self.wlist)
 
         if self.sessions.empty:
-            self.slist.insert(tk.END, "(no sessions)")
+            self._session_summary.set("No sessions found")
+            self.slist.insert("", tk.END, values=("-", "(no sessions)", "-"))
             return
 
         self._sessions_view = getattr(self, '_sessions_view', self.sessions).reset_index(drop=True)
-        for _, r in self._sessions_view.iterrows():
+        total_snips = 0
+        for i, r in self._sessions_view.iterrows():
             t0 = datetime.fromtimestamp(int(r["first_timestamp_ns"]) / 1e9, tz=self._tz)
-            self.slist.insert(tk.END, f"{t0.strftime('%Y-%m-%d %H:%M:%S')}  {r['session_id']}  snips={int(r['waveform_snips'])}")
+            snips = int(r.get("waveform_snips", 0))
+            total_snips += snips
+            self.slist.insert(
+                "",
+                tk.END,
+                iid=f"session_{i}",
+                values=(t0.strftime("%Y-%m-%d %H:%M:%S"), str(r["session_id"]), snips),
+            )
+        self._session_summary.set(f"Sessions: {len(self._sessions_view):,}   Total snips: {total_snips:,}")
 
         # If a session is already selected and snips are loaded, re-apply snip filter.
         if getattr(self, 'snips', _lazy_pandas().DataFrame()).empty is False:
@@ -2288,11 +2354,16 @@ class ArchiveBrowser(ttk.Frame):
     def _sel_sid(self) -> Optional[str]:
         if self.sessions.empty:
             return None
-        sel = self.slist.curselection()
+        sel = self.slist.selection()
         if not sel:
             return None
-        view = getattr(self, '_sessions_view', self.sessions)
-        return str(view.iloc[sel[0]]["session_id"]).strip()
+        vals = self.slist.item(sel[0], "values")
+        if not vals or len(vals) < 2:
+            return None
+        sid = str(vals[1]).strip()
+        if sid.startswith("("):
+            return None
+        return sid
 
 
     def _build_hour_index(self):
@@ -2354,10 +2425,10 @@ class ArchiveBrowser(ttk.Frame):
 
     def _apply_hour_filter(self):
         """Render wlist using selected date/hour."""
-        self.wlist.delete(0, tk.END)
+        self._clear_tree(self.wlist)
         self._snips_view = _lazy_pandas().DataFrame()
         if self.snips is None or self.snips.empty:
-            self.wlist.insert(tk.END, "(no saved waveforms)")
+            self.wlist.insert("", tk.END, values=("(no saved waveforms)", "-", "-", "-", "-"))
             return
         df = self.snips
         if "_date" in df.columns and self._sel_date is not None:
@@ -2368,7 +2439,7 @@ class ArchiveBrowser(ttk.Frame):
         self._snips_view = df.sort_values("timestamp_ns", ascending=False)
 
         if self._snips_view.empty:
-            self.wlist.insert(tk.END, "(no saved waveforms in this hour)")
+            self.wlist.insert("", tk.END, values=("(no waveforms in selected hour)", "-", "-", "-", "-"))
             return
 
         for _, r in self._snips_view.iterrows():
@@ -2376,7 +2447,13 @@ class ArchiveBrowser(ttk.Frame):
             ts = datetime.fromtimestamp(ts_ns_val / 1e9, tz=self._tz)
             # Show full microsecond precision: HH:MM:SS.uuuuuu
             us_str = ts.strftime('%H:%M:%S') + f".{ts_ns_val % 1_000_000_000 // 1000:06d}"
-            self.wlist.insert(tk.END, f"{us_str}  id={int(r['id'])}  buf={int(r['buffer_index'])}  rec={int(r['record_in_buffer'])}  g={int(r['record_global'])}")
+            sid = int(r["id"])
+            self.wlist.insert(
+                "",
+                tk.END,
+                iid=f"snip_{sid}",
+                values=(us_str, sid, int(r["buffer_index"]), int(r["record_in_buffer"]), int(r["record_global"])),
+            )
 
     def _on_date(self, _=None):
         if self.snips is None or self.snips.empty:
@@ -2448,9 +2525,14 @@ class ArchiveBrowser(ttk.Frame):
         except Exception:
             # fallback: brute force
             pos = 0
-        self.wlist.selection_clear(0, tk.END)
-        self.wlist.selection_set(pos)
-        self.wlist.see(pos)
+        items = self.wlist.get_children()
+        if not items:
+            return
+        pos = max(0, min(len(items) - 1, int(pos)))
+        target = items[pos]
+        self.wlist.selection_set(target)
+        self.wlist.focus(target)
+        self.wlist.see(target)
         # trigger display
         try:
             self._on_snip()
@@ -2539,9 +2621,9 @@ class ArchiveBrowser(ttk.Frame):
             self._snip_db_dir = ddir
             break
 
-        self.wlist.delete(0, tk.END)
+        self._clear_tree(self.wlist)
         if self.snips.empty:
-            self.wlist.insert(tk.END, "(no saved waveforms)")
+            self.wlist.insert("", tk.END, values=("(no saved waveforms)", "-", "-", "-", "-"))
             return
         # Populate hour list and apply hour filter
         self._populate_hours()
@@ -2551,19 +2633,14 @@ class ArchiveBrowser(ttk.Frame):
     def _on_snip(self, _=None):
         if self.snips.empty or self._snip_db_dir is None:
             return
-        sel = self.wlist.curselection()
+        sel = self.wlist.selection()
         if not sel:
             return
-        # listbox entry format: "HH:MM:SS  id=123  buf=..."
         try:
-            txt = str(self.wlist.get(sel[0]))
-            # Extract the id value from "id=123"
-            for part in txt.split():
-                if part.startswith("id="):
-                    snip_id = int(part.split("=")[1])
-                    break
-            else:
+            vals = self.wlist.item(sel[0], "values")
+            if not vals or len(vals) < 2:
                 return
+            snip_id = int(vals[1])
         except Exception:
             return
 
@@ -2839,9 +2916,10 @@ class LiveDashboard(ttk.Frame):
       - Channel A: integral RED, waveform BLUE
       - Channel B (if enabled): PINK (dashed)
     """
-    def __init__(self, master, data_dir_var: tk.StringVar):
+    def __init__(self, master, data_dir_var: tk.StringVar, on_status=None):
         super().__init__(master, padding=6)
         self.data_dir_var = data_dir_var
+        self._on_status = on_status
         self.status_path: Optional[Path] = None
         self.ring_path: Optional[Path] = None
         self._ring_npts = 1024
@@ -2862,8 +2940,6 @@ class LiveDashboard(ttk.Frame):
         # rolling stream buffers for true scrolling (concatenate each buffer waveform)
         self._streamA = np.empty((0,), dtype=np.float32)
         self._streamB = np.empty((0,), dtype=np.float32)
-        self._streamAT = np.empty((0,), dtype=np.float64)
-        self._streamBT = np.empty((0,), dtype=np.float64)
         self._stream_window = 20000  # points shown in scrolling mode
         self._stream_window_s = 2.0  # seconds shown in scrolling mode
         self._latest_ring_unix: Optional[float] = None
@@ -2984,8 +3060,6 @@ class LiveDashboard(ttk.Frame):
             self._wfB_hist.clear()
             self._streamA = np.empty((0,), dtype=np.float32)
             self._streamB = np.empty((0,), dtype=np.float32)
-            self._streamAT = np.empty((0,), dtype=np.float64)
-            self._streamBT = np.empty((0,), dtype=np.float64)
             self._latest_ring_unix = None
 
     def _read_ring_next(self):
@@ -3053,18 +3127,17 @@ class LiveDashboard(ttk.Frame):
         self.ax_int.clear()
 
         # --- Channel A waveform (top) - Optimized rendering ---
+        sr_hz = _to_float(snap.get("sample_rate_hz", 0.0), 0.0)
+        dt_ms = (1e3 / sr_hz) if sr_hz > 0 else 1.0
+
         if self._streamA.size > 1:
             # Baseline-subtract: remove DC offset using rolling mean of the stream
             stream_a = self._streamA.copy()
             bl_a = np.mean(stream_a)
             stream_a = stream_a - bl_a
 
-            if self._streamAT.size == stream_a.size and self._streamAT.size > 1:
-                x_full = (self._streamAT - self._streamAT[-1]) * 1e3
-                x_label = "Time from latest (ms)"
-            else:
-                x_full = np.arange(stream_a.size, dtype=np.float64)
-                x_label = "Rolling samples"
+            x_full = (np.arange(stream_a.size, dtype=np.float64) - (stream_a.size - 1)) * dt_ms
+            x_label = "Time from latest (ms)"
 
             # Use downsampled view if stream is very large for better performance
             if stream_a.size > 50000:
@@ -3104,12 +3177,8 @@ class LiveDashboard(ttk.Frame):
             bl_b = np.mean(stream_b)
             stream_b = stream_b - bl_b
 
-            if self._streamBT.size == stream_b.size and self._streamBT.size > 1:
-                xb_full = (self._streamBT - self._streamBT[-1]) * 1e3
-                xb_label = "Time from latest (ms)"
-            else:
-                xb_full = np.arange(stream_b.size, dtype=np.float64)
-                xb_label = "Rolling samples"
+            xb_full = (np.arange(stream_b.size, dtype=np.float64) - (stream_b.size - 1)) * dt_ms
+            xb_label = "Time from latest (ms)"
 
             # Use downsampled view if stream is very large
             if stream_b.size > 50000:
@@ -3140,12 +3209,12 @@ class LiveDashboard(ttk.Frame):
             self.ax_wfB.spines['right'].set_visible(False)
             self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle='-', linewidth=0.5)
 
-        if self._stream_window_s > 0:
-            w_ms = float(self._stream_window_s) * 1e3
+        if self._stream_window > 1:
+            w_ms = dt_ms * float(max(1, self._stream_window - 1))
             try:
-                if self._streamAT.size == self._streamA.size and self._streamA.size > 1:
+                if self._streamA.size > 1:
                     self.ax_wfA.set_xlim(left=-w_ms, right=0.0)
-                if self._streamBT.size == self._streamB.size and self._streamB.size > 1:
+                if self._streamB.size > 1:
                     self.ax_wfB.set_xlim(left=-w_ms, right=0.0)
             except Exception:
                 pass
@@ -3201,6 +3270,11 @@ class LiveDashboard(ttk.Frame):
     def _tick(self):
         snap = self._read_status()
         if snap:
+            if callable(self._on_status):
+                try:
+                    self._on_status(snap)
+                except Exception:
+                    pass
             # stats
             try:
                 self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
@@ -3243,45 +3317,18 @@ class LiveDashboard(ttk.Frame):
                 max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
             except Exception:
                 max_wf = 20
-            sr_hz = _to_float(snap.get("sample_rate_hz", 0.0), 0.0)
-            spr = _to_int(snap.get("samples_per_record", 0), 0)
-            est_record_s = (float(spr) / float(sr_hz)) if (sr_hz > 0 and spr > 0) else 0.0
 
-            def _append_stream(values: np.ndarray, t_unix: float, is_b: bool) -> None:
+            def _append_stream(values: np.ndarray, is_b: bool) -> None:
                 if values is None or values.size == 0:
                     return
-                n = int(values.size)
-                if est_record_s > 0:
-                    t0 = float(t_unix) - est_record_s
-                    tvec = np.linspace(t0, float(t_unix), num=n, endpoint=False, dtype=np.float64)
-                else:
-                    dt = 1.0 / float(sr_hz) if sr_hz > 0 else 1e-6
-                    t0 = float(t_unix) - (n * dt)
-                    tvec = t0 + (np.arange(n, dtype=np.float64) * dt)
                 if is_b:
                     self._streamB = np.concatenate([self._streamB, values.astype(np.float32, copy=False)])
-                    self._streamBT = np.concatenate([self._streamBT, tvec])
-                    if self._stream_window_s > 0 and self._streamBT.size:
-                        cut = self._streamBT[-1] - float(self._stream_window_s)
-                        i0 = int(np.searchsorted(self._streamBT, cut, side="left"))
-                        if i0 > 0:
-                            self._streamBT = self._streamBT[i0:]
-                            self._streamB = self._streamB[i0:]
                     if self._streamB.size > self._stream_window:
                         self._streamB = self._streamB[-self._stream_window:]
-                        self._streamBT = self._streamBT[-self._stream_window:]
                 else:
                     self._streamA = np.concatenate([self._streamA, values.astype(np.float32, copy=False)])
-                    self._streamAT = np.concatenate([self._streamAT, tvec])
-                    if self._stream_window_s > 0 and self._streamAT.size:
-                        cut = self._streamAT[-1] - float(self._stream_window_s)
-                        i0 = int(np.searchsorted(self._streamAT, cut, side="left"))
-                        if i0 > 0:
-                            self._streamAT = self._streamAT[i0:]
-                            self._streamA = self._streamA[i0:]
                     if self._streamA.size > self._stream_window:
                         self._streamA = self._streamA[-self._stream_window:]
-                        self._streamAT = self._streamAT[-self._stream_window:]
 
             for _ in range(max_wf):
                 wfA, wfB, wf_t_unix, _chmask, _seq = self._read_ring_next()
@@ -3291,12 +3338,12 @@ class LiveDashboard(ttk.Frame):
                     self._latest_ring_unix = float(wf_t_unix)
                 if wfA is not None:
                     try:
-                        _append_stream(wfA, float(wf_t_unix or time.time()), is_b=False)
+                        _append_stream(wfA, is_b=False)
                     except Exception:
                         pass
                 if wfB is not None:
                     try:
-                        _append_stream(wfB, float(wf_t_unix or time.time()), is_b=True)
+                        _append_stream(wfB, is_b=True)
                     except Exception:
                         pass
             self._redraw(snap)
@@ -3308,7 +3355,8 @@ class LiveDashboard(ttk.Frame):
                 except Exception:
                     latest_ring = str(self._latest_ring_unix)
             self._set_meta(
-                f"State: {snap.get('state','?')}    Last ring wf: {latest_ring}    Status: {self.status_path}"
+                f"State: {snap.get('state','?')}    Last ring wf: {latest_ring}    "
+                f"Points A/B: {self._streamA.size}/{self._streamB.size} (window={self._stream_window})    Status: {self.status_path}"
             )
         # Schedule periodic UI updates
         if hasattr(self, "_tick"):
@@ -3368,6 +3416,9 @@ class LiveControlPanel(ttk.Frame):
         self.launcher = launcher
         self._loading = False
         self._msg_var = tk.StringVar(value="")
+        self._out_var = launcher._live_out_dir if hasattr(launcher, "_live_out_dir") else tk.StringVar(value="Output: -")
+        self._written_var = launcher._live_written if hasattr(launcher, "_live_written") else tk.StringVar(value="Written: -")
+        self._flush_var = launcher._live_last_flush if hasattr(launcher, "_live_last_flush") else tk.StringVar(value="Last update: -")
 
         # Vars (GUI <-> YAML)
         self.var_clock_source = tk.StringVar(value="INTERNAL_CLOCK")
@@ -3484,8 +3535,14 @@ class LiveControlPanel(ttk.Frame):
         self._add_entry(live, 11, "Max waveforms/tick", self.var_max_wf_tick)
         self._add_combobox(live, 12, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
 
+        disk = ttk.LabelFrame(right, text="Disk write status", padding=8)
+        disk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(disk, textvariable=self._out_var).pack(anchor="w")
+        ttk.Label(disk, textvariable=self._written_var).pack(anchor="w", pady=(2, 0))
+        ttk.Label(disk, textvariable=self._flush_var).pack(anchor="w", pady=(2, 0))
+
         tools = ttk.Frame(self, padding=(8, 0))
-        tools.grid(row=1, column=0, columnspan=2, sticky="ew")
+        tools.grid(row=2, column=0, columnspan=2, sticky="ew")
         ttk.Button(tools, text="Reload Controls From YAML", command=self.launcher._load_controls_from_yaml).pack(side=tk.LEFT)
         ttk.Label(tools, textvariable=self._msg_var).pack(side=tk.LEFT, padx=(12, 0))
 
@@ -3672,11 +3729,25 @@ class LauncherGUI(tk.Tk):
         style.configure('TLabel', background='#2d2d2d', foreground='white')
         style.configure('TButton', background='#404040', foreground='white', borderwidth=1)
         style.map('TButton', background=[('active', '#505050')])
+        style.configure('TLabelframe', background='#2d2d2d', foreground='white')
+        style.configure('TLabelframe.Label', background='#2d2d2d', foreground='white')
+        style.configure('TCheckbutton', background='#2d2d2d', foreground='white')
+        style.map('TCheckbutton', background=[('active', '#2d2d2d')], foreground=[('active', 'white')])
         style.configure('TNotebook', background='#2d2d2d', borderwidth=0)
         style.configure('TNotebook.Tab', background='#404040', foreground='white', padding=[20, 10])
         style.map('TNotebook.Tab', background=[('selected', '#505050')])
         style.configure('TEntry', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white', borderwidth=1)
         style.configure('TCombobox', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white')
+        style.map(
+            'TCombobox',
+            fieldbackground=[('readonly', '#3d3d3d')],
+            foreground=[('readonly', 'white')],
+            selectforeground=[('readonly', 'white')],
+            selectbackground=[('readonly', '#3d3d3d')],
+        )
+        style.configure('Treeview', background='#262626', fieldbackground='#262626', foreground='white', borderwidth=0, rowheight=22)
+        style.configure('Treeview.Heading', background='#3a3a3a', foreground='white')
+        style.map('Treeview', background=[('selected', '#505050')], foreground=[('selected', 'white')])
 
         self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
         self.var_data_dir = tk.StringVar(value="dataFile")
@@ -3715,20 +3786,31 @@ class LauncherGUI(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="State: idle")
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
-        # Tabs (Overview + Log)
-        tabs = ttk.Notebook(self)
-        tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        # Overview/log on left, always-visible controls on right
+        content = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        left = ttk.Frame(content)
+        right = ttk.Frame(content)
+        content.add(left, weight=3)
+        content.add(right, weight=2)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
 
-        self.dashboard = LiveDashboard(tabs, self.var_data_dir)
+        tabs = ttk.Notebook(left)
+        tabs.grid(row=0, column=0, sticky="nsew")
+
+        self.dashboard = LiveDashboard(tabs, self.var_data_dir, on_status=self._on_status_snapshot)
         tabs.add(self.dashboard, text="Overview")
-
-        self.live_panel = LiveControlPanel(tabs, self)
-        tabs.add(self.live_panel, text="Control")
 
         logbox = ttk.Frame(tabs, padding=6)
         tabs.add(logbox, text="Log")
         self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9))
         self.log.pack(fill=tk.BOTH, expand=True)
+
+        self.live_panel = LiveControlPanel(right, self)
+        self.live_panel.grid(row=0, column=0, sticky="nsew")
 
         self._load_controls_from_yaml()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -3756,7 +3838,7 @@ class LauncherGUI(tk.Tk):
                 self._live_written.set(f"Written: {w.get('bytes',0)} bytes, {w.get('records',0)} records, {w.get('samples',0)} samples")
                 ts = evt.get("ts_iso") or ""
                 if not ts and isinstance(evt.get("ts_ns"), int):
-                    ts = ns_to_iso(int(evt["ts_ns"]))
+                    ts = _ns_to_iso(int(evt["ts_ns"]))
                 self._live_last_flush.set(f"Last flush: {ts or '-'}")
                 out_dir = evt.get("out_dir") or "-"
                 self._live_out_dir.set(f"Output: {out_dir}")
@@ -3765,6 +3847,29 @@ class LauncherGUI(tk.Tk):
                         self.live_panel.update_from_event(evt)
                 except Exception:
                     pass
+
+    def _on_status_snapshot(self, snap: dict):
+        try:
+            data_dir = str(snap.get("data_dir", self.var_data_dir.get()) or self.var_data_dir.get())
+            sid = str(snap.get("session_id", "") or "")
+            if sid:
+                self._live_out_dir.set(f"Output: {data_dir}/captures (session {sid})")
+            else:
+                self._live_out_dir.set(f"Output: {data_dir}/captures")
+        except Exception:
+            pass
+        try:
+            reduced = int(snap.get("reduced_rows", 0))
+            snips = int(snap.get("snips", 0))
+            self._live_written.set(f"Written: reduced_rows={reduced:,}   snips={snips:,}")
+        except Exception:
+            pass
+        try:
+            ts = str(snap.get("last_capture", snap.get("time", "")) or "")
+            state = str(snap.get("state", "?") or "?")
+            self._live_last_flush.set(f"Last update: {ts or '-'}   state={state}")
+        except Exception:
+            pass
 
     def _load_controls_from_yaml(self):
         cfg_path = Path(self.var_config.get()).expanduser()
