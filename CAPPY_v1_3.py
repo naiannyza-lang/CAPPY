@@ -133,7 +133,6 @@ trigger:
   timeout_ms: 0                   # 0 = wait forever (unless runtime.noise_test=true)
 
   external_startcapture: false
-  timeout_pause_s: 0
 
 timing:
   bunch_spacing_samples: 424      # adjust to your bunch spacing
@@ -168,8 +167,6 @@ storage:
   session_rotate_hours: 24
   flush_every_records: 20000
   flush_every_seconds: 2
-  flush_every_samples: 2000000
-  durable_fsync: false
   sqlite_commit_every_snips: 200
 
 notify:
@@ -802,33 +799,6 @@ class WaveBinSqliteStore:
             self.conn.commit()
             self._rows_since_commit = 0
 
-
-    def flush_raw_and_index(self, durable: bool = False) -> None:
-        """Flush raw .bin files and commit sqlite index together."""
-        try:
-            if self._fhA is not None:
-                self._fhA.flush()
-                if durable:
-                    os.fsync(self._fhA.fileno())
-        except Exception:
-            pass
-        try:
-            if self._fhB is not None:
-                self._fhB.flush()
-                if durable:
-                    os.fsync(self._fhB.fileno())
-        except Exception:
-            pass
-        try:
-            self.conn.commit()
-        except Exception:
-            pass
-        if durable:
-            try:
-                os.fsync(open(self.db_path, "rb").fileno())
-            except Exception:
-                pass
-
     def close_bin(self):
         for fh_name in ("_fhA", "_fhB"):
             fh = getattr(self, fh_name, None)
@@ -947,8 +917,7 @@ def load_waveforms_from_row(row: _lazy_pandas().Series, day_dir: Path) -> Tuple[
 class CappyArchive:
 
     def __init__(self, data_dir: Path, rollover_minutes: int, flush_every_records: int,
-                 session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0,
-                 flush_every_samples: int = 0, durable_fsync: bool = False):
+                 session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0):
         self.data_dir = data_dir
         _ensure_dir(self.data_dir)
         self.captures = data_dir / "captures"
@@ -956,12 +925,6 @@ class CappyArchive:
         self.rollover_minutes = int(rollover_minutes)
         self.flush_every_records = int(flush_every_records)
         self.flush_every_seconds = float(flush_every_seconds or 0.0)
-        self.flush_every_samples = int(flush_every_samples or 0)
-        self.durable_fsync = bool(durable_fsync)
-        self._samples_since_flush = 0
-        self._did_flush = False
-        self._last_flush_reason = ""
-        self._last_flush_ts = 0
         self._last_flush_unix = 0.0
         self.session_rotate_hours = float(session_rotate_hours or 0.0)
         self.sqlite_commit_every_snips = int(sqlite_commit_every_snips)
@@ -1017,22 +980,13 @@ class CappyArchive:
             return
         self._reduced_buf.extend(rows)
         self._touch(ts)
-        # Track samples for flush_every_samples
-        try:
-            self._samples_since_flush += sum(int(r.get('samples_per_record', 0)) for r in rows)
-        except Exception:
-            pass
         now = time.time()
         if self.flush_every_seconds > 0 and (now - self._last_flush_unix) >= self.flush_every_seconds:
             self._last_flush_unix = now
-            self.flush_all(ts, reason='time')
-            return
-        # Sample-count flush (archive-first)
-        if self.flush_every_samples > 0 and self._samples_since_flush >= self.flush_every_samples:
-            self.flush_all(ts, reason='samples')
+            self.flush_reduced(ts)
             return
         if len(self._reduced_buf) >= self.flush_every_records:
-            self.flush_all(ts, reason='records')
+            self.flush_reduced(ts)
 
     def flush_reduced(self, ts: int) -> None:
         if not self._reduced_buf:
@@ -1040,37 +994,6 @@ class CappyArchive:
         assert self.reduced_writer is not None
         self._n_reduced += self.reduced_writer.write_rows(self._reduced_buf, ts)
         self._reduced_buf.clear()
-
-
-    def flush_all(self, ts: int, reason: str) -> None:
-        """Flush reduced rows AND commit/flush waveform store (raw+sqlite) together."""
-        # reduced
-        self.flush_reduced(ts)
-        # waveform raw+sqlite
-        try:
-            if self.wave_store is not None:
-                self.wave_store.flush_raw_and_index(durable=self.durable_fsync)
-        except Exception:
-            pass
-        # reset sample counter on any flush boundary
-        self._samples_since_flush = 0
-        self._did_flush = True
-        self._last_flush_reason = str(reason or "")
-        self._last_flush_ts = int(ts)
-
-    def pop_flush_event(self) -> Optional[Dict[str, Any]]:
-        """Return a flush event (and clear the flag) for GUI/live publishing."""
-        if not self._did_flush:
-            return None
-        self._did_flush = False
-        return {
-            "reason": self._last_flush_reason,
-            "timestamp_ns": int(self._last_flush_ts or 0),
-            "reduced_rows": int(self._n_reduced),
-            "snips": int(self._n_snips),
-            "session_id": str(self.session_id),
-            "day_dir": str(self.day_dir) if self.day_dir else "",
-        }
 
     def append_snip(self, **kw) -> None:
         assert self.wave_store is not None
@@ -1081,7 +1004,7 @@ class CappyArchive:
         if not self.day_dir:
             return
         ts = self._last_ts or time.time_ns()
-        self.flush_all(ts, reason='final')
+        self.flush_reduced(ts)
         if self.reduced_writer:
             self.reduced_writer.close()
         if self.wave_store:
@@ -1587,8 +1510,6 @@ def run_capture(cfg_path: Path) -> int:
         session_rotate_hours=float(storage.get("session_rotate_hours", 0) or 0),
         sqlite_commit_every_snips=int(storage.get("sqlite_commit_every_snips", 2000)),
         flush_every_seconds=float(storage.get("flush_every_seconds", 10.0) or 0.0),
-        flush_every_samples=int(storage.get("flush_every_samples", 0) or 0),
-        durable_fsync=bool(storage.get("durable_fsync", False)),
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
@@ -1598,8 +1519,6 @@ def run_capture(cfg_path: Path) -> int:
     ring_npts = int(live_cfg.get('ring_points', 512))
     ring_path = Path(str(storage.get('data_dir', 'dataFile'))) / 'status' / 'live_waveforms.ring'
     ring = LiveRingWriter(ring_path, nslots=ring_nslots, npts=ring_npts)
-    _last_live = None  # last downsampled waveform; published only on flush
-
 
     notifier.update(session_id=sid, state='running', started=time.strftime('%Y-%m-%d %H:%M:%S'), started_unix=time.time(), data_dir=str(storage.get('data_dir','dataFile')), channels_mask=ch_expr, sample_rate_hz=sr_hz, samples_per_record=spr, records_per_buffer=rpb, vpp_A=vppA, vpp_B=vppB, live_ring_path=str(ring_path))
     notifier.maybe_emit()
@@ -1671,10 +1590,6 @@ def run_capture(cfg_path: Path) -> int:
                 if "ApiWaitTimeout" in str(ex):
                     timeout_count += 1
                     ago_s = (time.time_ns() - last_buffer_ns) / 1e9
-                    timeout_pause_s = float((cfg.get('trigger', {}) or {}).get('timeout_pause_s', 0) or 0)
-                    if timeout_pause_s > 0 and ago_s >= timeout_pause_s:
-                        print(f"[CAPPY] PAUSE (trigger timeout): no completed buffers for {ago_s:.1f}s")
-                        break
                     notifier.update(state="waiting_for_trigger", time=time.strftime("%Y-%m-%d %H:%M:%S"),
                                    timeouts=timeout_count, last_buffer_ago_s=ago_s,
                                    buffers=buf_done, records=global_rec,
@@ -3058,6 +2973,87 @@ class _ProcLogPump:
         return out
 
 
+
+class LiveControlPanel(ttk.Frame):
+    """
+    Live control panel: shows what has been WRITTEN TO DISK (from flush events),
+    and plots the latest committed preview. Updates ONLY at flush boundaries.
+    """
+    def __init__(self, master, launcher, **kwargs):
+        super().__init__(master, **kwargs)
+        self.launcher = launcher  # LauncherGUI instance (for shared vars)
+
+        # Layout
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
+        left = ttk.Frame(self, padding=10)
+        left.grid(row=0, column=0, sticky="nsw")
+        right = ttk.Frame(self, padding=10)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        # Status / written-to-disk
+        ttk.Label(left, text="Recorder (Written to disk)").grid(row=0, column=0, sticky="w", pady=(0,6))
+        ttk.Label(left, textvariable=launcher._live_written).grid(row=1, column=0, sticky="w")
+        ttk.Label(left, textvariable=launcher._live_last_flush).grid(row=2, column=0, sticky="w")
+        ttk.Label(left, textvariable=launcher._live_out_dir).grid(row=3, column=0, sticky="w", pady=(0,10))
+
+        # Flush controls (used when building run config)
+        frm = ttk.LabelFrame(left, text="Flush Policy", padding=8)
+        frm.grid(row=4, column=0, sticky="ew", pady=(0,10))
+        ttk.Label(frm, text="Flush every N samples").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=launcher.var_flush_samples, width=12).grid(row=0, column=1, sticky="e", padx=(8,0))
+        ttk.Label(frm, text="Timeout pause (s)").grid(row=1, column=0, sticky="w", pady=(6,0))
+        ttk.Entry(frm, textvariable=launcher.var_timeout_pause_s, width=12).grid(row=1, column=1, sticky="e", padx=(8,0), pady=(6,0))
+        ttk.Checkbutton(frm, text="Durable fsync (slower)", variable=launcher.var_durable_fsync).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8,0))
+
+        # Plot (latest committed preview)
+        self._mpl_ready = False
+        self.fig = None
+        self.ax = None
+        self.lineA = None
+        self.lineB = None
+        self.canvas = None
+
+        self._init_plot(right)
+
+    def _init_plot(self, parent):
+        matplotlib, plt, FigureCanvasTkAgg = _lazy_mpl()
+        from matplotlib.figure import Figure
+        self.fig = Figure(figsize=(7.5, 5.2), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Live (committed preview @ flush)")
+        self.ax.set_xlabel("t (s)")
+        self.ax.set_ylabel("V")
+        self.lineA, = self.ax.plot([], [], label="A")
+        self.lineB, = self.ax.plot([], [], label="B", linestyle="--")
+        self.ax.legend(loc="upper right")
+        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._mpl_ready = True
+
+    def update_from_event(self, evt: dict):
+        if not self._mpl_ready:
+            return
+        prev = evt.get("preview") or {}
+        if not prev or not prev.get("ok", False):
+            return
+        xs = prev.get("xs", [])
+        a = prev.get("a", [])
+        b = prev.get("b", [])
+        # Convert ADC counts to volts if provided; otherwise plot counts.
+        # Here we plot raw preview arrays as-is. Your existing pipeline can be wired later.
+        self.lineA.set_data(xs, a if a else [])
+        self.lineB.set_data(xs, b if b else [])
+        self.ax.relim()
+        self.ax.autoscale_view()
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+
 class LauncherGUI(tk.Tk):
     """Simple launcher: Start Capture / Browse Archive / Open YAML."""
     def __init__(self, script_path: Path):
@@ -3085,6 +3081,15 @@ class LauncherGUI(tk.Tk):
         self.var_data_dir = tk.StringVar(value="dataFile")
 
         self.var_trigger = tk.StringVar(value="External")
+
+        # Live/Recorder controls (used to build run YAML)
+        self.var_flush_samples = tk.IntVar(value=2000000)
+        self.var_timeout_pause_s = tk.DoubleVar(value=0.0)
+        self.var_durable_fsync = tk.BooleanVar(value=False)
+        # Live written-to-disk status (updated from flush events)
+        self._live_out_dir = tk.StringVar(value="Output: -")
+        self._live_written = tk.StringVar(value="Written: -")
+        self._live_last_flush = tk.StringVar(value="Last flush: -")
 
         # Auto-create default config so you never need to run `init` in a terminal.
         cfgp = Path(self.var_config.get())
@@ -3127,6 +3132,9 @@ class LauncherGUI(tk.Tk):
         self.dashboard = LiveDashboard(tabs, self.var_data_dir)
         tabs.add(self.dashboard, text="Overview")
 
+        self.live_panel = LiveControlPanel(tabs, self)
+        tabs.add(self.live_panel, text="Live")
+
         logbox = ttk.Frame(tabs, padding=6)
         tabs.add(logbox, text="Log")
         self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9))
@@ -3140,6 +3148,32 @@ class LauncherGUI(tk.Tk):
         self.log.insert(tk.END, s + "\n")
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
+
+
+    def _handle_line(self, ln: str):
+        # Flush events emitted by patched capture: "CAPPY_EVENT {json}"
+        if not ln:
+            return
+        ln = ln.strip()
+        if ln.startswith("CAPPY_EVENT "):
+            try:
+                evt = json.loads(ln[len("CAPPY_EVENT "):])
+            except Exception:
+                return
+            if isinstance(evt, dict) and evt.get("type") == "flush":
+                w = evt.get("written") or {}
+                self._live_written.set(f"Written: {w.get('bytes',0)} bytes, {w.get('records',0)} records, {w.get('samples',0)} samples")
+                ts = evt.get("ts_iso") or ""
+                if not ts and isinstance(evt.get("ts_ns"), int):
+                    ts = ns_to_iso(int(evt["ts_ns"]))
+                self._live_last_flush.set(f"Last flush: {ts or '-'}")
+                out_dir = evt.get("out_dir") or "-"
+                self._live_out_dir.set(f"Output: {out_dir}")
+                try:
+                    if hasattr(self, "live_panel") and self.live_panel is not None:
+                        self.live_panel.update_from_event(evt)
+                except Exception:
+                    pass
 
     def _pick_yaml(self):
         p = filedialog.askopenfilename(title="Select YAML", filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")])
@@ -3220,6 +3254,39 @@ class LauncherGUI(tk.Tk):
                 count=1
             )
 
+
+        # Ensure storage.flush_every_samples and storage.durable_fsync and trigger.timeout_pause_s are set
+        flush_samples = int(self.var_flush_samples.get() or 0)
+        timeout_pause_s = float(self.var_timeout_pause_s.get() or 0.0)
+        durable = bool(self.var_durable_fsync.get())
+
+        def _ensure_block(key: str, text: str) -> str:
+            import re
+            if re.search(rf"(?m)^\s*{re.escape(key)}\s*:\s*$", text) is None:
+                text = text.rstrip() + f"\n\n{key}:\n"
+            return text
+
+        import re
+        cfg_text = _ensure_block("storage", cfg_text)
+        # set flush_every_samples
+        if re.search(r"(?m)^\s*flush_every_samples\s*:", cfg_text):
+            cfg_text = re.sub(r"(?m)^(\s*flush_every_samples\s*:)\s*.*$", r"\1 " + str(flush_samples), cfg_text)
+        else:
+            cfg_text = re.sub(r"(?ms)^storage\s*:\s*\n", lambda m: m.group(0) + f"  flush_every_samples: {flush_samples}\n", cfg_text, count=1)
+
+        # set durable_fsync
+        if re.search(r"(?m)^\s*durable_fsync\s*:", cfg_text):
+            cfg_text = re.sub(r"(?m)^(\s*durable_fsync\s*:)\s*.*$", r"\1 " + ("true" if durable else "false"), cfg_text)
+        else:
+            cfg_text = re.sub(r"(?ms)^storage\s*:\s*\n", lambda m: m.group(0) + f"  durable_fsync: " + ("true" if durable else "false") + "\n", cfg_text, count=1)
+
+        cfg_text = _ensure_block("trigger", cfg_text)
+        # set timeout_pause_s
+        if re.search(r"(?m)^\s*timeout_pause_s\s*:", cfg_text):
+            cfg_text = re.sub(r"(?m)^(\s*timeout_pause_s\s*:)\s*.*$", r"\1 " + str(timeout_pause_s), cfg_text)
+        else:
+            cfg_text = re.sub(r"(?ms)^trigger\s*:\s*\n", lambda m: m.group(0) + f"  timeout_pause_s: {timeout_pause_s}\n", cfg_text, count=1)
+
         try:
             _atomic_write_text(run_cfg_path, cfg_text)
             self._append(f"[CAPPY] Run config: {run_cfg_path} (trigger={trig_const})")
@@ -3298,6 +3365,7 @@ class LauncherGUI(tk.Tk):
         if self.pump is not None:
             for ln in self.pump.drain(max_lines=400):
                 self._append(ln)
+                self._handle_line(ln)
 
         if self.proc is not None:
             rc = self.proc.poll()
@@ -3306,6 +3374,7 @@ class LauncherGUI(tk.Tk):
                     if self.pump is not None:
                         for ln in self.pump.drain(max_lines=10000):
                             self._append(ln)
+                            self._handle_line(ln)
                         self.pump.stop()
                 except Exception:
                     pass
