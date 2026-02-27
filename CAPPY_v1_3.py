@@ -14,6 +14,7 @@ import os
 import smtplib
 import subprocess
 import shutil
+import math
 from email.message import EmailMessage
 
 STOP_REQUESTED = False
@@ -141,10 +142,11 @@ acquisition:
   channels_mask: CHANNEL_A|CHANNEL_B
   pre_trigger_samples: 0
   post_trigger_samples: 256       # full record = pre + post
-  records_per_buffer: 128
-  buffers_allocated: 16
+  records_per_buffer: 1024
+  buffers_allocated: 8
   buffers_per_acquisition: 0      # 0 = run forever (until stop)
   wait_timeout_ms: 1000           # DMA wait timeout; timeouts are handled (no crash)
+  min_dma_buffer_bytes: 4194304   # target DMA buffer size (bytes). ATS-SDK recommends 1–8 MB.
 
 integration:
   baseline_window_samples: [0, 64]
@@ -1493,6 +1495,19 @@ def run_capture(cfg_path: Path) -> int:
     sample_type = ctypes.c_uint8 if bytesPerSample == 1 else ctypes.c_uint16
     bytesPerBuffer = bytesPerSample * spr * rpb * ch_count
 
+    # --- DMA buffer sizing guard ---
+    # Very small DMA buffers (e.g., 128 KB) are prone to ApiBufferOverflow at high sample rates.
+    # ATS-SDK guidance for AutoDMA is typically 1–8 MB per buffer; we default to 4 MB.
+    min_dma_bytes = int((acq.get("min_dma_buffer_bytes", 4 * 1024 * 1024)) or 0)
+    if min_dma_bytes > 0 and bytesPerBuffer < min_dma_bytes:
+        denom = max(1, bytesPerSample * spr * ch_count)
+        rpb_new = int(math.ceil(min_dma_bytes / denom))
+        # keep records_per_buffer a multiple of 16 for slightly better alignment/throughput
+        rpb_new = int(math.ceil(rpb_new / 16.0) * 16)
+        print(f"[CAPPY] Increasing records_per_buffer {rpb} -> {rpb_new} to reach ~{min_dma_bytes/1e6:.1f} MB DMA buffers")
+        rpb = rpb_new
+        bytesPerBuffer = bytesPerSample * spr * rpb * ch_count
+
     buffers = [ats.DMABuffer(board.handle, sample_type, bytesPerBuffer) for _ in range(bufN)]
     board.setRecordSize(pre, post)
 
@@ -2459,8 +2474,8 @@ class ArchiveBrowser(ttk.Frame):
 
         abs_ns = self._hover_ts_ns + int(t_sec * 1e9)
         abs_dt = datetime.fromtimestamp(abs_ns / 1e9, tz=self._tz)
-        us_part = abs_ns % 1_000_000_000 // 1000
-        ts_str = abs_dt.strftime('%H:%M:%S') + f".{us_part:06d}"
+        ns_part = abs_ns % 1_000_000_000
+        ts_str = abs_dt.strftime('%Y-%m-%d %H:%M:%S') + f".{ns_part:09d}"
 
         # Build annotation text: timestamp + voltage right at cursor
         annot_text = f"{ts_str}\n{v_val:.6g} V"
