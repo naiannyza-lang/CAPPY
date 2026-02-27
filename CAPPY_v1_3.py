@@ -2966,6 +2966,8 @@ class LauncherGUI(tk.Tk):
         self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
         self.var_data_dir = tk.StringVar(value="dataFile")
 
+        self.var_trigger = tk.StringVar(value="External")
+
         # Auto-create default config so you never need to run `init` in a terminal.
         cfgp = Path(self.var_config.get())
         if not cfgp.exists():
@@ -2983,6 +2985,10 @@ class LauncherGUI(tk.Tk):
 
         ttk.Label(top, text="Data dir:").pack(side=tk.LEFT, padx=(16,4))
         ttk.Entry(top, textvariable=self.var_data_dir, width=24).pack(side=tk.LEFT)
+
+        ttk.Label(top, text="Trigger:").pack(side=tk.LEFT, padx=(16,4))
+        cb = ttk.Combobox(top, textvariable=self.var_trigger, values=["External", "Channel A"], width=12, state="readonly")
+        cb.pack(side=tk.LEFT)
 
         ttk.Button(top, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
         ttk.Button(top, text="Browse Archive", command=self._browse).pack(side=tk.LEFT)
@@ -3057,6 +3063,7 @@ class LauncherGUI(tk.Tk):
 
     def _start(self):
         import subprocess
+        import re
         if self.proc is not None:
             return
         cfg_path = Path(self.var_config.get()).expanduser()
@@ -3064,14 +3071,52 @@ class LauncherGUI(tk.Tk):
             messagebox.showerror("Missing", f"Config not found:{cfg_path}")
             return
 
-        # Clear Python bytecode cache to avoid stale imports and reduce startup churn
+        # Build a run-time config (do not overwrite the user's YAML)
+        run_cfg_path = cfg_path.with_suffix(cfg_path.suffix + ".run.yaml")
+        try:
+            cfg_text = cfg_path.read_text()
+        except Exception as ex:
+            messagebox.showerror("CAPPY", f"Failed to read config:\n{cfg_path}\n{ex}")
+            return
+
+        trig_choice = (self.var_trigger.get() or "External").strip()
+        trig_const = "TRIG_EXTERNAL" if trig_choice.lower().startswith("external") else "TRIG_CHAN_A"
+
+        # Ensure trigger.sourceJ is set
+        if re.search(r"(?m)^\s*trigger\s*:\s*$", cfg_text) is None:
+            cfg_text = cfg_text.rstrip() + "\n\ntrigger:\n  sourceJ: " + trig_const + "\n"
+        else:
+            # Replace (or insert) sourceJ inside the trigger block
+            def _set_sourcej(match):
+                block = match.group(0)
+                if re.search(r"(?m)^\s*sourceJ\s*:", block):
+                    block = re.sub(r"(?m)^(\s*sourceJ\s*:)\s*.*$", r"\1 " + trig_const, block)
+                else:
+                    block = block.rstrip() + "\n  sourceJ: " + trig_const + "\n"
+                return block
+
+            cfg_text = re.sub(
+                r"(?ms)^trigger\s*:\s*\n(?:[ \t].*\n?)*",
+                _set_sourcej,
+                cfg_text,
+                count=1
+            )
+
+        try:
+            _atomic_write_text(run_cfg_path, cfg_text)
+            self._append(f"[CAPPY] Run config: {run_cfg_path} (trigger={trig_const})")
+        except Exception as ex:
+            messagebox.showerror("CAPPY", f"Failed to write run config:\n{run_cfg_path}\n{ex}")
+            return
+
+        # Clear Python bytecode cache to avoid stale imports and reduce startup churn to avoid stale imports and reduce startup churn
         try:
             removed = clear_pycache(self.script_path.parent)
             self._append(f"[CAPPY] Cleared pycache (removed ~{removed} items)")
         except Exception:
             pass
 
-        cmd = [sys.executable, str(self.script_path), "capture", "--config", str(cfg_path)]
+        cmd = [sys.executable, str(self.script_path), "capture", "--config", str(run_cfg_path)]
         self._append("RUN: " + " ".join(cmd))
 
         try:
