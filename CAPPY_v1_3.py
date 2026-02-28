@@ -137,6 +137,8 @@ RUNTIME_PROFILE_PRESETS = {
     },
 }
 RUNTIME_PROFILE_OPTIONS = list(RUNTIME_PROFILE_PRESETS.keys()) + ["Custom"]
+LIVE_UI_FPS_MAX = 30.0
+LIVE_MAX_CATCHUP_WAVEFORMS_PER_TICK = 64
 
 
 def _to_int(v: Any, default: int) -> int:
@@ -314,6 +316,7 @@ live:
   stream_window_points: 20000
   stream_window_seconds: 2.0
   max_waveforms_per_tick: 20
+  ui_fps: 10
   show_channel_b: false
   preview_mode: archive_match
 """
@@ -474,6 +477,16 @@ def _dir_size_bytes(root: Path) -> int:
             except Exception:
                 pass
     return int(total)
+
+
+def _preferred_data_dir(local_name: str) -> str:
+    try:
+        data_root = Path("/Data")
+        if data_root.exists() and data_root.is_dir() and os.access(str(data_root), os.W_OK):
+            return str(data_root / local_name)
+    except Exception:
+        pass
+    return local_name
 
 def ats_const(prefix_or_name: str, maybe_name: str | None = None) -> int:
     """Resolve atsapi constants with the same prefix-mapping style as your old script."""
@@ -1457,6 +1470,7 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     live["stream_window_points"] = _clamp_int(live.get("stream_window_points", 20000), 256, 5_000_000, 20000)
     live["stream_window_seconds"] = _clamp_float(live.get("stream_window_seconds", 2.0), 0.25, 120.0, 2.0)
     live["max_waveforms_per_tick"] = _clamp_int(live.get("max_waveforms_per_tick", 20), 1, 2000, 20)
+    live["ui_fps"] = _clamp_float(live.get("ui_fps", 10.0), 1.0, LIVE_UI_FPS_MAX, 10.0)
     live["show_channel_b"] = _to_bool(live.get("show_channel_b", False), False)
     mode = str(live.get("preview_mode", "archive_match")).strip().lower()
     if mode not in {"archive_match", "record0"}:
@@ -1876,6 +1890,7 @@ def run_capture(cfg_path: Path) -> int:
             stream_window_points=int(live_cfg.get('stream_window_points', 20000)),
             stream_window_seconds=float(live_cfg.get('stream_window_seconds', 2.0)),
             max_waveforms_per_tick=int(live_cfg.get('max_waveforms_per_tick', 20)),
+            ui_fps=float(live_cfg.get('ui_fps', 10.0)),
             show_channel_b=bool(show_channel_b_live),
             preview_mode=str(live_cfg.get('preview_mode', 'archive_match')),
         ),
@@ -3106,7 +3121,10 @@ class LiveDashboard(ttk.Frame):
         self._is_destroyed = False
         self._redraw_in_progress = False
         self._auto_trim_scope_tail = True
-        self._tick_ms = 50
+        self._ui_fps = 10.0
+        self._min_redraw_interval_s = 1.0 / self._ui_fps
+        self._next_redraw_monotonic = 0.0
+        self._last_plot_cfg = None
 
         # --- top stats ---
         stats = ttk.Frame(self)
@@ -3168,7 +3186,8 @@ class LiveDashboard(ttk.Frame):
         try:
             if not bool(self.winfo_exists()):
                 return
-            self._tick_after_id = self.after(self._tick_ms, self._tick)
+            tick_ms = max(16, int(round(1000.0 / max(1.0, float(self._ui_fps)))))
+            self._tick_after_id = self.after(tick_ms, self._tick)
         except Exception:
             self._tick_after_id = None
 
@@ -3207,16 +3226,16 @@ class LiveDashboard(ttk.Frame):
         src = str(snap.get("trigger_source", "") or "").strip().upper()
         return src in {"TRIG_EXTERNAL", "TRIG_CHAN_A", "TRIG_CHAN_B"}
 
-    def _append_point(self, snap: dict):
+    def _append_point(self, snap: dict) -> bool:
         seq = snap.get("status_seq", None)
         if seq is None:
-            return
+            return False
         try:
             seq = int(seq)
         except Exception:
-            return
+            return False
         if seq <= self._last_seen_seq:
-            return
+            return False
         self._last_seen_seq = seq
 
         su = snap.get("started_unix", None)
@@ -3232,7 +3251,7 @@ class LiveDashboard(ttk.Frame):
             except Exception:
                 pass
         if self._started_unix is None or tu is None:
-            return
+            return False
 
         t = float(tu) - float(self._started_unix)
         self.t.append(t)
@@ -3241,6 +3260,7 @@ class LiveDashboard(ttk.Frame):
 
         while self.t and (self.t[-1] - self.t[0]) > 600.0:
             self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
+        return True
 
 
     def _open_ring_from_status(self, snap: dict):
@@ -3263,23 +3283,24 @@ class LiveDashboard(ttk.Frame):
             self._streamB = np.empty((0,), dtype=np.float32)
             self._latest_ring_unix = None
 
-    def _read_ring_next(self):
+    def _read_ring_batch(self, max_items: int) -> List[Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[int], Optional[int]]]:
         """
-        Read the next available waveform record from the live ring.
-        Returns (wfA, wfB, t_unix, chmask, seq) or all-None if nothing new.
+        Read up to max_items records from the live ring in one file open.
+        This avoids repeated open/close overhead in the UI loop.
         """
-        if self.ring_path is None:
-            return None, None, None, None, None
+        out: List[Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[int], Optional[int]]] = []
+        if self.ring_path is None or max_items <= 0:
+            return out
 
         try:
             import struct
             with open(self.ring_path, "rb", buffering=0) as f:
                 hdr = f.read(32)
                 if len(hdr) != 32:
-                    return None, None, None, None, None
-                magic, ver, nslots, npts, _rsv, write_seq = struct.unpack("<8sIIIIQ", hdr)
+                    return out
+                magic, _ver, nslots, npts, _rsv, write_seq = struct.unpack("<8sIIIIQ", hdr)
                 if magic != LiveRingWriter.MAGIC:
-                    return None, None, None, None, None
+                    return out
                 self._ring_nslots = int(nslots)
                 self._ring_npts = int(npts)
                 rec_bytes = (8 + 8 + 8 + 4 + 4) + (self._ring_npts * 4) + (self._ring_npts * 4)
@@ -3300,30 +3321,32 @@ class LiveDashboard(ttk.Frame):
                     self._ring_play_seq = max(1, self._ring_last_seq - 50)
 
                 if self._ring_play_seq >= self._ring_last_seq:
-                    return None, None, None, None, None
+                    return out
 
-                # read next record
-                self._ring_play_seq += 1
-                seq = self._ring_play_seq
-                slot = (seq - 1) % self._ring_nslots
-                off = self._ring_hdr_bytes + slot * rec_bytes
-                f.seek(off)
-                rec_hdr = f.read(8 + 8 + 8 + 4 + 4)
-                if len(rec_hdr) != (8 + 8 + 8 + 4 + 4):
-                    return None, None, None, None, None
-                r_seq, t_unix, buf_idx, chmask, _r = struct.unpack("<QdQII", rec_hdr)
-                if int(r_seq) != int(seq):
-                    # slot not yet written / overwritten; jump to last
-                    self._ring_play_seq = self._ring_last_seq
-                    return None, None, None, None, None
+                n_to_read = min(int(max_items), int(self._ring_last_seq - self._ring_play_seq))
+                for _ in range(max(0, n_to_read)):
+                    seq = self._ring_play_seq + 1
+                    slot = (seq - 1) % self._ring_nslots
+                    off = self._ring_hdr_bytes + slot * rec_bytes
+                    f.seek(off)
+                    rec_hdr = f.read(8 + 8 + 8 + 4 + 4)
+                    if len(rec_hdr) != (8 + 8 + 8 + 4 + 4):
+                        break
+                    r_seq, t_unix, _buf_idx, chmask, _r = struct.unpack("<QdQII", rec_hdr)
+                    if int(r_seq) != int(seq):
+                        # slot not yet written / overwritten; jump to current head
+                        self._ring_play_seq = self._ring_last_seq
+                        break
 
-                wfA = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
-                wfB = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
-                if (chmask & 2) == 0:
-                    wfB = None
-                return wfA, wfB, float(t_unix), int(chmask), int(seq)
+                    wfA = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
+                    wfB = np.frombuffer(f.read(self._ring_npts * 4), dtype=np.float32).copy()
+                    if (chmask & 2) == 0:
+                        wfB = None
+                    out.append((wfA, wfB, float(t_unix), int(chmask), int(seq)))
+                    self._ring_play_seq = seq
         except Exception:
-            return None, None, None, None, None
+            return out
+        return out
 
     def _redraw(self, snap: dict):
         """
@@ -3373,7 +3396,7 @@ class LiveDashboard(ttk.Frame):
                 else:
                     x_view = x_full
                     y_view = stream_a
-                self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=True)
+                self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=False)
             else:
                 self.ax_wfA.set_title("Channel A: waiting for waveforms…", color="white")
             self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
@@ -3401,7 +3424,7 @@ class LiveDashboard(ttk.Frame):
                 else:
                     xb_view = xb_full
                     yb_view = stream_b
-                self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=True)
+                self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=False)
             else:
                 if not show_channel_b:
                     self.ax_wfB.set_title("Channel B: display disabled", color="white")
@@ -3452,9 +3475,9 @@ class LiveDashboard(ttk.Frame):
                     t_view = self.t
                     areaA_view = self.areaA
                     areaB_view = self.areaB
-                self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=True)
+                self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=False)
                 if has_b_channel and areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
-                    self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=True)
+                    self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=False)
                 legend = self.ax_int.legend(loc="best")
                 for text in legend.get_texts():
                     text.set_color("white")
@@ -3522,24 +3545,38 @@ class LiveDashboard(ttk.Frame):
                         self._stream_window = int(live_cfg.get('stream_window_points', self._stream_window))
                     if 'stream_window_seconds' in live_cfg:
                         self._stream_window_s = float(live_cfg.get('stream_window_seconds', self._stream_window_s))
+                    if 'ui_fps' in live_cfg:
+                        fps = _clamp_float(live_cfg.get('ui_fps', self._ui_fps), 1.0, LIVE_UI_FPS_MAX, self._ui_fps)
+                        self._ui_fps = float(fps)
+                        self._min_redraw_interval_s = 1.0 / self._ui_fps
                 except Exception:
                     pass
 
                 self._open_ring_from_status(snap)
-                self._append_point(snap)
-                # Drain multiple waveforms per UI tick so you can see EVERY buffer even if UI refresh is slower.
+                status_changed = self._append_point(snap)
+                # Drain a bounded number of waveforms per UI tick to avoid CPU spikes.
                 try:
                     max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
                 except Exception:
                     max_wf = 20
-                max_wf = max(1, int(max_wf))
+                max_wf = min(max(1, int(max_wf)), LIVE_MAX_CATCHUP_WAVEFORMS_PER_TICK)
                 # If capture outpaces UI, drain more records for this tick so plots catch up.
                 backlog = max(0, int(self._ring_last_seq) - int(self._ring_play_seq))
                 if backlog > (2 * max_wf):
-                    max_wf = min(max_wf * 8, 1000)
+                    max_wf = min(max_wf * 2, LIVE_MAX_CATCHUP_WAVEFORMS_PER_TICK)
                 channels_mask_text = str(snap.get("channels_mask", "CHANNEL_A") or "CHANNEL_A")
                 status_has_b = show_channel_b and bool(channels_from_mask_expr(channels_mask_text) & 0x2)
                 scope_mode = self._is_scope_mode(snap)
+                plot_cfg = (
+                    bool(scope_mode),
+                    bool(status_has_b),
+                    str(channels_mask_text),
+                    int(self._stream_window),
+                    float(self._stream_window_s),
+                    int(self._ring_npts),
+                )
+                cfg_changed = plot_cfg != self._last_plot_cfg
+                self._last_plot_cfg = plot_cfg
 
                 def _append_stream(values: np.ndarray, is_b: bool) -> None:
                     if values is None or values.size == 0:
@@ -3566,10 +3603,10 @@ class LiveDashboard(ttk.Frame):
 
                 saw_ring_record = False
                 saw_b_record = False
-                for _ in range(max_wf):
-                    wfA, wfB, wf_t_unix, _chmask, _seq = self._read_ring_next()
+                ring_records = self._read_ring_batch(max_wf)
+                for wfA, wfB, wf_t_unix, _chmask, _seq in ring_records:
                     if wfA is None and wfB is None:
-                        break
+                        continue
                     saw_ring_record = True
                     if wf_t_unix is not None:
                         self._latest_ring_unix = float(wf_t_unix)
@@ -3586,13 +3623,19 @@ class LiveDashboard(ttk.Frame):
                             pass
 
                 # Prevent stale Channel B traces when capture switches to A-only.
+                b_cleared = False
                 if not status_has_b:
                     if self._streamB.size:
                         self._streamB = np.empty((0,), dtype=np.float32)
+                        b_cleared = True
                 elif saw_ring_record and (not saw_b_record):
                     self._streamB = np.empty((0,), dtype=np.float32)
+                    b_cleared = True
 
-                self._redraw(snap)
+                now_mono = time.monotonic()
+                if now_mono >= self._next_redraw_monotonic and (saw_ring_record or status_changed or cfg_changed or b_cleared):
+                    self._redraw(snap)
+                    self._next_redraw_monotonic = now_mono + self._min_redraw_interval_s
 
                 latest_ring = "-"
                 if self._latest_ring_unix is not None:
@@ -4321,6 +4364,7 @@ class LauncherGUI(tk.Tk):
     def __init__(self, script_path: Path):
         super().__init__()
         self.script_path = script_path
+        self._state_path = self.script_path.parent / ".cappy_v1_3_gui_state.json"
         self.proc = None
         self.pump = None
         self._kill_after_id = None
@@ -4357,7 +4401,7 @@ class LauncherGUI(tk.Tk):
         style.map('Treeview', background=[('selected', '#505050')], foreground=[('selected', 'white')])
 
         self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
-        self.var_data_dir = tk.StringVar(value="dataFile")
+        self.var_data_dir = tk.StringVar(value=_preferred_data_dir("dataFile"))
         # Live written-to-disk status (updated from flush events)
         self._live_out_dir = tk.StringVar(value="Output: -")
         self._live_written = tk.StringVar(value="Written: -")
@@ -4365,6 +4409,8 @@ class LauncherGUI(tk.Tk):
         self._disk_scan_interval_s = 10.0
         self._last_disk_scan_unix = 0.0
         self._last_disk_size_bytes = 0
+
+        self._restore_gui_state()
 
         # Auto-create default config so you never need to run `init` in a terminal.
         cfgp = Path(self.var_config.get())
@@ -4427,6 +4473,41 @@ class LauncherGUI(tk.Tk):
         self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_poll()
 
+    def _restore_gui_state(self) -> None:
+        try:
+            p = self._state_path
+            if not p.exists():
+                return
+            st = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(st, dict):
+                return
+            cfg = str(st.get("config_path", "") or "").strip()
+            ddir = str(st.get("data_dir", "") or "").strip()
+            geom = str(st.get("geometry", "") or "").strip()
+            if cfg:
+                self.var_config.set(cfg)
+            if ddir:
+                self.var_data_dir.set(ddir)
+            if geom:
+                try:
+                    self.geometry(geom)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _save_gui_state(self) -> None:
+        try:
+            st = {
+                "config_path": str(self.var_config.get() or ""),
+                "data_dir": str(self.var_data_dir.get() or ""),
+                "geometry": str(self.geometry() or ""),
+                "saved_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            _atomic_write_text(self._state_path, json.dumps(st, indent=2))
+        except Exception:
+            pass
+
     def _on_destroy(self, evt=None):
         if evt is not None and getattr(evt, "widget", None) is not self:
             return
@@ -4468,10 +4549,6 @@ class LauncherGUI(tk.Tk):
             return
 
     def _capture_disk_size(self, data_dir: Path) -> int:
-        now = time.time()
-        if (now - self._last_disk_scan_unix) >= self._disk_scan_interval_s:
-            self._last_disk_scan_unix = now
-            self._last_disk_size_bytes = _dir_size_bytes(data_dir / "captures")
         return int(self._last_disk_size_bytes)
 
 
@@ -4491,6 +4568,7 @@ class LauncherGUI(tk.Tk):
                 self._live_written.set(
                     f"Written: {w_bytes:,} bytes ({_format_size_gib(w_bytes)}), {w.get('records',0)} records, {w.get('samples',0)} samples"
                 )
+                self._last_disk_size_bytes = max(self._last_disk_size_bytes, w_bytes)
                 ts = evt.get("ts_iso") or ""
                 if not ts and isinstance(evt.get("ts_ns"), int):
                     ts = _ns_to_iso(int(evt["ts_ns"]))
@@ -4517,7 +4595,7 @@ class LauncherGUI(tk.Tk):
         try:
             reduced = int(snap.get("reduced_rows", 0))
             snips = int(snap.get("snips", 0))
-            disk_bytes = self._capture_disk_size(data_dir_path)
+            disk_bytes = _to_int(snap.get("disk_bytes", self._capture_disk_size(data_dir_path)), self._capture_disk_size(data_dir_path))
             self._live_written.set(
                 f"Written: reduced_rows={reduced:,}   snips={snips:,}   disk={_format_size_gib(disk_bytes)}"
             )
@@ -4631,6 +4709,14 @@ class LauncherGUI(tk.Tk):
             run_cfg = dict(base_cfg)
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 run_cfg = self.live_panel.apply_to_cfg(run_cfg)
+            try:
+                st = run_cfg.setdefault("storage", {}) or {}
+                dd = str(st.get("data_dir", "") or "").strip()
+                if dd and not os.path.isabs(dd):
+                    st["data_dir"] = _preferred_data_dir(dd)
+                    run_cfg["storage"] = st
+            except Exception:
+                pass
             run_cfg, warns, errs = validate_and_normalize_capture_cfg(run_cfg)
             if errs:
                 messagebox.showerror("CAPPY", "Invalid run configuration:\n- " + "\n- ".join(errs))
@@ -4653,12 +4739,14 @@ class LauncherGUI(tk.Tk):
             messagebox.showerror("CAPPY", f"Failed to write run config:\n{run_cfg_path}\n{ex}")
             return
 
-        # Clear Python bytecode cache to avoid stale imports and reduce startup churn to avoid stale imports and reduce startup churn
-        try:
-            removed = clear_pycache(self.script_path.parent)
-            self._append(f"[CAPPY] Cleared pycache (removed ~{removed} items)")
-        except Exception:
-            pass
+        # Optional maintenance only (disabled by default for fast starts).
+        # Set env CAPPY_CLEAR_PYCACHE=1 if you explicitly want a cleanup pass.
+        if str(os.environ.get("CAPPY_CLEAR_PYCACHE", "0")).strip() in {"1", "true", "TRUE", "yes", "YES"}:
+            try:
+                removed = clear_pycache(self.script_path.parent)
+                self._append(f"[CAPPY] Cleared pycache (removed ~{removed} items)")
+            except Exception:
+                pass
 
         cmd = [sys.executable, str(self.script_path), "capture", "--config", str(run_cfg_path)]
         self._append("RUN: " + " ".join(cmd))
@@ -4714,6 +4802,12 @@ class LauncherGUI(tk.Tk):
         self._is_closing = True
         self._cancel_after_callback("_poll_after_id")
         self._cancel_after_callback("_close_after_id")
+        try:
+            if hasattr(self, "live_panel") and self.live_panel is not None:
+                self._save_controls_to_yaml()
+        except Exception:
+            pass
+        self._save_gui_state()
         try:
             if self.proc is not None and self.proc.poll() is None:
                 self._stop()
