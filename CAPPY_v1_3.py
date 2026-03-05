@@ -14,6 +14,9 @@ import os
 import smtplib
 import subprocess
 import shutil
+import struct
+import zlib
+import io
 from email.message import EmailMessage
 
 STOP_REQUESTED = False
@@ -75,9 +78,39 @@ def _lazy_mpl():
     return _MPL
 
 
-# Define neon colors
-NEON_PINK = "#FF00EE"
-NEON_GREEN = "#26FF00"
+# ── Theme palette ─────────────────────────────────────────────────────────
+# Deep-space dark theme with color-coded functional zones.
+#   Channel A : Cyan        Channel B : Gold/Amber
+#   Trigger   : Magenta     Integration : Teal
+#   Surfaces  : Navy/slate  Accents     : bright on dark
+T_BG        = "#0b0e14"   # deepest background
+T_SURFACE   = "#111620"   # panel / card surface
+T_SURFACE2  = "#151b28"   # slightly lighter surface
+T_BORDER    = "#1e2636"   # subtle border
+T_BORDER_HI = "#2a3550"   # highlighted border
+T_TEXT      = "#c8d4e6"   # primary text
+T_TEXT_DIM  = "#6e7f99"   # secondary / dim text
+T_TEXT_BRIGHT = "#eef2f8"  # bright labels
+
+# Functional accent colors
+T_CYAN      = "#00d4ff"   # Channel A / primary accent
+T_GOLD      = "#ffb700"   # Channel B / trigger-related
+T_MAGENTA   = "#e040fb"   # Trigger / alerts
+T_GREEN     = "#00e676"   # Status OK / runtime
+T_TEAL      = "#1de9b6"   # Integration history
+T_RED       = "#ff5252"   # Errors / stop
+T_ORANGE    = "#ff9100"   # Warnings
+
+# Selection / interactive
+T_SEL       = "#0d2240"   # selection background
+T_SEL_HI    = "#143360"   # active selection
+T_BTN       = "#1a2740"   # button background
+T_BTN_HI    = "#243654"   # button hover
+T_BTN_ACT   = "#00d4ff"   # active / primary button
+
+# Legacy aliases for plot compatibility
+NEON_PINK = T_CYAN         # Channel A plots
+NEON_GREEN = T_GOLD        # Channel B plots
 
 SAMPLE_RATE_OPTIONS_MSPS = [20.0, 50.0, 100.0, 125.0, 160.0, 180.0, 200.0, 250.0, 500.0, 1000.0]
 INPUT_RANGE_OPTIONS = [
@@ -93,6 +126,13 @@ TRIGGER_SOURCE_LABEL_TO_CONST = {
     "Channel B": "TRIG_CHAN_B",
 }
 TRIGGER_SOURCE_CONST_TO_LABEL = {v: k for k, v in TRIGGER_SOURCE_LABEL_TO_CONST.items()}
+TRIGGER_SOURCEK_LABEL_TO_CONST = {
+    "Disabled": "TRIG_DISABLE",
+    "External": "TRIG_EXTERNAL",
+    "Channel A": "TRIG_CHAN_A",
+    "Channel B": "TRIG_CHAN_B",
+}
+TRIGGER_SOURCEK_CONST_TO_LABEL = {v: k for k, v in TRIGGER_SOURCEK_LABEL_TO_CONST.items()}
 TRIGGER_SLOPE_LABEL_TO_CONST = {
     "Positive": "TRIGGER_SLOPE_POSITIVE",
     "Negative": "TRIGGER_SLOPE_NEGATIVE",
@@ -102,6 +142,17 @@ TRIGGER_MODE_OPTIONS = ["TRIG_ENGINE_OP_J", "TRIG_ENGINE_OP_J_OR_K", "TRIG_ENGIN
 EXT_TRIGGER_RANGE_OPTIONS = ["ETR_5V", "ETR_1V"]
 TRIGGER_LEVEL_PRESETS_PCT = [-50.0, -25.0, 0.0, 25.0, 50.0]
 RUNTIME_PROFILE_PRESETS = {
+    "Mu2e Spill": {
+        "rearm_if_no_trigger_s": 3,
+        "rearm_cooldown_s": 2,
+        "max_rearms_per_hour": 3600,
+        "flush_every_records": 20000,
+        "flush_every_seconds": 2.0,
+        "sqlite_commit_every_snips": 200,
+        "stream_window_points": 20000,
+        "stream_window_seconds": 2.0,
+        "max_waveforms_per_tick": 20,
+    },
     "Balanced": {
         "rearm_if_no_trigger_s": 300,
         "rearm_cooldown_s": 30,
@@ -135,10 +186,23 @@ RUNTIME_PROFILE_PRESETS = {
         "stream_window_seconds": 5.0,
         "max_waveforms_per_tick": 10,
     },
+    "Low CPU": {
+        "rearm_if_no_trigger_s": 300,
+        "rearm_cooldown_s": 30,
+        "max_rearms_per_hour": 12,
+        "flush_every_records": 80000,
+        "flush_every_seconds": 8.0,
+        "sqlite_commit_every_snips": 1024,
+        "stream_window_points": 8000,
+        "stream_window_seconds": 4.0,
+        "max_waveforms_per_tick": 2,
+    },
 }
 RUNTIME_PROFILE_OPTIONS = list(RUNTIME_PROFILE_PRESETS.keys()) + ["Custom"]
-LIVE_UI_FPS_MAX = 30.0
-LIVE_MAX_CATCHUP_WAVEFORMS_PER_TICK = 64
+LIVE_UI_FPS_MAX = 15.0
+LIVE_MAX_CATCHUP_WAVEFORMS_PER_TICK = 12
+WAVEFORM_EVERY_N_MAX = 3000
+WAVE_ARCHIVE_CODEC_OPTIONS = {"none", "f32_zlib", "delta_i16_zlib"}
 
 
 def _to_int(v: Any, default: int) -> int:
@@ -283,6 +347,9 @@ waveforms:
   threshold_peak_V: 0.0
   max_waveforms_per_sec: 120
   store_volts: true
+  archive_codec: delta_i16_zlib    # none | f32_zlib | delta_i16_zlib (best compression)
+  archive_quant_bits: 12          # used by delta_i16_zlib (8..14)
+  archive_zlib_level: 3           # zlib compression level (1..9)
 
 storage:
   data_dir: dataFile
@@ -306,17 +373,18 @@ notify:
 runtime:
   noise_test: false
   autotrigger_timeout_ms: 10
-  rearm_if_no_trigger_s: 300
-  rearm_cooldown_s: 30
-  max_rearms_per_hour: 12
+  rearm_if_no_trigger_s: 3         # ≈2× the MI beam-off gap (1.02s) for Mu2e spill timing
+  rearm_cooldown_s: 2              # allow rapid rearm across spill boundaries
+  max_rearms_per_hour: 3600        # ≈1/s is fine for Mu2e cycle (1.4s period)
 
 live:
   ring_slots: 4096
   ring_points: 512
+  waveform_every_n_buffers: 1
   stream_window_points: 20000
   stream_window_seconds: 2.0
-  max_waveforms_per_tick: 20
-  ui_fps: 10
+  max_waveforms_per_tick: 6
+  ui_fps: 4
   show_channel_b: false
   preview_mode: archive_match
 """
@@ -401,9 +469,29 @@ def clear_pycache(root: Path) -> int:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomic text write with backup. Creates .bak of previous version for YAML configs."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep a .bak for YAML configs (safety net)
+    if path.exists() and path.suffix in ('.yaml', '.yml'):
+        try:
+            bak = path.with_suffix(path.suffix + '.bak')
+            shutil.copy2(str(path), str(bak))
+        except Exception:
+            pass
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, text.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        tmp.replace(path)
+    except Exception:
+        # Fallback to simple write
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
 
 
 def _auto_time_axis(n: int, sample_rate_hz: float) -> Tuple[np.ndarray, str]:
@@ -689,11 +777,31 @@ class LiveRingWriter:
                 self._fh.write(invalid_hdr)
                 self._fh.write(a.tobytes(order="C"))
                 self._fh.write(b.tobytes(order="C"))
+                self._fh.flush()
                 self._fh.seek(off)
                 self._fh.write(rec_hdr)
                 # also update header write_seq for reader to know latest
                 self._fh.seek(24)  # write_seq offset in header
                 self._fh.write(struct.pack("<Q", seq))
+                self._fh.flush()
+            except IOError:
+                # Retry once on transient IO error
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                try:
+                    self._fh = open(self.path, "r+b", buffering=0)
+                    self._fh.seek(off)
+                    self._fh.write(rec_hdr)
+                    self._fh.write(a.tobytes(order="C"))
+                    self._fh.write(b.tobytes(order="C"))
+                    self._fh.flush()
+                    self._fh.seek(24)
+                    self._fh.write(struct.pack("<Q", seq))
+                    self._fh.flush()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -836,11 +944,102 @@ class ParquetRollingWriter:
                 self._open_hour = None
 
 
+def _normalize_waveform_codec(codec: Any) -> str:
+    c = str(codec or "none").strip().lower()
+    if c in WAVE_ARCHIVE_CODEC_OPTIONS:
+        return c
+    return "none"
+
+
+_WAVE_CODEC_MAGIC = b"CWZ1"
+_WAVE_CODEC_HEADER_FMT = "<4sBBIf"
+_WAVE_CODEC_HEADER_SIZE = struct.calcsize(_WAVE_CODEC_HEADER_FMT)
+
+
+def _encode_wave_payload(wave: np.ndarray, codec: str, zlib_level: int = 3,
+                         quant_bits: int = 12) -> bytes:
+    """Encode a float32 waveform with the chosen codec.
+
+    Codecs:
+      none          – raw float32 bytes (no compression)
+      f32_zlib      – zlib-compressed float32 (lossless, ~2:1 typical)
+      delta_i16_zlib – quantize to int16, delta-code, zlib  (~4-8:1 typical)
+    """
+    wf = np.asarray(wave, dtype=np.float32)
+    raw = wf.tobytes(order="C")
+    c = _normalize_waveform_codec(codec)
+
+    if c == "f32_zlib":
+        try:
+            return zlib.compress(raw, _clamp_int(zlib_level, 1, 9, 3))
+        except Exception:
+            return raw
+
+    if c == "delta_i16_zlib":
+        try:
+            qbits = int(max(8, min(14, int(quant_bits))))
+            qmax = (1 << (qbits - 1)) - 1
+            max_abs = float(np.max(np.abs(wf))) if wf.size else 0.0
+            scale = (max_abs / qmax) if (max_abs > 0.0 and qmax > 0) else 1.0
+            q = np.clip(np.rint(wf / scale), -qmax, qmax).astype(np.int16, copy=False)
+            deltas = np.empty_like(q, dtype=np.int16)
+            if q.size:
+                deltas[0] = q[0]
+                if q.size > 1:
+                    deltas[1:] = (q[1:].astype(np.int32) - q[:-1].astype(np.int32)).astype(np.int16)
+            comp = zlib.compress(deltas.tobytes(order="C"),
+                                 _clamp_int(zlib_level, 1, 9, 3))
+            header = struct.pack(_WAVE_CODEC_HEADER_FMT,
+                                 _WAVE_CODEC_MAGIC, 1, qbits, int(q.size), float(scale))
+            return header + comp
+        except Exception:
+            return raw
+
+    # codec == "none"
+    return raw
+
+
+def _decode_wave_payload(payload: bytes, n_samples: int, codec: Any = None) -> np.ndarray:
+    """Decode waveform payload.  Detects CWZ1 header for delta_i16_zlib regardless of
+    the *codec* hint so archives from either v1.0 or v1.3 are always readable."""
+    # Try CWZ1 (delta_i16_zlib) first – works even when codec hint is wrong/missing
+    if len(payload) >= _WAVE_CODEC_HEADER_SIZE and payload[:4] == _WAVE_CODEC_MAGIC:
+        try:
+            _, _ver, _qb, nq, sc = struct.unpack(
+                _WAVE_CODEC_HEADER_FMT, payload[:_WAVE_CODEC_HEADER_SIZE])
+            d = np.frombuffer(zlib.decompress(payload[_WAVE_CODEC_HEADER_SIZE:]),
+                              dtype=np.int16, count=int(nq))
+            out = np.cumsum(d.astype(np.int32), dtype=np.int32).astype(np.float32)
+            out *= np.float32(sc)
+            return out[:n_samples] if n_samples > 0 else out
+        except Exception:
+            pass
+
+    codec_norm = _normalize_waveform_codec(codec)
+    data = payload
+    if codec_norm == "f32_zlib":
+        try:
+            data = zlib.decompress(payload)
+        except Exception:
+            data = payload
+    elif codec_norm == "none":
+        # Also try zlib decompress as a fallback for mis-labeled f32_zlib
+        if len(payload) >= 2 and payload[0:2] in (b'\x78\x01', b'\x78\x5e', b'\x78\x9c', b'\x78\xda'):
+            try:
+                data = zlib.decompress(payload)
+            except Exception:
+                data = payload
+    arr = np.frombuffer(data, dtype=np.float32)
+    if n_samples > 0:
+        return arr[:n_samples]
+    return arr
+
 
 class WaveBinSqliteStore:
     """
     Store waveform snippets as:
-      - raw float32 channel-separated data appended to time-rolled .bin files inside hourly folders
+      - binary channel-separated waveform payloads (raw float32 or zlib-compressed float32)
+        appended to time-rolled .bin files inside hourly folders
       - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
 
     Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/):
@@ -848,11 +1047,23 @@ class WaveBinSqliteStore:
       - <HH:00>/waveforms/A_snips_<session>_<YYYYMMDD_HHMM>.bin
       - <HH:00>/waveforms/B_snips_<session>_<YYYYMMDD_HHMM>.bin
     """
-    def __init__(self, day_dir: Path, session_id: str, rollover_minutes: int, commit_every: int):
+    def __init__(
+        self,
+        day_dir: Path,
+        session_id: str,
+        rollover_minutes: int,
+        commit_every: int,
+        waveform_codec: str = "none",
+        waveform_zlib_level: int = 3,
+        waveform_quant_bits: int = 12,
+    ):
         self.day_dir = day_dir
         self.session_id = session_id
         self.rollover_minutes = max(1, int(rollover_minutes))
         self.commit_every = max(1, int(commit_every))
+        self.waveform_codec = _normalize_waveform_codec(waveform_codec)
+        self.waveform_zlib_level = _clamp_int(waveform_zlib_level, 1, 9, 3)
+        self.waveform_quant_bits = int(max(8, min(14, int(waveform_quant_bits))))
         _ensure_dir(day_dir)
 
         idx_dir = day_dir / "index"
@@ -885,9 +1096,11 @@ class WaveBinSqliteStore:
               file_A TEXT,
               offset_A INTEGER,
               nbytes_A INTEGER,
+              codec_A TEXT,
               file_B TEXT,
               offset_B INTEGER,
               nbytes_B INTEGER,
+              codec_B TEXT,
 
               area_A_Vs REAL,
               peak_A_V REAL,
@@ -908,9 +1121,11 @@ class WaveBinSqliteStore:
                 "file_A": "ALTER TABLE snips ADD COLUMN file_A TEXT",
                 "offset_A": "ALTER TABLE snips ADD COLUMN offset_A INTEGER",
                 "nbytes_A": "ALTER TABLE snips ADD COLUMN nbytes_A INTEGER",
+                "codec_A": "ALTER TABLE snips ADD COLUMN codec_A TEXT",
                 "file_B": "ALTER TABLE snips ADD COLUMN file_B TEXT",
                 "offset_B": "ALTER TABLE snips ADD COLUMN offset_B INTEGER",
                 "nbytes_B": "ALTER TABLE snips ADD COLUMN nbytes_B INTEGER",
+                "codec_B": "ALTER TABLE snips ADD COLUMN codec_B TEXT",
                 "baseline_A_V": "ALTER TABLE snips ADD COLUMN baseline_A_V REAL",
                 "baseline_B_V": "ALTER TABLE snips ADD COLUMN baseline_B_V REAL",
             }
@@ -941,8 +1156,9 @@ class WaveBinSqliteStore:
         hour, base = self._hour_dir(ts_ns)
         pathA = base / f"A_snips_{self.session_id}_{key}.bin"
         pathB = base / f"B_snips_{self.session_id}_{key}.bin"
-        self._fhA = open(pathA, "ab", buffering=0)
-        self._fhB = open(pathB, "ab", buffering=0)
+        # Use 64 KiB write buffer to reduce syscalls and IO errors
+        self._fhA = open(pathA, "ab", buffering=65536)
+        self._fhB = open(pathB, "ab", buffering=65536)
         self._bin_key = key
         self._bin_hour = hour
 
@@ -980,19 +1196,32 @@ class WaveBinSqliteStore:
         assert self._fhA is not None and self._fhB is not None
 
         wfA = wfA_V.astype(np.float32, copy=False)
-        payloadA = wfA.tobytes(order="C")
+        payloadA = _encode_wave_payload(
+            wfA,
+            self.waveform_codec,
+            zlib_level=self.waveform_zlib_level,
+            quant_bits=self.waveform_quant_bits,
+        )
+        codecA = self.waveform_codec
 
         offA = self._fhA.tell()
         self._fhA.write(payloadA)
 
         if wfB_V is not None:
             wfB = wfB_V.astype(np.float32, copy=False)
-            payloadB = wfB.tobytes(order="C")
+            payloadB = _encode_wave_payload(
+                wfB,
+                self.waveform_codec,
+                zlib_level=self.waveform_zlib_level,
+                quant_bits=self.waveform_quant_bits,
+            )
+            codecB = self.waveform_codec
             offB = self._fhB.tell()
             self._fhB.write(payloadB)
             n_channels = 2
         else:
             payloadB = b""
+            codecB = None
             offB = 0
             n_channels = 1
 
@@ -1013,15 +1242,16 @@ class WaveBinSqliteStore:
 
         self.conn.execute(
             "INSERT OR IGNORE INTO snips(session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
-            "file,offset_bytes,nbytes,file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "file,offset_bytes,nbytes,file_A,offset_A,nbytes_A,codec_A,file_B,offset_B,nbytes_B,codec_B,area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.session_id, int(ts_ns), int(buffer_index), int(record_in_buffer), int(record_global),
              str(channels_mask), float(sample_rate_hz), int(wfA.shape[0]), int(n_channels),
              file_legacy, int(off_legacy), int(nbytes_legacy),
-             fileA, int(offA), int(len(payloadA)),
+             fileA, int(offA), int(len(payloadA)), codecA,
              (fileB if wfB_V is not None else None),
              (int(offB) if wfB_V is not None else None),
              (int(len(payloadB)) if wfB_V is not None else None),
+             codecB,
              float(area_A_Vs), float(peak_A_V), float(baseline_A_V), float(area_B_Vs), float(peak_B_V), float(baseline_B_V))
         )
 
@@ -1034,6 +1264,11 @@ class WaveBinSqliteStore:
         for fh_name in ("_fhA", "_fhB"):
             fh = getattr(self, fh_name, None)
             if fh is not None:
+                try:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                except Exception:
+                    pass
                 try:
                     fh.close()
                 except Exception:
@@ -1068,23 +1303,25 @@ class WaveBinSqliteStore:
         fileA = row.get("file_A", None)
         offA = row.get("offset_A", None)
         nbytesA = row.get("nbytes_A", None)
+        codecA = row.get("codec_A", "none")
 
         if isinstance(fileA, str) and fileA and _lazy_pandas().notna(offA) and _lazy_pandas().notna(nbytesA):
             binA = day_dir / str(fileA)
             with open(binA, "rb") as fh:
                 fh.seek(int(offA))
                 payloadA = fh.read(int(nbytesA))
-            a = np.frombuffer(payloadA, dtype=np.float32)[:n_samples]
+            a = _decode_wave_payload(payloadA, n_samples, codecA)
 
             fileB = row.get("file_B", None)
             offB = row.get("offset_B", None)
             nbytesB = row.get("nbytes_B", None)
+            codecB = row.get("codec_B", "none")
             if isinstance(fileB, str) and fileB and _lazy_pandas().notna(offB) and _lazy_pandas().notna(nbytesB):
                 binB = day_dir / str(fileB)
                 with open(binB, "rb") as fh:
                     fh.seek(int(offB))
                     payloadB = fh.read(int(nbytesB))
-                b = np.frombuffer(payloadB, dtype=np.float32)[:n_samples]
+                b = _decode_wave_payload(payloadB, n_samples, codecB)
                 return a, b
             return a, None
 
@@ -1096,7 +1333,8 @@ class WaveBinSqliteStore:
         with open(bin_path, "rb") as fh:
             fh.seek(offset)
             payload = fh.read(nbytes)
-        arr = np.frombuffer(payload, dtype=np.float32)
+        legacy_codec = row.get("codec_A", "none")
+        arr = _decode_wave_payload(payload, n_samples * max(1, n_channels), legacy_codec)
         if n_channels == 2:
             return arr[:n_samples], arr[n_samples:2*n_samples]
         return arr[:n_samples], None
@@ -1110,23 +1348,25 @@ def load_waveforms_from_row(row: _lazy_pandas().Series, day_dir: Path) -> Tuple[
     fileA = row.get("file_A", None)
     offA = row.get("offset_A", None)
     nbytesA = row.get("nbytes_A", None)
+    codecA = row.get("codec_A", "none")
 
     if isinstance(fileA, str) and fileA and _lazy_pandas().notna(offA) and _lazy_pandas().notna(nbytesA):
         binA = day_dir / str(fileA)
         with open(binA, "rb") as fh:
             fh.seek(int(offA))
             payloadA = fh.read(int(nbytesA))
-        a = np.frombuffer(payloadA, dtype=np.float32)[:n_samples]
+        a = _decode_wave_payload(payloadA, n_samples, codecA)
 
         fileB = row.get("file_B", None)
         offB = row.get("offset_B", None)
         nbytesB = row.get("nbytes_B", None)
+        codecB = row.get("codec_B", "none")
         if isinstance(fileB, str) and fileB and _lazy_pandas().notna(offB) and _lazy_pandas().notna(nbytesB):
             binB = day_dir / str(fileB)
             with open(binB, "rb") as fh:
                 fh.seek(int(offB))
                 payloadB = fh.read(int(nbytesB))
-            b = np.frombuffer(payloadB, dtype=np.float32)[:n_samples]
+            b = _decode_wave_payload(payloadB, n_samples, codecB)
             return a, b
         return a, None
 
@@ -1138,7 +1378,8 @@ def load_waveforms_from_row(row: _lazy_pandas().Series, day_dir: Path) -> Tuple[
     with open(bin_path, "rb") as fh:
         fh.seek(offset)
         payload = fh.read(nbytes)
-    arr = np.frombuffer(payload, dtype=np.float32)
+    legacy_codec = row.get("codec_A", "none")
+    arr = _decode_wave_payload(payload, n_samples * max(1, n_channels), legacy_codec)
     if n_channels == 2:
         return arr[:n_samples], arr[n_samples:2*n_samples]
     return arr[:n_samples], None
@@ -1148,7 +1389,9 @@ def load_waveforms_from_row(row: _lazy_pandas().Series, day_dir: Path) -> Tuple[
 class CappyArchive:
 
     def __init__(self, data_dir: Path, rollover_minutes: int, flush_every_records: int,
-                 session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0):
+                 session_rotate_hours: float, sqlite_commit_every_snips: int, flush_every_seconds: float = 10.0,
+                 waveform_codec: str = "none", waveform_zlib_level: int = 3,
+                 waveform_quant_bits: int = 12):
         self.data_dir = data_dir
         _ensure_dir(self.data_dir)
         self.captures = data_dir / "captures"
@@ -1159,6 +1402,9 @@ class CappyArchive:
         self._last_flush_unix = 0.0
         self.session_rotate_hours = float(session_rotate_hours or 0.0)
         self.sqlite_commit_every_snips = int(sqlite_commit_every_snips)
+        self.waveform_codec = _normalize_waveform_codec(waveform_codec)
+        self.waveform_zlib_level = _clamp_int(waveform_zlib_level, 1, 9, 3)
+        self.waveform_quant_bits = _clamp_int(waveform_quant_bits, 8, 14, 12)
         self.session_id = ""
         self.day_dir: Optional[Path] = None
         self.reduced_writer: Optional[ParquetRollingWriter] = None
@@ -1190,7 +1436,15 @@ class CappyArchive:
         _ensure_dir(idx_dir)
 
         self.reduced_writer = ParquetRollingWriter(self.day_dir, f"reduced_{sid}", REDUCED_SCHEMA, self.rollover_minutes)
-        self.wave_store = WaveBinSqliteStore(self.day_dir, sid, self.rollover_minutes, self.sqlite_commit_every_snips)
+        self.wave_store = WaveBinSqliteStore(
+            self.day_dir,
+            sid,
+            self.rollover_minutes,
+            self.sqlite_commit_every_snips,
+            waveform_codec=self.waveform_codec,
+            waveform_zlib_level=self.waveform_zlib_level,
+            waveform_quant_bits=self.waveform_quant_bits,
+        )
 
         _atomic_write_text(idx_dir / f"session_{sid}.txt", f"CAPPY v1.3 session {sid}\nchannels={channels_mask}\n")
         print(f"[CAPPY] Started session {sid} in {self.day_dir}")
@@ -1451,6 +1705,13 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     waves["max_waveforms_per_sec"] = _clamp_int(
         waves.get("max_waveforms_per_sec", 120), 1, 50_000, 120
     )
+    codec_raw = str(waves.get("archive_codec", "none") or "none").strip().lower()
+    codec = _normalize_waveform_codec(codec_raw)
+    if codec != codec_raw:
+        warnings.append(f"waveforms.archive_codec={codec_raw!r} is invalid; using 'none'.")
+    waves["archive_codec"] = codec
+    waves["archive_quant_bits"] = _clamp_int(waves.get("archive_quant_bits", 12), 8, 14, 12)
+    waves["archive_zlib_level"] = _clamp_int(waves.get("archive_zlib_level", 3), 1, 9, 3)
 
     runtime["rearm_if_no_trigger_s"] = _clamp_int(runtime.get("rearm_if_no_trigger_s", 300), 0, 86_400, 300)
     runtime["rearm_cooldown_s"] = _clamp_int(runtime.get("rearm_cooldown_s", 30), 0, 86_400, 30)
@@ -1467,10 +1728,13 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
 
     live["ring_slots"] = _clamp_int(live.get("ring_slots", 4096), 16, 1_000_000, 4096)
     live["ring_points"] = _clamp_int(live.get("ring_points", 512), 32, 16384, 512)
+    live["waveform_every_n_buffers"] = _clamp_int(
+        live.get("waveform_every_n_buffers", 1), 1, WAVEFORM_EVERY_N_MAX, 1
+    )
     live["stream_window_points"] = _clamp_int(live.get("stream_window_points", 20000), 256, 5_000_000, 20000)
     live["stream_window_seconds"] = _clamp_float(live.get("stream_window_seconds", 2.0), 0.25, 120.0, 2.0)
-    live["max_waveforms_per_tick"] = _clamp_int(live.get("max_waveforms_per_tick", 20), 1, 2000, 20)
-    live["ui_fps"] = _clamp_float(live.get("ui_fps", 10.0), 1.0, LIVE_UI_FPS_MAX, 10.0)
+    live["max_waveforms_per_tick"] = _clamp_int(live.get("max_waveforms_per_tick", 12), 1, 2000, 12)
+    live["ui_fps"] = _clamp_float(live.get("ui_fps", 6.0), 1.0, LIVE_UI_FPS_MAX, 6.0)
     live["show_channel_b"] = _to_bool(live.get("show_channel_b", False), False)
     mode = str(live.get("preview_mode", "archive_match")).strip().lower()
     if mode not in {"archive_match", "record0"}:
@@ -1763,6 +2027,21 @@ def _is_ats_dma_done(ex: Exception) -> bool:
     # ATS return code 519 == ApiDmaDone (normal DMA completion condition).
     return ("ApiDmaDone" in msg) or ("return code 519" in msg) or (" 519 " in f" {msg} ")
 
+
+def _is_recoverable_ats_error(ex: Exception) -> bool:
+    msg = _ats_msg(ex)
+    recoverable_tokens = (
+        "ApiBufferOverflow",
+        "ApiBufferNotReady",
+        "ApiWaitTimeout",
+        "ApiWaitCanceled",
+        "ApiWaitCancelled",
+        "ApiDmaInProgress",
+        "ApiFailed",
+        "ApiDmaDone",
+    )
+    return any(tok in msg for tok in recoverable_tokens)
+
 def run_capture(cfg_path: Path) -> int:
     if not ATS_AVAILABLE or ats is None:
         print("[CAPPY] atsapi not available on this machine.")
@@ -1770,6 +2049,13 @@ def run_capture(cfg_path: Path) -> int:
     if REDUCED_SCHEMA is None or SESSION_INDEX_SCHEMA is None:
         print("[CAPPY] pyarrow is required for capture/archive writing. Please install pyarrow.")
         return 2
+
+    # Reduce CPU priority so the DAQ kernel threads get precedence
+    try:
+        os.nice(5)
+        print("[CAPPY] Process niceness set to +5 (lower CPU priority for I/O thread)")
+    except Exception:
+        pass
 
     cfg = load_config(cfg_path)
     cfg, cfg_warnings, cfg_errors = validate_and_normalize_capture_cfg(cfg)
@@ -1807,6 +2093,9 @@ def run_capture(cfg_path: Path) -> int:
         max_per_sec=int(waves.get("max_waveforms_per_sec", 50)),
     )
     store_volts = bool(waves.get("store_volts", True))
+    waveform_codec = _normalize_waveform_codec(waves.get("archive_codec", "none"))
+    waveform_zlib_level = _clamp_int(waves.get("archive_zlib_level", 3), 1, 9, 3)
+    waveform_quant_bits = _clamp_int(waves.get("archive_quant_bits", 12), 8, 14, 12)
 
     binfo = cfg.get("board", {}) if isinstance(cfg, dict) else {}
     systemId = int(binfo.get("system_id", 2))
@@ -1858,6 +2147,9 @@ def run_capture(cfg_path: Path) -> int:
         session_rotate_hours=float(storage.get("session_rotate_hours", 0) or 0),
         sqlite_commit_every_snips=int(storage.get("sqlite_commit_every_snips", 2000)),
         flush_every_seconds=float(storage.get("flush_every_seconds", 10.0) or 0.0),
+        waveform_codec=waveform_codec,
+        waveform_zlib_level=waveform_zlib_level,
+        waveform_quant_bits=waveform_quant_bits,
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
@@ -1865,6 +2157,9 @@ def run_capture(cfg_path: Path) -> int:
     live_cfg = (cfg.get('live', {}) or {})
     ring_nslots = int(live_cfg.get('ring_slots', 4096))
     ring_npts = int(live_cfg.get('ring_points', 512))
+    live_waveform_every_n = _clamp_int(
+        live_cfg.get("waveform_every_n_buffers", 1), 1, WAVEFORM_EVERY_N_MAX, 1
+    )
     show_channel_b_live = _to_bool(live_cfg.get('show_channel_b', False), False)
     ring_path = Path(str(storage.get('data_dir', 'dataFile'))) / 'status' / 'live_waveforms.ring'
     ring = LiveRingWriter(ring_path, nslots=ring_nslots, npts=ring_npts)
@@ -1883,14 +2178,17 @@ def run_capture(cfg_path: Path) -> int:
         vpp_B=vppB,
         trigger_source=str(trig.get("sourceJ", "TRIG_EXTERNAL")),
         trigger_timeout_ms=int(trig.get("timeout_ms", 0)),
+        trigger_level_code=int(trig.get("levelJ", 128)),
+        trigger_slope=str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE")),
         live_ring_path=str(ring_path),
         live=dict(
             ring_slots=int(live_cfg.get('ring_slots', ring_nslots)),
             ring_points=int(live_cfg.get('ring_points', ring_npts)),
+            waveform_every_n_buffers=int(live_waveform_every_n),
             stream_window_points=int(live_cfg.get('stream_window_points', 20000)),
             stream_window_seconds=float(live_cfg.get('stream_window_seconds', 2.0)),
-            max_waveforms_per_tick=int(live_cfg.get('max_waveforms_per_tick', 20)),
-            ui_fps=float(live_cfg.get('ui_fps', 10.0)),
+            max_waveforms_per_tick=int(live_cfg.get('max_waveforms_per_tick', 12)),
+            ui_fps=float(live_cfg.get('ui_fps', 6.0)),
             show_channel_b=bool(show_channel_b_live),
             preview_mode=str(live_cfg.get('preview_mode', 'archive_match')),
         ),
@@ -1912,7 +2210,7 @@ def run_capture(cfg_path: Path) -> int:
     t0 = time.time()
     last = t0
     dashboard_every_buffers = int((cfg.get('notify', {}) or {}).get('dashboard_every_buffers', 1000))
-    gui_every_buffers = int((cfg.get('notify', {}) or {}).get('gui_every_buffers', 50))
+    gui_every_buffers = max(1, int((cfg.get('notify', {}) or {}).get('gui_every_buffers', 1)))
     last_emit_buf = 0
     last_gui_emit_buf = 0
     timeout_count = 0
@@ -1922,14 +2220,17 @@ def run_capture(cfg_path: Path) -> int:
     rearm_if_no_trigger_s = int(rt.get('rearm_if_no_trigger_s', 300))
     rearm_cooldown_s = int(rt.get('rearm_cooldown_s', 30))
     max_rearms_per_hour = int(rt.get('max_rearms_per_hour', 12))
+    max_recoverable_errors = int(rt.get('max_recoverable_errors', 200))
+    recover_backoff_s = float(rt.get('recover_backoff_s', 0.05) or 0.05)
     timeout_pause_s = float(trig.get("timeout_pause_s", 0.0) or 0.0)
     preview_mode = str(live_cfg.get("preview_mode", "archive_match")).strip().lower()
     if preview_mode not in {"archive_match", "record0"}:
         preview_mode = "archive_match"
     rearm_times: List[float] = []
+    recoverable_error_count = 0
 
     try:
-        def _do_rearm(force: bool = False):
+        def _do_rearm(force: bool = False, reason: str = ""):
             nonlocal timeout_count, last_buffer_ns, next_wait_idx
             now = time.time()
             # keep only last hour
@@ -1941,7 +2242,8 @@ def run_capture(cfg_path: Path) -> int:
                 return
             rearm_times.append(now)
 
-            print(f"[CAPPY] Rearming acquisition (no completed buffers for {rearm_if_no_trigger_s}s). rearms_last_hour={len(rearm_times)}")
+            reason_str = f" ({reason})" if reason else f" (no completed buffers for {rearm_if_no_trigger_s}s)"
+            print(f"[CAPPY] Rearming acquisition{reason_str}. rearms_last_hour={len(rearm_times)}")
             notifier.update(state='rearming', time=time.strftime('%Y-%m-%d %H:%M:%S'), timeouts=timeout_count)
             notifier.maybe_emit()
 
@@ -1949,6 +2251,10 @@ def run_capture(cfg_path: Path) -> int:
                 board.abortAsyncRead()
             except Exception:
                 pass
+
+            # Brief pause to let the board fully quiesce before re-posting DMA buffers.
+            # This prevents ApiBufferOverflow cascades at spill boundaries.
+            time.sleep(0.005)
 
             board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recordsPerAcq, adma_flags)
             for b in buffers:
@@ -1960,6 +2266,29 @@ def run_capture(cfg_path: Path) -> int:
             next_wait_idx = 0
             notifier.update(state='running')
             notifier.maybe_emit()
+
+        def _recoverable_rearm(ex: Exception, where: str) -> bool:
+            nonlocal recoverable_error_count
+            if not _is_recoverable_ats_error(ex):
+                return False
+            recoverable_error_count += 1
+            print(f"[CAPPY] Warning: recoverable ATS error in {where}: {ex}")
+            notifier.update(
+                state='recovering',
+                time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                recoverable_errors=recoverable_error_count,
+                last_error=str(ex),
+            )
+            notifier.maybe_emit()
+            if recoverable_error_count > max_recoverable_errors:
+                print(f"[CAPPY] Too many recoverable errors ({recoverable_error_count}); stopping capture.")
+                return False
+            try:
+                time.sleep(max(0.0, recover_backoff_s))
+            except Exception:
+                pass
+            _do_rearm(force=True, reason=f"recoverable {where}: {ex}")
+            return True
 
         def _pause_for_timeout(no_trigger_for_s: float):
             nonlocal timeout_count, last_buffer_ns
@@ -1986,7 +2315,7 @@ def run_capture(cfg_path: Path) -> int:
                 time.sleep(0.2)
             if _should_stop():
                 return
-            _do_rearm(force=True)
+            _do_rearm(force=True, reason=f"timeout pause ({pause_for:.1f}s)")
 
         board.startCapture()
         print(f"[CAPPY] Running session {sid}. " + ("Press <enter> to stop." if (sys.stdin is not None and hasattr(sys.stdin,"isatty") and sys.stdin.isatty()) else "Use Stop (GUI) or Ctrl+C to stop."))
@@ -2000,7 +2329,18 @@ def run_capture(cfg_path: Path) -> int:
                     break
                 if "ApiBufferNotReady" in str(ex):
                     print("[CAPPY] Warning: ApiBufferNotReady while waiting for DMA buffer; resetting DMA queue.")
-                    _do_rearm(force=True)
+                    _do_rearm(force=True, reason="ApiBufferNotReady")
+                    continue
+                if "ApiDmaInProgress" in str(ex):
+                    # Non-fatal poll result: DMA transfer is still active for this buffer.
+                    timeout_count += 1
+                    ago_s = (time.time_ns() - last_buffer_ns) / 1e9
+                    notifier.update(state="waiting_for_trigger", time=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                   timeouts=timeout_count, last_buffer_ago_s=ago_s,
+                                   buffers=buf_done, records=global_rec,
+                                   reduced_rows=getattr(archive, "_n_reduced", 0),
+                                   snips=getattr(archive, "_n_snips", 0))
+                    notifier.maybe_emit()
                     continue
                 if "ApiWaitTimeout" in str(ex):
                     timeout_count += 1
@@ -2017,11 +2357,13 @@ def run_capture(cfg_path: Path) -> int:
                         _pause_for_timeout(ago_s)
                         continue
                     if rearm_if_no_trigger_s > 0 and ago_s >= float(rearm_if_no_trigger_s):
-                        _do_rearm()
+                        _do_rearm(reason=f"no triggers for {ago_s:.1f}s")
                     continue
                 if "ApiWaitCanceled" in str(ex) or "ApiWaitCancelled" in str(ex):
                     # Normal stop path (SIGINT / abortAsyncRead)
                     break
+                if _recoverable_rearm(ex, "waitAsyncBufferComplete"):
+                    continue
                 raise
 
             timeout_count = 0
@@ -2044,11 +2386,15 @@ def run_capture(cfg_path: Path) -> int:
                 if _is_ats_dma_done(ex):
                     break
                 if "ApiBufferOverflow" in msg:
-                    print("[CAPPY] Warning: ApiBufferOverflow while recycling DMA buffer; rearming capture.")
-                    _do_rearm(force=True)
+                    print("[CAPPY] Warning: ApiBufferOverflow while recycling DMA buffer; soft rearm.")
+                    # Brief quiesce before rearm to prevent cascade at spill boundaries
+                    time.sleep(0.01)
+                    _do_rearm(force=True, reason="ApiBufferOverflow on postAsyncBuffer")
                     continue
                 if "ApiWaitCanceled" in msg or "ApiWaitCancelled" in msg:
                     break
+                if _recoverable_rearm(ex, "postAsyncBuffer"):
+                    continue
                 raise
 
             if archive.should_rotate():
@@ -2124,46 +2470,49 @@ def run_capture(cfg_path: Path) -> int:
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA)),
                         buffer_mean_area_B=float(np.mean(areaB)), buffer_mean_peak_B=float(np.mean(peakB)),
                     )
-                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
-                        last_gui_emit_buf = buf_done
+                    completed_buffers = buf_done + 1
+                    if gui_every_buffers > 0 and (completed_buffers - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = completed_buffers
                         notifier.update(
                             last_capture=time.strftime('%Y-%m-%d %H:%M:%S'),
                             last_capture_unix=time.time(),
-                            buffers=buf_done,
+                            buffers=completed_buffers,
                         )
                         notifier.emit_now()
                 else:
                     notifier.update(
                         buffer_mean_area_A=float(np.mean(areaA)), buffer_mean_peak_A=float(np.mean(peakA))
                     )
-                    if gui_every_buffers > 0 and (buf_done - last_gui_emit_buf) >= gui_every_buffers:
-                        last_gui_emit_buf = buf_done
+                    completed_buffers = buf_done + 1
+                    if gui_every_buffers > 0 and (completed_buffers - last_gui_emit_buf) >= gui_every_buffers:
+                        last_gui_emit_buf = completed_buffers
                         notifier.update(
                             last_capture=time.strftime('%Y-%m-%d %H:%M:%S'),
                             last_capture_unix=time.time(),
-                            buffers=buf_done,
+                            buffers=completed_buffers,
                         )
                         notifier.emit_now()
             except Exception:
                 pass
 
-            # Write EVERY buffer's representative waveform into the live ring for smooth GUI playback
-            try:
-                if preview_mode == "archive_match" and live_wfA_candidate is not None:
-                    wfA_live = live_wfA_candidate
-                    wfB_live = live_wfB_candidate if (ch_count == 2 and show_channel_b_live) else None
-                    chmask_live = 3 if (ch_count == 2 and show_channel_b_live and wfB_live is not None) else 1
-                else:
-                    # Fallback for non-archived or record0 preview mode.
-                    wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
-                    wfB_live = None
-                    chmask_live = 1
-                    if ch_count == 2 and show_channel_b_live:
-                        wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
-                        chmask_live = 3
-                ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
-            except Exception:
-                pass
+            # Write representative waveforms to the live ring at a configurable cadence.
+            if (buf_done % live_waveform_every_n) == 0:
+                try:
+                    if preview_mode == "archive_match" and live_wfA_candidate is not None:
+                        wfA_live = live_wfA_candidate
+                        wfB_live = live_wfB_candidate if (ch_count == 2 and show_channel_b_live) else None
+                        chmask_live = 3 if (ch_count == 2 and show_channel_b_live and wfB_live is not None) else 1
+                    else:
+                        # Fallback for non-archived or record0 preview mode.
+                        wfA_live = _codes_to_volts_u16(A[0], vpp=vppA)
+                        wfB_live = None
+                        chmask_live = 1
+                        if ch_count == 2 and show_channel_b_live:
+                            wfB_live = _codes_to_volts_u16(B[0], vpp=vppB)
+                            chmask_live = 3
+                    ring.write(wfA_live, wfB_live, buf_idx=buf_done, chmask=chmask_live)
+                except Exception:
+                    pass
 
             archive.append_reduced(red_rows, ts_ns)
 
@@ -2231,6 +2580,8 @@ class ArchiveBrowser(ttk.Frame):
         self.snips = _lazy_pandas().DataFrame()
         self._snip_db_dir: Optional[Path] = None
         self._snips_view = _lazy_pandas().DataFrame()
+        self._snips_total_count = 0
+        self._snip_load_limit = _clamp_int(os.environ.get("CAPPY_ARCHIVE_SNIP_LIMIT", 200000), 1000, 2000000, 200000)
         self._sel_date = None
         self._sel_hour = None
         self._session_summary = tk.StringVar(value="No sessions loaded")
@@ -2288,7 +2639,7 @@ class ArchiveBrowser(ttk.Frame):
         self.cmb_date.bind("<<ComboboxSelected>>", self._on_date)
         hour_row = ttk.Frame(left)
         hour_row.pack(fill=tk.X, pady=(6,0))
-        ttk.Label(hour_row, text="Hour").pack(side=tk.LEFT)
+        ttk.Label(hour_row, text="Minute").pack(side=tk.LEFT)
         self.var_seek = tk.StringVar(value="")
         seek_entry = ttk.Entry(hour_row, textvariable=self.var_seek, width=7)
         seek_entry.pack(side=tk.LEFT, padx=(8,4))
@@ -2347,10 +2698,10 @@ class ArchiveBrowser(ttk.Frame):
 
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
         self.fig, (self.axA, self.axB, self.axI) = plt.subplots(3, 1, figsize=(7.5,6.8))
-        self.fig.patch.set_facecolor('#1e1e1e')
-        self.axA.set_facecolor('#2d2d2d')
-        self.axB.set_facecolor('#2d2d2d')
-        self.axI.set_facecolor('#2d2d2d')
+        self.fig.patch.set_facecolor(T_BG)
+        self.axA.set_facecolor(T_SURFACE)
+        self.axB.set_facecolor(T_SURFACE)
+        self.axI.set_facecolor(T_SURFACE)
         self.fig.tight_layout(pad=1.0)
 
         # Canvas for matplotlib figure
@@ -2363,7 +2714,7 @@ class ArchiveBrowser(ttk.Frame):
                 from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk as _NavTB
             except ImportError:
                 from matplotlib.backends.backend_tkagg import NavigationToolbar2TkAgg as _NavTB
-            toolbar_frame = tk.Frame(self._right, bg='#3d3d3d', height=36)
+            toolbar_frame = tk.Frame(self._right, bg=T_SURFACE, height=36)
             toolbar_frame.pack(side=tk.TOP, fill=tk.X)
             toolbar_frame.pack_propagate(True)
             self._nav_toolbar = _NavTB(self.canvas, toolbar_frame)
@@ -2377,11 +2728,11 @@ class ArchiveBrowser(ttk.Frame):
         # Readout label below plots
         self._readout_var = tk.StringVar(value="")
         readout_lbl = tk.Label(self._right, textvariable=self._readout_var,
-                               font=('Courier', 10, 'bold'), fg=NEON_PINK, bg='#1e1e1e',
+                               font=('Consolas', 10, 'bold'), fg=T_CYAN, bg=T_BG,
                                anchor='w', padx=6, pady=2)
         readout_lbl.pack(fill=tk.X)
 
-        self.meta = tk.Text(self._right, height=10, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
+        self.meta = tk.Text(self._right, height=10, bg=T_SURFACE, fg=T_TEXT, insertbackground=T_CYAN, font=('Consolas', 9))
         self.meta.pack(fill=tk.X, pady=(8,0))
         self.meta.configure(state=tk.DISABLED)
 
@@ -2510,7 +2861,7 @@ class ArchiveBrowser(ttk.Frame):
 
 
     def _build_hour_index(self):
-        """Add _date/_hour columns to self.snips (local time)."""
+        """Add _date/_hour/_minute columns to self.snips (local time)."""
         if self.snips is None or self.snips.empty:
             return
         # Treat stored ns as UTC epoch, then convert to local timezone for display/grouping.
@@ -2518,6 +2869,7 @@ class ArchiveBrowser(ttk.Frame):
         self.snips = self.snips.copy()
         self.snips["_date"] = dt.dt.strftime("%Y-%m-%d")
         self.snips["_hour"] = dt.dt.strftime("%H")
+        self.snips["_minute"] = dt.dt.strftime("%H:%M")
 
     def _populate_hours(self):
         """Populate date combobox + hour listbox from currently loaded snips."""
@@ -2549,19 +2901,19 @@ class ArchiveBrowser(ttk.Frame):
         if self._sel_date is not None:
             self.var_date.set(str(self._sel_date))
 
-        # Hours for selected date
+        # Minute buckets for selected date
         sub = self.snips[self.snips["_date"] == self._sel_date] if self._sel_date is not None else self.snips
-        counts = sub["_hour"].value_counts().sort_index()
-        hours = list(counts.index)
+        counts = sub["_minute"].value_counts().sort_index()
+        minutes = list(counts.index)
 
-        for hh in hours:
-            self.hlist.insert(tk.END, f"{hh}:00  ({int(counts[hh])})")
+        for hm in minutes:
+            self.hlist.insert(tk.END, f"{hm}  ({int(counts[hm])})")
 
-        if self._sel_hour is None or self._sel_hour not in hours:
-            self._sel_hour = str(hours[0]) if hours else None
+        if self._sel_hour is None or self._sel_hour not in minutes:
+            self._sel_hour = str(minutes[0]) if minutes else None
 
-        if self._sel_hour is not None and self._sel_hour in hours:
-            idx = hours.index(self._sel_hour)
+        if self._sel_hour is not None and self._sel_hour in minutes:
+            idx = minutes.index(self._sel_hour)
             self.hlist.selection_clear(0, tk.END)
             self.hlist.selection_set(idx)
             self.hlist.see(idx)
@@ -2576,13 +2928,13 @@ class ArchiveBrowser(ttk.Frame):
         df = self.snips
         if "_date" in df.columns and self._sel_date is not None:
             df = df[df["_date"] == self._sel_date]
-        if "_hour" in df.columns and self._sel_hour is not None:
-            df = df[df["_hour"] == self._sel_hour]
+        if "_minute" in df.columns and self._sel_hour is not None:
+            df = df[df["_minute"] == self._sel_hour]
 
         self._snips_view = df.sort_values("timestamp_ns", ascending=False)
 
         if self._snips_view.empty:
-            self.wlist.insert("", tk.END, values=("(no waveforms in selected hour)", "-", "-", "-", "-"))
+            self.wlist.insert("", tk.END, values=("(no waveforms in selected minute)", "-", "-", "-", "-"))
             return
 
         for _, r in self._snips_view.iterrows():
@@ -2617,19 +2969,19 @@ class ArchiveBrowser(ttk.Frame):
         if not sel:
             return
         txt = self.hlist.get(sel[0])
-        # 'HH:00  (N)'
-        self._sel_hour = txt.split(":")[0].strip()
+        # 'HH:MM  (N)'
+        self._sel_hour = txt.split()[0].strip()
         self._apply_hour_filter()
 
 
     def _seek_mmss(self):
-        """Jump to the snip closest to MM:SS within the currently selected date/hour."""
+        """Jump to the snip closest to MM:SS (or SS) in the selected date/minute."""
         if getattr(self, "_snips_view", _lazy_pandas().DataFrame()).empty:
             return
         txt = (self.var_seek.get() if hasattr(self, "var_seek") else "").strip()
         if not txt:
             return
-        # Parse MM:SS (allow SS or M:SS)
+        # Parse MM:SS or SS. With SS, keep currently selected minute.
         mm = 0
         ss = 0
         try:
@@ -2638,9 +2990,11 @@ class ArchiveBrowser(ttk.Frame):
                 mm = int(a)
                 ss = int(b)
             else:
+                if self._sel_hour is not None and ":" in str(self._sel_hour):
+                    mm = int(str(self._sel_hour).split(":", 1)[1])
                 ss = int(txt)
         except Exception:
-            messagebox.showerror("Invalid time", "Enter time as MM:SS (e.g., 12:34).")
+            messagebox.showerror("Invalid time", "Enter time as MM:SS (or SS).")
             return
         if ss < 0 or ss > 59 or mm < 0:
             messagebox.showerror("Invalid time", "Seconds must be 0–59.")
@@ -2650,7 +3004,11 @@ class ArchiveBrowser(ttk.Frame):
         try:
             # Build a local-time target and compare in epoch ns
             y, m, d = map(int, str(self._sel_date).split("-"))
-            hh = int(self._sel_hour)
+            hh_txt = str(self._sel_hour).strip()
+            if ":" in hh_txt:
+                hh = int(hh_txt.split(":", 1)[0])
+            else:
+                hh = int(hh_txt)
             target_local = datetime(y, m, d, hh, mm, ss, tzinfo=self._tz)
             target_ns = int(target_local.timestamp() * 1e9)
         except Exception:
@@ -2701,6 +3059,7 @@ class ArchiveBrowser(ttk.Frame):
             return
         self.snips = _lazy_pandas().DataFrame()
         self._snip_db_dir = None
+        self._snips_total_count = 0
 
         for ddir in self._iter_day_dirs() or []:
             idx_dir = ddir / "index"
@@ -2721,24 +3080,33 @@ class ArchiveBrowser(ttk.Frame):
                 continue
             conn = sqlite3.connect(db)
             try:
+                try:
+                    self._snips_total_count = int(conn.execute("SELECT COUNT(*) FROM snips WHERE session_id=?", (sid,)).fetchone()[0] or 0)
+                except Exception:
+                    self._snips_total_count = 0
                 self.snips = _lazy_pandas().read_sql_query(
                     "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                     "file,offset_bytes,nbytes,"
-                    "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+                    "file_A,offset_A,nbytes_A,codec_A,file_B,offset_B,nbytes_B,codec_B,"
                     "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
-                    "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                    "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT ?",
                     conn,
-                    params=(sid,),
+                    params=(sid, self._snip_load_limit),
                 )
                 # If query returned nothing, try without session_id filter (DB might only have one session)
                 if self.snips.empty:
+                    try:
+                        self._snips_total_count = int(conn.execute("SELECT COUNT(*) FROM snips").fetchone()[0] or 0)
+                    except Exception:
+                        self._snips_total_count = 0
                     self.snips = _lazy_pandas().read_sql_query(
                         "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,"
-                        "file_A,offset_A,nbytes_A,file_B,offset_B,nbytes_B,"
+                        "file_A,offset_A,nbytes_A,codec_A,file_B,offset_B,nbytes_B,codec_B,"
                         "area_A_Vs,peak_A_V,baseline_A_V,area_B_Vs,peak_B_V,baseline_B_V "
-                        "FROM snips ORDER BY timestamp_ns DESC LIMIT 50000",
+                        "FROM snips ORDER BY timestamp_ns DESC LIMIT ?",
                         conn,
+                        params=(self._snip_load_limit,),
                     )
             except Exception:
                 # Legacy DB schema (no channel-separated columns or baseline columns)
@@ -2746,16 +3114,17 @@ class ArchiveBrowser(ttk.Frame):
                     self.snips = _lazy_pandas().read_sql_query(
                         "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                         "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT 50000",
+                        "FROM snips WHERE session_id=? ORDER BY timestamp_ns DESC LIMIT ?",
                         conn,
-                        params=(sid,),
+                        params=(sid, self._snip_load_limit),
                     )
                     if self.snips.empty:
                         self.snips = _lazy_pandas().read_sql_query(
                             "SELECT id,session_id,timestamp_ns,buffer_index,record_in_buffer,record_global,channels_mask,sample_rate_hz,n_samples,n_channels,"
                             "file,offset_bytes,nbytes,area_A_Vs,peak_A_V,area_B_Vs,peak_B_V "
-                            "FROM snips ORDER BY timestamp_ns DESC LIMIT 50000",
+                            "FROM snips ORDER BY timestamp_ns DESC LIMIT ?",
                             conn,
+                            params=(self._snip_load_limit,),
                         )
                 except Exception:
                     pass
@@ -2771,7 +3140,15 @@ class ArchiveBrowser(ttk.Frame):
         # Populate hour list and apply hour filter
         self._populate_hours()
         self._apply_hour_filter()
-        self._set_meta(f"Snips loaded: {len(self.snips):,}")
+        loaded = len(self.snips)
+        total = int(self._snips_total_count or loaded)
+        if total > loaded:
+            self._set_meta(
+                f"Snips loaded: {loaded:,} of {total:,} "
+                f"(limited to {self._snip_load_limit:,}; set CAPPY_ARCHIVE_SNIP_LIMIT to change)"
+            )
+        else:
+            self._set_meta(f"Snips loaded: {loaded:,}")
 
     def _redraw_selected_snip(self):
         try:
@@ -2928,7 +3305,8 @@ class ArchiveBrowser(ttk.Frame):
 
         ts_ns_val = int(r["timestamp_ns"])
         ts = datetime.fromtimestamp(ts_ns_val / 1e9, tz=self._tz)
-        us_str = ts.strftime('%Y-%m-%d %H:%M:%S') + f".{ts_ns_val % 1_000_000_000 // 1000:06d}"
+        # Keep nanosecond precision so closely spaced records remain distinguishable.
+        us_str = ts.strftime('%Y-%m-%d %H:%M:%S') + f".{ts_ns_val % 1_000_000_000:09d}"
         a_vs = float(r.get("area_A_Vs", np.nan)) if "area_A_Vs" in r else float(r.get("area_A_Vs", np.nan))
         b_vs = float(r.get("area_B_Vs", np.nan)) if "area_B_Vs" in r else float(r.get("area_B_Vs", np.nan))
         self._set_meta(
@@ -3011,8 +3389,8 @@ class ArchiveBrowser(ttk.Frame):
 
         abs_ns = self._hover_ts_ns + int(t_sec * 1e9)
         abs_dt = datetime.fromtimestamp(abs_ns / 1e9, tz=self._tz)
-        us_part = abs_ns % 1_000_000_000 // 1000
-        ts_str = abs_dt.strftime('%H:%M:%S') + f".{us_part:06d}"
+        ns_part = abs_ns % 1_000_000_000
+        ts_str = abs_dt.strftime('%H:%M:%S') + f".{ns_part:09d}"
 
         # Build annotation text: timestamp + voltage right at cursor
         annot_text = f"{ts_str}\n{v_val:.6g} V"
@@ -3079,12 +3457,12 @@ class ArchiveBrowser(ttk.Frame):
 
 class LiveDashboard(ttk.Frame):
     """
-    Dashboard optimized for capture monitoring:
-      - Top stats: rate, captures, started, last capture, mean peak
-      - Plots: mean integral history + latest waveform
-    Colors:
-      - Channel A: integral RED, waveform BLUE
-      - Channel B (if enabled): PINK (dashed)
+    Dashboard optimized for capture monitoring with enhanced live updates:
+      - Color-coded stats bar with rate, captures, uptime, throughput, ring lag
+      - Artist-reuse plots for smoother redraw (no ax.clear() per frame)
+      - Channel A: Cyan waveform     Channel B: Gold waveform
+      - Integration history: Teal
+      - Adaptive FPS with backlog-aware catchup
     """
     def __init__(self, master, data_dir_var: tk.StringVar, on_status=None):
         super().__init__(master, padding=6)
@@ -3121,47 +3499,103 @@ class LiveDashboard(ttk.Frame):
         self._is_destroyed = False
         self._redraw_in_progress = False
         self._auto_trim_scope_tail = True
-        self._ui_fps = 10.0
+        self._ui_fps = 8.0  # higher default for smoother updates
         self._min_redraw_interval_s = 1.0 / self._ui_fps
         self._next_redraw_monotonic = 0.0
         self._last_plot_cfg = None
+        self._rate_history: list[float] = []  # track rate trend
 
-        # --- top stats ---
-        stats = ttk.Frame(self)
-        stats.pack(fill=tk.X, pady=(0, 6))
+        # ── Stats bar (color-coded cards) ───────────────────────────────
+        stats = tk.Frame(self, bg=T_BG)
+        stats.pack(fill=tk.X, pady=(0, 4))
 
-        def mkrow(label: str):
-            f = ttk.Frame(stats)
-            f.pack(side=tk.LEFT, padx=(0, 14))
-            ttk.Label(f, text=label).pack(anchor="w")
-            v = ttk.Label(f, text="—")
-            v.pack(anchor="w")
+        def mkcard(parent, label: str, color: str = T_TEXT_DIM, width: int = 0):
+            """Create a compact color-coded stat card."""
+            f = tk.Frame(parent, bg=T_SURFACE, padx=10, pady=4,
+                         highlightbackground=T_BORDER, highlightthickness=1)
+            f.pack(side=tk.LEFT, padx=(0, 3), fill=tk.Y)
+            tk.Label(f, text=label, font=('Consolas', 7, 'bold'),
+                     fg=color, bg=T_SURFACE, anchor='w').pack(anchor='w')
+            v = tk.Label(f, text="—", font=('Consolas', 11),
+                         fg=T_TEXT_BRIGHT, bg=T_SURFACE, anchor='w')
+            v.pack(anchor='w')
             return v
 
-        self.lbl_rate = mkrow("Rate (Hz)")
-        self.lbl_caps = mkrow("Captures (buffers)")
-        self.lbl_started = mkrow("Started")
-        self.lbl_last = mkrow("Last capture")
-        self.lbl_peak = mkrow("Mean peak (V)")
+        self.lbl_rate = mkcard(stats, "RATE (Hz)", T_CYAN)
+        self.lbl_caps = mkcard(stats, "BUFFERS", T_TEXT_DIM)
+        self.lbl_started = mkcard(stats, "STARTED", T_TEXT_DIM)
+        self.lbl_last = mkcard(stats, "LAST CAPTURE", T_GREEN)
+        self.lbl_peak = mkcard(stats, "PEAK (V)", T_GOLD)
 
-        # --- plots ---
+        # Extra live-update stats
+        stats2 = tk.Frame(self, bg=T_BG)
+        stats2.pack(fill=tk.X, pady=(0, 4))
+        self.lbl_uptime = mkcard(stats2, "UPTIME", T_GOLD)
+        self.lbl_throughput = mkcard(stats2, "THROUGHPUT", T_TEAL)
+        self.lbl_ring_lag = mkcard(stats2, "RING LAG", T_ORANGE)
+        self.lbl_state = mkcard(stats2, "STATE", T_GREEN)
+
+        # ── Plots (artist reuse for smooth updates) ─────────────────────
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
         self.fig = plt.Figure(figsize=(8.2, 7.2))
-        self.fig.patch.set_facecolor('#1e1e1e')
+        self.fig.patch.set_facecolor(T_BG)
+        self.fig.subplots_adjust(left=0.10, right=0.97, top=0.97, bottom=0.06, hspace=0.28)
 
         # Scope-like layout: Channel A (top), Channel B (middle), Integration history (bottom)
         self.ax_wfA = self.fig.add_subplot(311)
-        self.ax_wfA.set_facecolor('#2d2d2d')
+        self.ax_wfA.set_facecolor(T_SURFACE)
         self.ax_wfB = self.fig.add_subplot(312)
-        self.ax_wfB.set_facecolor('#2d2d2d')
+        self.ax_wfB.set_facecolor(T_SURFACE)
         self.ax_int = self.fig.add_subplot(313)
-        self.ax_int.set_facecolor('#2d2d2d')
+        self.ax_int.set_facecolor(T_SURFACE)
+
+        # Create persistent line artists (no ax.clear() needed)
+        (self._lineA,) = self.ax_wfA.plot([], [], color=T_CYAN, linewidth=0.9, antialiased=False)
+        (self._lineB,) = self.ax_wfB.plot([], [], color=T_GOLD, linewidth=0.9, antialiased=False)
+        (self._lineIA,) = self.ax_int.plot([], [], color=T_GREEN, linewidth=1.2, antialiased=False, label="Mean integral A (V·s)")
+        (self._lineIB,) = self.ax_int.plot([], [], color=T_GOLD, linewidth=1.2, linestyle="--", antialiased=False, label="Mean integral B (V·s)")
+
+        # Style axes once (not on every redraw)
+        for ax, ylabel, ycolor in [
+            (self.ax_wfA, "A (V)", T_CYAN),
+            (self.ax_wfB, "B (V)", T_GOLD),
+            (self.ax_int, "Integral (V·s)", T_GREEN),
+        ]:
+            ax.set_ylabel(ylabel, color=ycolor, fontsize=9)
+            ax.tick_params(colors=T_TEXT_DIM, labelsize=8)
+            ax.spines["left"].set_color(ycolor)
+            ax.spines["bottom"].set_color(T_BORDER)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            grid_color = ycolor if ax != self.ax_int else T_BORDER
+            ax.grid(True, alpha=0.12, color=grid_color, linestyle="-", linewidth=0.5)
+
+        self._artists_initialized = True
+
+        # ── Trigger level "J pointer" (horizontal line + label) ─────────
+        # Shows the trigger threshold on the Channel A waveform, like the
+        # AlazarTech front-panel J arrow.  Updated every tick from status.
+        self._trig_level_V: Optional[float] = None
+        self._trig_lineA = self.ax_wfA.axhline(y=0, color=T_MAGENTA, linewidth=1.0,
+                                                 linestyle='--', alpha=0.7, visible=False)
+        self._trig_labelA = self.ax_wfA.text(0.01, 0, 'J', transform=self.ax_wfA.get_yaxis_transform(),
+                                              color=T_MAGENTA, fontsize=10, fontweight='bold',
+                                              va='center', ha='left', visible=False,
+                                              bbox=dict(boxstyle='round,pad=0.15', facecolor=T_BG, edgecolor=T_MAGENTA, alpha=0.85))
+        # Also show on Channel B if trigger source is Channel B
+        self._trig_lineB = self.ax_wfB.axhline(y=0, color=T_MAGENTA, linewidth=1.0,
+                                                 linestyle='--', alpha=0.7, visible=False)
+        self._trig_labelB = self.ax_wfB.text(0.01, 0, 'J', transform=self.ax_wfB.get_yaxis_transform(),
+                                              color=T_MAGENTA, fontsize=10, fontweight='bold',
+                                              va='center', ha='left', visible=False,
+                                              bbox=dict(boxstyle='round,pad=0.15', facecolor=T_BG, edgecolor=T_MAGENTA, alpha=0.85))
 
         self.canvas = _FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.meta = tk.Text(self, height=3, bg='#2d2d2d', fg='white', insertbackground='white', font=('Courier', 9))
-        self.meta.pack(fill=tk.X, pady=(6, 0))
+        self.meta = tk.Text(self, height=3, bg=T_SURFACE, fg=T_TEXT, insertbackground=T_CYAN,
+                            font=('Consolas', 9), relief=tk.FLAT, bd=0, padx=8, pady=4)
+        self.meta.pack(fill=tk.X, pady=(4, 0))
         self.meta.configure(state=tk.DISABLED)
 
         self.bind("<Destroy>", self._on_destroy, add="+")
@@ -3203,6 +3637,32 @@ class LiveDashboard(ttk.Frame):
             self.meta.configure(state=tk.DISABLED)
         except Exception:
             return
+
+    def update_trigger_pointer(self, level_pct: float, source: str, vpp_a: float = 2.0, vpp_b: float = 2.0):
+        """Called by LauncherGUI/LiveControlPanel to update J pointer in real-time when slider moves."""
+        try:
+            trig_V_a = (level_pct / 100.0) * (vpp_a / 2.0)
+            trig_V_b = (level_pct / 100.0) * (vpp_b / 2.0)
+            self._trig_level_V = trig_V_a
+            src = source.strip().upper()
+            show_on_a = src in ("TRIG_CHAN_A", "TRIG_EXTERNAL", "EXTERNAL", "CHANNEL A", "")
+            show_on_b = src in ("TRIG_CHAN_B", "CHANNEL B")
+
+            self._trig_lineA.set_ydata([trig_V_a, trig_V_a])
+            self._trig_lineA.set_visible(show_on_a)
+            self._trig_labelA.set_position((0.01, trig_V_a))
+            self._trig_labelA.set_text(f"J {level_pct:+.0f}%")
+            self._trig_labelA.set_visible(show_on_a)
+
+            self._trig_lineB.set_ydata([trig_V_b, trig_V_b])
+            self._trig_lineB.set_visible(show_on_b)
+            self._trig_labelB.set_position((0.01, trig_V_b))
+            self._trig_labelB.set_text(f"J {level_pct:+.0f}%")
+            self._trig_labelB.set_visible(show_on_b)
+
+            self.canvas.draw_idle()
+        except Exception:
+            pass
 
     def _read_status(self) -> Optional[dict]:
         data_dir = Path(self.data_dir_var.get()).expanduser()
@@ -3350,17 +3810,13 @@ class LiveDashboard(ttk.Frame):
 
     def _redraw(self, snap: dict):
         """
-        Redraw all plots with optimizations for smooth scrolling.
-        Uses smart axis limits and efficient plotting for better performance.
+        Redraw all plots using artist reuse (set_data) for smooth, flicker-free updates.
+        Only relimits axes when data changes — no ax.clear() per frame.
         """
         if self._redraw_in_progress:
             return
         self._redraw_in_progress = True
         try:
-            self.ax_wfA.clear()
-            self.ax_wfB.clear()
-            self.ax_int.clear()
-
             live_cfg = snap.get("live", {}) if isinstance(snap.get("live", {}), dict) else {}
             sr_hz = _to_float(snap.get("sample_rate_hz", 0.0), 0.0)
             spr = _to_int(snap.get("samples_per_record", 0), 0)
@@ -3382,6 +3838,7 @@ class LiveDashboard(ttk.Frame):
                 if trim_idx >= 0:
                     scope_right_ms = dt_ms * float(max(1, trim_idx))
 
+            # ── Channel A waveform ──────────────────────────────────────
             if self._streamA.size > 1:
                 stream_a = self._streamA.copy()
                 stream_a = stream_a - np.mean(stream_a)
@@ -3396,18 +3853,19 @@ class LiveDashboard(ttk.Frame):
                 else:
                     x_view = x_full
                     y_view = stream_a
-                self.ax_wfA.plot(x_view, y_view, color=NEON_PINK, linewidth=0.8, antialiased=False)
+                self._lineA.set_data(x_view, y_view)
+                self.ax_wfA.set_title("")
+                # Update limits
+                if y_view.size > 0:
+                    ylo, yhi = float(np.nanmin(y_view)), float(np.nanmax(y_view))
+                    pad = max(abs(yhi - ylo) * 0.08, 1e-9)
+                    self.ax_wfA.set_ylim(ylo - pad, yhi + pad)
             else:
-                self.ax_wfA.set_title("Channel A: waiting for waveforms…", color="white")
-            self.ax_wfA.set_ylabel("A (V)", color=NEON_PINK)
-            self.ax_wfA.set_xlabel(x_label, color="white")
-            self.ax_wfA.tick_params(colors="white")
-            self.ax_wfA.spines["left"].set_color(NEON_PINK)
-            self.ax_wfA.spines["bottom"].set_color("white")
-            self.ax_wfA.spines["top"].set_visible(False)
-            self.ax_wfA.spines["right"].set_visible(False)
-            self.ax_wfA.grid(True, alpha=0.15, color=NEON_PINK, linestyle="-", linewidth=0.5)
+                self._lineA.set_data([], [])
+                self.ax_wfA.set_title("Channel A: waiting for waveforms…", color=T_TEXT_DIM, fontsize=9)
+            self.ax_wfA.set_xlabel(x_label, color=T_TEXT_DIM, fontsize=8)
 
+            # ── Channel B waveform ──────────────────────────────────────
             show_channel_b = _to_bool(live_cfg.get("show_channel_b", False), False)
             has_b_channel = show_channel_b and bool(channels_from_mask_expr(str(snap.get("channels_mask", "CHANNEL_A"))) & 0x2)
             if has_b_channel and self._streamB.size > 1 and not np.all(np.isnan(self._streamB)):
@@ -3424,23 +3882,23 @@ class LiveDashboard(ttk.Frame):
                 else:
                     xb_view = xb_full
                     yb_view = stream_b
-                self.ax_wfB.plot(xb_view, yb_view, color=NEON_GREEN, linewidth=0.8, antialiased=False)
+                self._lineB.set_data(xb_view, yb_view)
+                self.ax_wfB.set_title("")
+                if yb_view.size > 0:
+                    ylo, yhi = float(np.nanmin(yb_view)), float(np.nanmax(yb_view))
+                    pad = max(abs(yhi - ylo) * 0.08, 1e-9)
+                    self.ax_wfB.set_ylim(ylo - pad, yhi + pad)
             else:
+                self._lineB.set_data([], [])
                 if not show_channel_b:
-                    self.ax_wfB.set_title("Channel B: display disabled", color="white")
+                    self.ax_wfB.set_title("Channel B: display disabled", color=T_TEXT_DIM, fontsize=9)
                 elif has_b_channel:
-                    self.ax_wfB.set_title("Channel B: waiting for waveforms…", color="white")
+                    self.ax_wfB.set_title("Channel B: waiting for waveforms…", color=T_TEXT_DIM, fontsize=9)
                 else:
-                    self.ax_wfB.set_title("Channel B: disabled in channels mask", color="white")
-            self.ax_wfB.set_ylabel("B (V)", color=NEON_GREEN)
-            self.ax_wfB.set_xlabel(x_label, color="white")
-            self.ax_wfB.tick_params(colors="white")
-            self.ax_wfB.spines["left"].set_color(NEON_GREEN)
-            self.ax_wfB.spines["bottom"].set_color("white")
-            self.ax_wfB.spines["top"].set_visible(False)
-            self.ax_wfB.spines["right"].set_visible(False)
-            self.ax_wfB.grid(True, alpha=0.15, color=NEON_GREEN, linestyle="-", linewidth=0.5)
+                    self.ax_wfB.set_title("Channel B: disabled in channels mask", color=T_TEXT_DIM, fontsize=9)
+            self.ax_wfB.set_xlabel(x_label, color=T_TEXT_DIM, fontsize=8)
 
+            # ── X-axis limits (scope vs stream) ─────────────────────────
             if scope_mode:
                 try:
                     if self._streamA.size > 1:
@@ -3465,6 +3923,7 @@ class LiveDashboard(ttk.Frame):
                 except Exception:
                     pass
 
+            # ── Integration history ─────────────────────────────────────
             if self.t:
                 if len(self.t) > 5000:
                     step = max(1, len(self.t) // 2000)
@@ -3475,25 +3934,36 @@ class LiveDashboard(ttk.Frame):
                     t_view = self.t
                     areaA_view = self.areaA
                     areaB_view = self.areaB
-                self.ax_int.plot(t_view, areaA_view, color=NEON_PINK, linewidth=1.2, label="Mean integral A (V·s)", antialiased=False)
+                self._lineIA.set_data(t_view, areaA_view)
                 if has_b_channel and areaB_view and np.any(np.isfinite(np.asarray(areaB_view, dtype=float))) and np.any(np.abs(np.asarray(areaB_view, dtype=float)) > 0):
-                    self.ax_int.plot(t_view, areaB_view, color=NEON_GREEN, linewidth=1.2, linestyle="--", label="Mean integral B (V·s)", antialiased=False)
-                legend = self.ax_int.legend(loc="best")
-                for text in legend.get_texts():
-                    text.set_color("white")
+                    self._lineIB.set_data(t_view, areaB_view)
+                    self._lineIB.set_visible(True)
+                else:
+                    self._lineIB.set_data([], [])
+                    self._lineIB.set_visible(False)
+                # Update legend only if needed
+                if not hasattr(self, '_int_legend_drawn'):
+                    legend = self.ax_int.legend(loc="best", fontsize=7, facecolor=T_SURFACE,
+                                                 edgecolor=T_BORDER, labelcolor=T_TEXT)
+                    self._int_legend_drawn = True
+                # Update y limits
+                try:
+                    aa = np.asarray(areaA_view, dtype=float)
+                    ylo, yhi = float(np.nanmin(aa)), float(np.nanmax(aa))
+                    pad = max(abs(yhi - ylo) * 0.08, 1e-9)
+                    self.ax_int.set_ylim(ylo - pad, yhi + pad)
+                    if t_view and len(t_view) > 1:
+                        self.ax_int.set_xlim(float(t_view[0]), float(t_view[-1]))
+                except Exception:
+                    pass
+                self.ax_int.set_title("")
             else:
-                self.ax_int.set_title("Integration: waiting for data…", color="white")
-            self.ax_int.set_ylabel("Integral (V·s)", color="white")
-            self.ax_int.set_xlabel("Time (s)", color="white")
-            self.ax_int.tick_params(colors="white")
-            self.ax_int.spines["left"].set_color("white")
-            self.ax_int.spines["bottom"].set_color("white")
-            self.ax_int.spines["top"].set_visible(False)
-            self.ax_int.spines["right"].set_visible(False)
-            self.ax_int.grid(True, alpha=0.15, color="white", linestyle="-", linewidth=0.5)
+                self._lineIA.set_data([], [])
+                self._lineIB.set_data([], [])
+                self.ax_int.set_title("Integration: waiting for data…", color=T_TEXT_DIM, fontsize=9)
+            self.ax_int.set_xlabel("Time (s)", color=T_TEXT_DIM, fontsize=8)
 
-            # Synchronous paint avoids queued overlay artifacts seen with draw_idle + flush_events.
-            self.canvas.draw()
+            self.canvas.draw_idle()
         finally:
             self._redraw_in_progress = False
 
@@ -3519,7 +3989,12 @@ class LiveDashboard(ttk.Frame):
                         pass
                 # stats
                 try:
-                    self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
+                    rate_val = float(snap.get('rate_hz',0.0))
+                    self.lbl_rate.configure(text=f"{rate_val:.3f}")
+                    # Track rate trend for throughput calc
+                    self._rate_history.append(rate_val)
+                    if len(self._rate_history) > 30:
+                        self._rate_history = self._rate_history[-30:]
                 except Exception:
                     self.lbl_rate.configure(text=str(snap.get("rate_hz", "—")))
                 self.lbl_caps.configure(text=str(snap.get("buffers", "—")))
@@ -3556,9 +4031,9 @@ class LiveDashboard(ttk.Frame):
                 status_changed = self._append_point(snap)
                 # Drain a bounded number of waveforms per UI tick to avoid CPU spikes.
                 try:
-                    max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 20)) if isinstance(snap.get('live', {}), dict) else 20
+                    max_wf = int((snap.get('live', {}) or {}).get('max_waveforms_per_tick', 12)) if isinstance(snap.get('live', {}), dict) else 12
                 except Exception:
-                    max_wf = 20
+                    max_wf = 12
                 max_wf = min(max(1, int(max_wf)), LIVE_MAX_CATCHUP_WAVEFORMS_PER_TICK)
                 # If capture outpaces UI, drain more records for this tick so plots catch up.
                 backlog = max(0, int(self._ring_last_seq) - int(self._ring_play_seq))
@@ -3632,6 +4107,35 @@ class LiveDashboard(ttk.Frame):
                     self._streamB = np.empty((0,), dtype=np.float32)
                     b_cleared = True
 
+                # ── Update J trigger pointer ────────────────────────────
+                try:
+                    trig_src = str(snap.get("trigger_source", "") or "").strip().upper()
+                    trig_code = _to_int(snap.get("trigger_level_code", 128), 128)
+                    trig_pct = _level_code_to_trigger_pct(trig_code)
+                    vpp_a = _to_float(snap.get("vpp_A", 2.0), 2.0)
+                    vpp_b = _to_float(snap.get("vpp_B", 2.0), 2.0)
+                    # Convert trigger percent to volts (baseline-subtracted)
+                    # The trigger level is relative to mid-scale (0V in bipolar mode)
+                    trig_V_a = (trig_pct / 100.0) * (vpp_a / 2.0)
+                    trig_V_b = (trig_pct / 100.0) * (vpp_b / 2.0)
+                    self._trig_level_V = trig_V_a
+
+                    # Show J pointer on the relevant channel
+                    show_on_a = trig_src in ("TRIG_CHAN_A", "TRIG_EXTERNAL", "")
+                    show_on_b = trig_src == "TRIG_CHAN_B"
+
+                    self._trig_lineA.set_ydata([trig_V_a, trig_V_a])
+                    self._trig_lineA.set_visible(show_on_a and self._streamA.size > 1)
+                    self._trig_labelA.set_position((0.01, trig_V_a))
+                    self._trig_labelA.set_visible(show_on_a and self._streamA.size > 1)
+
+                    self._trig_lineB.set_ydata([trig_V_b, trig_V_b])
+                    self._trig_lineB.set_visible(show_on_b and self._streamB.size > 1)
+                    self._trig_labelB.set_position((0.01, trig_V_b))
+                    self._trig_labelB.set_visible(show_on_b and self._streamB.size > 1)
+                except Exception:
+                    pass
+
                 now_mono = time.monotonic()
                 if now_mono >= self._next_redraw_monotonic and (saw_ring_record or status_changed or cfg_changed or b_cleared):
                     self._redraw(snap)
@@ -3644,6 +4148,50 @@ class LiveDashboard(ttk.Frame):
                     except Exception:
                         latest_ring = str(self._latest_ring_unix)
                 mode = "scope" if scope_mode else "stream"
+
+                # ── Enhanced live stats ─────────────────────────────────
+                # Uptime
+                try:
+                    if self._started_unix is not None:
+                        elapsed = time.time() - float(self._started_unix)
+                        h, rem = divmod(int(elapsed), 3600)
+                        m, s = divmod(rem, 60)
+                        self.lbl_uptime.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
+                    else:
+                        self.lbl_uptime.configure(text="—")
+                except Exception:
+                    self.lbl_uptime.configure(text="—")
+
+                # Throughput (rolling average rate × records_per_buffer)
+                try:
+                    rpb = _to_int(snap.get("records_per_buffer", 0), 0)
+                    avg_rate = np.mean(self._rate_history) if self._rate_history else 0.0
+                    tput = avg_rate * max(1, rpb)
+                    if tput > 1e6:
+                        self.lbl_throughput.configure(text=f"{tput/1e6:.2f} Mrec/s")
+                    elif tput > 1e3:
+                        self.lbl_throughput.configure(text=f"{tput/1e3:.1f} krec/s")
+                    else:
+                        self.lbl_throughput.configure(text=f"{tput:.0f} rec/s")
+                except Exception:
+                    self.lbl_throughput.configure(text="—")
+
+                # Ring lag (how far behind the UI reader is from the writer)
+                try:
+                    lag = max(0, int(self._ring_last_seq) - int(self._ring_play_seq))
+                    lag_color = T_GREEN if lag < 10 else (T_ORANGE if lag < 100 else T_RED)
+                    self.lbl_ring_lag.configure(text=f"{lag:,}", fg=lag_color)
+                except Exception:
+                    self.lbl_ring_lag.configure(text="—")
+
+                # State with color coding
+                try:
+                    state = str(snap.get('state', '?') or '?')
+                    state_color = T_GREEN if state == 'capturing' else (T_ORANGE if state == 'waiting' else T_TEXT_DIM)
+                    self.lbl_state.configure(text=state, fg=state_color)
+                except Exception:
+                    self.lbl_state.configure(text="?")
+
                 self._set_meta(
                     f"State: {snap.get('state','?')}    Last ring wf: {latest_ring}    "
                     f"Points A/B: {self._streamA.size}/{self._streamB.size} (mode={mode}, window={self._stream_window})    Status: {self.status_path}"
@@ -3739,7 +4287,13 @@ class LiveControlPanel(ttk.Frame):
         self.var_ext_startcapture = tk.BooleanVar(value=False)
         self.var_trigger_delay_us = tk.DoubleVar(value=0.0)
         self._trig_level_code_var = tk.StringVar(value="code=128")
+        # K engine
+        self.var_trig_sourceK = tk.StringVar(value="Disabled")
+        self.var_trig_slopeK = tk.StringVar(value="Positive")
+        self.var_trig_levelK_pct = tk.DoubleVar(value=0.0)
+        self._trig_levelK_code_var = tk.StringVar(value="code=128")
         self.var_wf_every_n = tk.IntVar(value=16)
+        self.var_live_waveform_every_n = tk.IntVar(value=1)
         self.var_wf_max_per_sec = tk.IntVar(value=120)
 
         self.var_rearm_s = tk.IntVar(value=300)
@@ -3756,7 +4310,7 @@ class LiveControlPanel(ttk.Frame):
         self.var_ring_points = tk.IntVar(value=512)
         self.var_stream_pts = tk.IntVar(value=20000)
         self.var_stream_s = tk.DoubleVar(value=2.0)
-        self.var_max_wf_tick = tk.IntVar(value=20)
+        self.var_max_wf_tick = tk.IntVar(value=12)
         self.var_show_channel_b_live = tk.BooleanVar(value=False)
         self.var_preview_mode = tk.StringVar(value="archive_match")
         self._math_var = tk.StringVar(value="")
@@ -3768,17 +4322,35 @@ class LiveControlPanel(ttk.Frame):
         self.var_trig_source.trace_add("write", self._on_trigger_source_or_slope_change)
         self.var_trig_slope.trace_add("write", self._on_trigger_source_or_slope_change)
 
-        # Layout
+        # Layout: one vertically scrollable controls partition.
         self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
-        left = ttk.Frame(self, padding=8)
-        left.grid(row=0, column=0, sticky="nsew")
-        right = ttk.Frame(self, padding=8)
-        right.grid(row=0, column=1, sticky="nsew")
-        left.columnconfigure(0, weight=1)
-        right.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        scroll_host = ttk.Frame(self, padding=(8, 8, 0, 8))
+        scroll_host.grid(row=0, column=0, sticky="nsew")
+        scroll_host.columnconfigure(0, weight=1)
+        scroll_host.rowconfigure(0, weight=1)
 
-        acq = ttk.LabelFrame(left, text="Acquire", padding=8)
+        self._scroll_canvas = tk.Canvas(
+            scroll_host,
+            bg=T_BG,
+            highlightthickness=0,
+            bd=0,
+            relief=tk.FLAT,
+        )
+        self._scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self._scrollbar_y = ttk.Scrollbar(scroll_host, orient=tk.VERTICAL, command=self._scroll_canvas.yview)
+        self._scrollbar_y.grid(row=0, column=1, sticky="ns")
+        self._scroll_canvas.configure(yscrollcommand=self._scrollbar_y.set)
+
+        self._controls_root = ttk.Frame(self._scroll_canvas, padding=(0, 0, 8, 0))
+        self._controls_root.columnconfigure(0, weight=1)
+        self._controls_root_window = self._scroll_canvas.create_window((0, 0), window=self._controls_root, anchor="nw")
+        self._controls_root.bind("<Configure>", self._on_controls_root_configure, add="+")
+        self._scroll_canvas.bind("<Configure>", self._on_controls_canvas_configure, add="+")
+        self._wheel_bound = False
+        self._bind_controls_mousewheel()
+
+        acq = ttk.LabelFrame(self._controls_root, text="  ▸ Acquire", padding=8, style='Acquire.TLabelframe')
         acq.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         acq.columnconfigure(1, weight=1)
         self._add_combobox(acq, 0, "Clock source", self.var_clock_source, ["INTERNAL_CLOCK", "EXTERNAL_CLOCK_10MHZ_REF"])
@@ -3792,7 +4364,7 @@ class LiveControlPanel(ttk.Frame):
         self._add_spinbox(acq, 8, "Buffers/acquisition (0=run)", self.var_bpa, from_=0, to=2_000_000_000, increment=1)
         self._add_spinbox(acq, 9, "DMA wait timeout (ms)", self.var_wait_timeout_ms, from_=10, to=120_000, increment=10)
 
-        vert = ttk.LabelFrame(left, text="Vertical", padding=8)
+        vert = ttk.LabelFrame(self._controls_root, text="  ▸ Vertical", padding=8, style='Vertical.TLabelframe')
         vert.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         vert.columnconfigure(1, weight=1)
         ttk.Label(vert, text="Channel A").grid(row=0, column=0, sticky="w")
@@ -3805,8 +4377,8 @@ class LiveControlPanel(ttk.Frame):
         self._add_combobox(vert, 7, "B coupling", self.var_coupling_b, COUPLING_OPTIONS)
         self._add_combobox(vert, 8, "B impedance", self.var_imp_b, IMPEDANCE_OPTIONS)
 
-        trig = ttk.LabelFrame(right, text="Trigger", padding=8)
-        trig.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        trig = ttk.LabelFrame(self._controls_root, text="  ▸ Trigger", padding=8, style='Trigger.TLabelframe')
+        trig.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         trig.columnconfigure(1, weight=1)
         self._add_combobox(trig, 0, "Mode", self.var_trig_mode, TRIGGER_MODE_OPTIONS, width=18)
         self._add_combobox(trig, 1, "Source", self.var_trig_source, list(TRIGGER_SOURCE_LABEL_TO_CONST.keys()), width=12)
@@ -3846,8 +4418,25 @@ class LiveControlPanel(ttk.Frame):
             row=10, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
 
-        live = ttk.LabelFrame(right, text="Runtime / Storage / Live", padding=8)
-        live.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        # ── Engine K ────────────────────────────────────────────────────
+        ttk.Separator(trig, orient=tk.HORIZONTAL).grid(row=11, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(trig, text="Engine K", font=('Consolas', 9, 'bold')).grid(row=12, column=0, sticky="w")
+        self._add_combobox(trig, 13, "K Source", self.var_trig_sourceK, list(TRIGGER_SOURCEK_LABEL_TO_CONST.keys()), width=12)
+        self._add_combobox(trig, 14, "K Slope", self.var_trig_slopeK, list(TRIGGER_SLOPE_LABEL_TO_CONST.keys()), width=12)
+        ttk.Label(trig, text="K Level (%FS)").grid(row=15, column=0, sticky="w", pady=2)
+        trigK_level = ttk.Frame(trig)
+        trigK_level.grid(row=15, column=1, sticky="ew", padx=(8, 0), pady=2)
+        trigK_level.columnconfigure(0, weight=1)
+        ttk.Scale(
+            trigK_level, from_=-100.0, to=100.0, orient=tk.HORIZONTAL,
+            variable=self.var_trig_levelK_pct,
+            command=lambda _v: self._sync_trigK_level_code(),
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Entry(trigK_level, textvariable=self.var_trig_levelK_pct, width=7).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(trigK_level, textvariable=self._trig_levelK_code_var, width=10).grid(row=0, column=2, padx=(6, 0))
+
+        live = ttk.LabelFrame(self._controls_root, text="  ▸ Runtime / Storage / Live", padding=8, style='Runtime.TLabelframe')
+        live.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         live.columnconfigure(1, weight=1)
         ttk.Label(live, text="Runtime profile").grid(row=0, column=0, sticky="w", pady=2)
         live_profile = ttk.Frame(live)
@@ -3879,21 +4468,41 @@ class LiveControlPanel(ttk.Frame):
         self._add_spinbox(live, 11, "Live window seconds", self.var_stream_s, from_=0.25, to=120.0, increment=0.1, width=10)
         self._add_spinbox(live, 12, "Max waveforms/tick", self.var_max_wf_tick, from_=1, to=2000, increment=1)
         self._add_spinbox(live, 13, "Save waveform every N", self.var_wf_every_n, from_=1, to=10_000_000, increment=1)
-        self._add_spinbox(live, 14, "Saved waveforms/sec cap", self.var_wf_max_per_sec, from_=1, to=50_000, increment=1)
+        ttk.Label(live, text="Live waveform every N buffers").grid(row=14, column=0, sticky="w", pady=2)
+        wf_slider = ttk.Frame(live)
+        wf_slider.grid(row=14, column=1, sticky="ew", padx=(8, 0), pady=2)
+        wf_slider.columnconfigure(0, weight=1)
+        tk.Scale(
+            wf_slider,
+            from_=1,
+            to=WAVEFORM_EVERY_N_MAX,
+            orient=tk.HORIZONTAL,
+            resolution=1,
+            showvalue=False,
+            variable=self.var_live_waveform_every_n,
+            command=lambda _v: self._harmonize_controls(),
+            bg=T_BG,
+            fg=T_TEXT,
+            troughcolor=T_SURFACE,
+            highlightthickness=0,
+            activebackground=T_CYAN,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(wf_slider, textvariable=self.var_live_waveform_every_n, width=6).grid(row=0, column=1, padx=(6, 0))
+        self._add_spinbox(live, 15, "Saved waveforms/sec cap", self.var_wf_max_per_sec, from_=1, to=50_000, increment=1)
         ttk.Checkbutton(live, text="Show Channel B live waveform", variable=self.var_show_channel_b_live).grid(
-            row=15, column=0, columnspan=2, sticky="w", pady=(4, 2)
+            row=16, column=0, columnspan=2, sticky="w", pady=(4, 2)
         )
-        self._add_combobox(live, 16, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
-        ttk.Label(live, textvariable=self._math_var).grid(row=17, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._add_combobox(live, 17, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
+        ttk.Label(live, textvariable=self._math_var).grid(row=18, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        disk = ttk.LabelFrame(right, text="Disk write status", padding=8)
-        disk.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        disk = ttk.LabelFrame(self._controls_root, text="  ▸ Disk write status", padding=8, style='Disk.TLabelframe')
+        disk.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(disk, textvariable=self._out_var).pack(anchor="w")
         ttk.Label(disk, textvariable=self._written_var).pack(anchor="w", pady=(2, 0))
         ttk.Label(disk, textvariable=self._flush_var).pack(anchor="w", pady=(2, 0))
 
-        tools = ttk.Frame(self, padding=(8, 0))
-        tools.grid(row=2, column=0, columnspan=2, sticky="ew")
+        tools = ttk.Frame(self._controls_root, padding=(0, 0, 0, 8))
+        tools.grid(row=5, column=0, sticky="ew")
         ttk.Button(tools, text="Save Controls To YAML", command=self.launcher._save_controls_to_yaml).pack(side=tk.LEFT)
         ttk.Button(tools, text="Reload Controls From YAML", command=self.launcher._load_controls_from_yaml).pack(side=tk.LEFT)
         ttk.Label(tools, textvariable=self._msg_var).pack(side=tk.LEFT, padx=(12, 0))
@@ -3921,15 +4530,24 @@ class LiveControlPanel(ttk.Frame):
             increment=increment,
             textvariable=var,
             width=width,
-            bg="#3d3d3d",
-            fg="white",
-            insertbackground="white",
-            buttonbackground="#404040",
+            bg=T_SURFACE,
+            fg=T_TEXT,
+            insertbackground=T_CYAN,
+            buttonbackground=T_BTN,
             relief=tk.FLAT,
+            highlightbackground=T_BORDER,
+            highlightcolor=T_CYAN,
+            highlightthickness=1,
+            selectbackground=T_SEL_HI,
+            selectforeground=T_TEXT_BRIGHT,
         )
         sb.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
         sb.bind("<FocusOut>", lambda _e: self._harmonize_controls())
         sb.bind("<Return>", lambda _e: self._harmonize_controls())
+        # Block scroll wheel from changing spinbox values
+        sb.bind("<MouseWheel>", lambda e: "break")
+        sb.bind("<Button-4>", lambda e: "break")
+        sb.bind("<Button-5>", lambda e: "break")
         return sb
 
     def _add_readonly_value(self, parent: ttk.Widget, row: int, label: str, var: tk.Variable) -> None:
@@ -3940,6 +4558,68 @@ class LiveControlPanel(ttk.Frame):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
         cb = ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width)
         cb.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
+        # Block scroll wheel from changing combobox selection
+        cb.bind("<MouseWheel>", lambda e: "break")
+        cb.bind("<Button-4>", lambda e: "break")
+        cb.bind("<Button-5>", lambda e: "break")
+
+    def _on_controls_root_configure(self, _evt=None) -> None:
+        try:
+            self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_controls_canvas_configure(self, evt=None) -> None:
+        try:
+            width = int(getattr(evt, "width", 0) or self._scroll_canvas.winfo_width())
+            if width > 0:
+                self._scroll_canvas.itemconfigure(self._controls_root_window, width=width)
+        except Exception:
+            pass
+
+    def _bind_controls_mousewheel(self) -> None:
+        if self._wheel_bound:
+            return
+        self._wheel_bound = True
+        self.bind_all("<MouseWheel>", self._on_controls_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_controls_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_controls_mousewheel, add="+")
+
+    def _is_descendant(self, widget: tk.Misc, ancestor: tk.Misc) -> bool:
+        w = widget
+        while w is not None:
+            if w == ancestor:
+                return True
+            parent_name = getattr(w, "winfo_parent", lambda: "")()
+            if not parent_name:
+                return False
+            try:
+                w = w.nametowidget(parent_name)
+            except Exception:
+                return False
+        return False
+
+    def _on_controls_mousewheel(self, evt) -> str:
+        try:
+            target = getattr(evt, "widget", None)
+            if target is None:
+                return ""
+            if not (self._is_descendant(target, self._controls_root) or self._is_descendant(target, self._scroll_canvas)):
+                return ""
+            if getattr(evt, "num", None) == 4:
+                self._scroll_canvas.yview_scroll(-1, "units")
+                return "break"
+            if getattr(evt, "num", None) == 5:
+                self._scroll_canvas.yview_scroll(1, "units")
+                return "break"
+            delta = int(getattr(evt, "delta", 0))
+            if delta == 0:
+                return "break"
+            steps = int(-delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+            self._scroll_canvas.yview_scroll(steps, "units")
+            return "break"
+        except Exception:
+            return "break"
 
     def _set_trigger_level_pct(self, pct: float) -> None:
         src = self._var_text(self.var_trig_source, "External")
@@ -3969,6 +4649,24 @@ class LiveControlPanel(ttk.Frame):
         pct = _clamp_float(self._safe_float(self.var_trig_level_pct, 0.0), -100.0, 100.0, 0.0)
         code = _trigger_pct_to_level_code(pct, 0.0)
         self._trig_level_code_var.set(f"code={code}")
+        # Update the J trigger pointer on the live dashboard in real-time
+        try:
+            dashboard = getattr(self.launcher, 'dashboard', None)
+            if dashboard is not None and hasattr(dashboard, 'update_trigger_pointer'):
+                src_label = self._var_text(self.var_trig_source, "External")
+                src_const = TRIGGER_SOURCE_LABEL_TO_CONST.get(src_label, "TRIG_EXTERNAL")
+                range_a = self._var_text(self.var_range_a, "PM_1_V")
+                range_b = self._var_text(self.var_range_b, "PM_1_V")
+                vpp_a = _range_name_to_vpp(range_a, 2.0)
+                vpp_b = _range_name_to_vpp(range_b, 2.0)
+                dashboard.update_trigger_pointer(pct, src_const, vpp_a, vpp_b)
+        except Exception:
+            pass
+
+    def _sync_trigK_level_code(self, *_args) -> None:
+        pct = _clamp_float(self._safe_float(self.var_trig_levelK_pct, 0.0), -100.0, 100.0, 0.0)
+        code = _trigger_pct_to_level_code(pct, 0.0)
+        self._trig_levelK_code_var.set(f"code={code}")
 
     def _round_up_to_step(self, value: int, step: int, min_value: int = 0) -> int:
         st = max(1, int(step))
@@ -3986,6 +4684,7 @@ class LiveControlPanel(ttk.Frame):
         self.var_rpb.trace_add("write", self._on_harmonize_var)
         self.var_flush_records.trace_add("write", self._on_harmonize_var)
         self.var_wf_every_n.trace_add("write", self._on_harmonize_var)
+        self.var_live_waveform_every_n.trace_add("write", self._on_harmonize_var)
         self.var_wf_max_per_sec.trace_add("write", self._on_harmonize_var)
         self.var_sqlite_commit.trace_add("write", self._on_harmonize_var)
         self.var_ring_points.trace_add("write", self._on_harmonize_var)
@@ -4031,6 +4730,7 @@ class LiveControlPanel(ttk.Frame):
             flush = self._round_up_to_step(flush, rpb, rpb)
             flush = min(flush, 50_000_000)
             wf_every_n = _clamp_int(self._safe_int(self.var_wf_every_n, 16), 1, 10_000_000, 16)
+            live_waveform_every_n = _clamp_int(self._safe_int(self.var_live_waveform_every_n, 1), 1, WAVEFORM_EVERY_N_MAX, 1)
             wf_max_per_sec = _clamp_int(self._safe_int(self.var_wf_max_per_sec, 120), 1, 50_000, 120)
 
             sqlite_commit = _clamp_int(self._safe_int(self.var_sqlite_commit, 200), 1, 10_000_000, 200)
@@ -4064,6 +4764,7 @@ class LiveControlPanel(ttk.Frame):
             self.var_rpb.set(int(rpb))
             self.var_flush_records.set(int(flush))
             self.var_wf_every_n.set(int(wf_every_n))
+            self.var_live_waveform_every_n.set(int(live_waveform_every_n))
             self.var_wf_max_per_sec.set(int(wf_max_per_sec))
             self.var_sqlite_commit.set(int(sqlite_commit))
             self.var_ring_points.set(int(ring_points))
@@ -4088,7 +4789,7 @@ class LiveControlPanel(ttk.Frame):
             self._math_var.set(
                 f"Math: post = samples - pre ({post}); flush/commit step = records_per_buffer ({rpb}); "
                 f"record={record_us:.3f} us, buffer={buffer_ms:.3f} ms, live window={stream_s:.3f} s, "
-                f"snips every {wf_every_n} rec (cap {wf_max_per_sec}/s){delay_str}."
+                f"live every {live_waveform_every_n} buffers, snips every {wf_every_n} rec (cap {wf_max_per_sec}/s){delay_str}."
             )
         finally:
             self._harmonizing = False
@@ -4103,7 +4804,7 @@ class LiveControlPanel(ttk.Frame):
             sqlite_commit_every_snips=self._safe_int(self.var_sqlite_commit, 200),
             stream_window_points=self._safe_int(self.var_stream_pts, 20000),
             stream_window_seconds=self._safe_float(self.var_stream_s, 2.0),
-            max_waveforms_per_tick=self._safe_int(self.var_max_wf_tick, 20),
+            max_waveforms_per_tick=self._safe_int(self.var_max_wf_tick, 12),
         )
         for name, preset in RUNTIME_PROFILE_PRESETS.items():
             match = True
@@ -4211,6 +4912,14 @@ class LiveControlPanel(ttk.Frame):
             self.var_ext_coupling.set(str(trig.get("ext_coupling", "DC_COUPLING")))
             self.var_ext_startcapture.set(bool(trig.get("external_startcapture", False)))
             self.var_trigger_delay_us.set(float(trig.get("trigger_delay_us", 0.0) or 0.0))
+            # K engine
+            srcK = str(trig.get("sourceK", "TRIG_DISABLE") or "TRIG_DISABLE")
+            slopeK = str(trig.get("slopeK", "TRIGGER_SLOPE_POSITIVE") or "TRIGGER_SLOPE_POSITIVE")
+            levelK_code = _to_int(trig.get("levelK", 128), 128)
+            self.var_trig_sourceK.set(TRIGGER_SOURCEK_CONST_TO_LABEL.get(srcK, "Disabled"))
+            self.var_trig_slopeK.set(TRIGGER_SLOPE_CONST_TO_LABEL.get(slopeK, "Positive"))
+            self.var_trig_levelK_pct.set(round(_level_code_to_trigger_pct(levelK_code, 128), 3))
+            self._sync_trigK_level_code()
             self._sync_trigger_level_code()
             self.var_wf_every_n.set(_to_int(waves.get("every_n", 16), 16))
             self.var_wf_max_per_sec.set(_to_int(waves.get("max_waveforms_per_sec", 120), 120))
@@ -4232,9 +4941,10 @@ class LiveControlPanel(ttk.Frame):
 
             self.var_ring_slots.set(_to_int(live.get("ring_slots", 4096), 4096))
             self.var_ring_points.set(_to_int(live.get("ring_points", 512), 512))
+            self.var_live_waveform_every_n.set(_to_int(live.get("waveform_every_n_buffers", 1), 1))
             self.var_stream_pts.set(_to_int(live.get("stream_window_points", 20000), 20000))
             self.var_stream_s.set(_to_float(live.get("stream_window_seconds", 2.0), 2.0))
-            self.var_max_wf_tick.set(_to_int(live.get("max_waveforms_per_tick", 20), 20))
+            self.var_max_wf_tick.set(_to_int(live.get("max_waveforms_per_tick", 12), 12))
             self.var_show_channel_b_live.set(_to_bool(live.get("show_channel_b", False), False))
             self.var_preview_mode.set(str(live.get("preview_mode", "archive_match")))
             if not rt_profile_norm:
@@ -4313,9 +5023,9 @@ class LiveControlPanel(ttk.Frame):
         trig["slopeJ"] = TRIGGER_SLOPE_LABEL_TO_CONST.get(self._var_text(self.var_trig_slope, "Positive"), "TRIGGER_SLOPE_POSITIVE")
         trig["levelJ"] = _trigger_pct_to_level_code(self._safe_float(self.var_trig_level_pct, 0.0), 0.0)
         self._sync_trigger_level_code()
-        trig["sourceK"] = str(trig.get("sourceK", "TRIG_DISABLE") or "TRIG_DISABLE")
-        trig["slopeK"] = str(trig.get("slopeK", "TRIGGER_SLOPE_POSITIVE") or "TRIGGER_SLOPE_POSITIVE")
-        trig["levelK"] = _clamp_int(trig.get("levelK", 128), 0, 255, 128)
+        trig["sourceK"] = TRIGGER_SOURCEK_LABEL_TO_CONST.get(self._var_text(self.var_trig_sourceK, "Disabled"), "TRIG_DISABLE")
+        trig["slopeK"] = TRIGGER_SLOPE_LABEL_TO_CONST.get(self._var_text(self.var_trig_slopeK, "Positive"), "TRIGGER_SLOPE_POSITIVE")
+        trig["levelK"] = _trigger_pct_to_level_code(self._safe_float(self.var_trig_levelK_pct, 0.0), 0.0)
         trig["timeout_ms"] = self._safe_int(self.var_trig_timeout_ms, 0)
         trig["timeout_pause_s"] = self._safe_float(self.var_timeout_pause_s, 0.0)
         trig["ext_range"] = self._var_text(self.var_ext_range, "ETR_5V") or "ETR_5V"
@@ -4338,9 +5048,12 @@ class LiveControlPanel(ttk.Frame):
 
         live["ring_slots"] = self._safe_int(self.var_ring_slots, 4096)
         live["ring_points"] = self._safe_int(self.var_ring_points, 512)
+        live["waveform_every_n_buffers"] = _clamp_int(
+            self._safe_int(self.var_live_waveform_every_n, 1), 1, WAVEFORM_EVERY_N_MAX, 1
+        )
         live["stream_window_points"] = self._safe_int(self.var_stream_pts, 20000)
         live["stream_window_seconds"] = self._safe_float(self.var_stream_s, 2.0)
-        live["max_waveforms_per_tick"] = self._safe_int(self.var_max_wf_tick, 20)
+        live["max_waveforms_per_tick"] = self._safe_int(self.var_max_wf_tick, 12)
         live["show_channel_b"] = bool(self.var_show_channel_b_live.get())
         live["preview_mode"] = self._var_text(self.var_preview_mode, "archive_match") or "archive_match"
 
@@ -4372,33 +5085,71 @@ class LauncherGUI(tk.Tk):
         self._close_after_id = None
         self._is_closing = False
 
-        # Apply dark mode theme
-        self.tk_setPalette(background='#2d2d2d', foreground='white', activeBackground='#404040', activeForeground='white')
+        # ── Sleek dark theme ──────────────────────────────────────────────
+        self.tk_setPalette(
+            background=T_BG, foreground=T_TEXT,
+            activeBackground=T_BTN_HI, activeForeground=T_TEXT_BRIGHT,
+        )
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure('TFrame', background='#2d2d2d')
-        style.configure('TLabel', background='#2d2d2d', foreground='white')
-        style.configure('TButton', background='#404040', foreground='white', borderwidth=1)
-        style.map('TButton', background=[('active', '#505050')])
-        style.configure('TLabelframe', background='#2d2d2d', foreground='white')
-        style.configure('TLabelframe.Label', background='#2d2d2d', foreground='white')
-        style.configure('TCheckbutton', background='#2d2d2d', foreground='white')
-        style.map('TCheckbutton', background=[('active', '#2d2d2d')], foreground=[('active', 'white')])
-        style.configure('TNotebook', background='#2d2d2d', borderwidth=0)
-        style.configure('TNotebook.Tab', background='#404040', foreground='white', padding=[20, 10])
-        style.map('TNotebook.Tab', background=[('selected', '#505050')])
-        style.configure('TEntry', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white', borderwidth=1)
-        style.configure('TCombobox', fieldbackground='#3d3d3d', background='#3d3d3d', foreground='white')
+        style.configure('TFrame',             background=T_BG)
+        style.configure('TLabel',             background=T_BG, foreground=T_TEXT)
+        style.configure('TButton',            background=T_BTN, foreground=T_TEXT,
+                         borderwidth=1, relief='flat', padding=(10, 4))
+        style.map('TButton',                  background=[('active', T_BTN_HI)])
+        style.configure('TLabelframe',        background=T_BG, foreground=T_TEXT,
+                         bordercolor=T_BORDER, relief='flat', borderwidth=1)
+        style.configure('TLabelframe.Label',  background=T_BG, foreground=T_CYAN)
+        style.configure('TCheckbutton',       background=T_BG, foreground=T_TEXT)
+        style.map('TCheckbutton',             background=[('active', T_BG)],
+                   foreground=[('active', T_TEXT_BRIGHT)])
+        style.configure('TNotebook',          background=T_BG, borderwidth=0, tabmargins=(2, 4, 2, 0))
+        style.configure('TNotebook.Tab',      background=T_BTN, foreground=T_TEXT_DIM,
+                         padding=[20, 8], font=('Consolas', 9))
+        style.map('TNotebook.Tab',            background=[('selected', T_SURFACE2)],
+                   foreground=[('selected', T_CYAN)])
+        style.configure('TEntry',             fieldbackground=T_SURFACE, background=T_SURFACE,
+                         foreground=T_TEXT, borderwidth=1, relief='flat',
+                         insertcolor=T_CYAN)
+        style.configure('TCombobox',          fieldbackground=T_SURFACE, background=T_SURFACE,
+                         foreground=T_TEXT, arrowcolor=T_TEXT_DIM)
         style.map(
             'TCombobox',
-            fieldbackground=[('readonly', '#3d3d3d')],
-            foreground=[('readonly', 'white')],
-            selectforeground=[('readonly', 'white')],
-            selectbackground=[('readonly', '#3d3d3d')],
+            fieldbackground=[('readonly', T_SURFACE)],
+            foreground=[('readonly', T_TEXT)],
+            selectforeground=[('readonly', T_TEXT_BRIGHT)],
+            selectbackground=[('readonly', T_SEL)],
         )
-        style.configure('Treeview', background='#262626', fieldbackground='#262626', foreground='white', borderwidth=0, rowheight=22)
-        style.configure('Treeview.Heading', background='#3a3a3a', foreground='white')
-        style.map('Treeview', background=[('selected', '#505050')], foreground=[('selected', 'white')])
+        style.configure('Treeview',           background=T_SURFACE, fieldbackground=T_SURFACE,
+                         foreground=T_TEXT, borderwidth=0, rowheight=24,
+                         font=('Consolas', 9))
+        style.configure('Treeview.Heading',   background=T_BORDER, foreground=T_CYAN,
+                         font=('Consolas', 9, 'bold'))
+        style.map('Treeview',                 background=[('selected', T_SEL_HI)],
+                   foreground=[('selected', T_TEXT_BRIGHT)])
+        style.configure('TScrollbar',         background=T_BORDER, troughcolor=T_BG,
+                         arrowcolor=T_TEXT_DIM)
+        style.configure('TPanedwindow',       background=T_BG)
+        style.configure('TSeparator',         background=T_BORDER)
+        style.configure('TScale',             background=T_BG, troughcolor=T_SURFACE)
+        # Colored section label-frames
+        style.configure('Acquire.TLabelframe.Label', foreground=T_CYAN)
+        style.configure('Vertical.TLabelframe.Label', foreground=T_TEAL)
+        style.configure('Trigger.TLabelframe.Label', foreground=T_MAGENTA)
+        style.configure('Runtime.TLabelframe.Label', foreground=T_GREEN)
+        style.configure('Disk.TLabelframe.Label', foreground=T_ORANGE)
+        # Primary action button — subtle dark with cyan text, not a bright block
+        style.configure('Primary.TButton',    background=T_BTN, foreground=T_CYAN,
+                         font=('Consolas', 10, 'bold'), padding=(14, 6),
+                         borderwidth=1, relief='flat')
+        style.map('Primary.TButton',          background=[('active', T_BTN_HI)],
+                   foreground=[('active', T_TEXT_BRIGHT)])
+        # Stop button — subtle dark with red text
+        style.configure('Stop.TButton',       background=T_BTN, foreground=T_RED,
+                         font=('Consolas', 10, 'bold'), padding=(14, 6),
+                         borderwidth=1, relief='flat')
+        style.map('Stop.TButton',             background=[('active', T_BTN_HI)],
+                   foreground=[('active', '#ff1744')])
 
         self.var_config = tk.StringVar(value="CAPPY_v1_3.yaml")
         self.var_data_dir = tk.StringVar(value=_preferred_data_dir("dataFile"))
@@ -4436,10 +5187,10 @@ class LauncherGUI(tk.Tk):
         ctrl = ttk.Frame(self, padding=8)
         ctrl.pack(fill=tk.X)
 
-        self.btn = ttk.Button(ctrl, text="Start Capture", command=self._toggle)
+        self.btn = ttk.Button(ctrl, text="Start Capture", command=self._toggle, style='Primary.TButton')
         self.btn.pack(side=tk.LEFT)
-        ttk.Button(ctrl, text="Stop", command=self._stop).pack(side=tk.LEFT, padx=(8,0))
-        self.lbl = ttk.Label(ctrl, text="State: idle")
+        ttk.Button(ctrl, text="Stop", command=self._stop, style='Stop.TButton').pack(side=tk.LEFT, padx=(8,0))
+        self.lbl = ttk.Label(ctrl, text="State: idle", foreground=T_TEXT_DIM, font=('Consolas', 10))
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
         # Overview/log on left, always-visible controls on right
@@ -4462,7 +5213,7 @@ class LauncherGUI(tk.Tk):
 
         logbox = ttk.Frame(tabs, padding=6)
         tabs.add(logbox, text="Log")
-        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg='#2d2d2d', fg='#00ff41', insertbackground='white', font=('Courier', 9))
+        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg=T_SURFACE, fg=T_GREEN, insertbackground=T_CYAN, font=('Consolas', 9), relief=tk.FLAT, bd=0, padx=6, pady=4)
         self.log.pack(fill=tk.BOTH, expand=True)
 
         self.live_panel = LiveControlPanel(right, self)
@@ -4531,7 +5282,7 @@ class LauncherGUI(tk.Tk):
         try:
             if not bool(self.winfo_exists()):
                 return
-            self._poll_after_id = self.after(50, self._poll)
+            self._poll_after_id = self.after(80, self._poll)
         except Exception:
             self._poll_after_id = None
 
@@ -4548,7 +5299,39 @@ class LauncherGUI(tk.Tk):
         except Exception:
             return
 
-    def _capture_disk_size(self, data_dir: Path) -> int:
+    def _capture_disk_size(self, data_dir: Path, session_id: str = "") -> int:
+        """
+        Estimate on-disk bytes for capture output with throttled scans.
+        Prefer current session's day folder when session_id is available.
+        """
+        now = time.time()
+        if (now - float(self._last_disk_scan_unix)) < float(self._disk_scan_interval_s):
+            return int(self._last_disk_size_bytes)
+
+        base = data_dir / "captures"
+        scan_root = base
+        sid = str(session_id or "").strip()
+        if len(sid) >= 8 and sid[:8].isdigit():
+            ymd = sid[:8]
+            candidate = base / ymd[:4] / f"{ymd[:4]}-{ymd[4:6]}" / f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+            if candidate.exists():
+                scan_root = candidate
+
+        total = 0
+        try:
+            if scan_root.exists():
+                for root, _dirs, files in os.walk(scan_root):
+                    for fn in files:
+                        fp = Path(root) / fn
+                        try:
+                            total += int(fp.stat().st_size)
+                        except Exception:
+                            pass
+        except Exception:
+            return int(self._last_disk_size_bytes)
+
+        self._last_disk_scan_unix = now
+        self._last_disk_size_bytes = max(int(total), int(self._last_disk_size_bytes))
         return int(self._last_disk_size_bytes)
 
 
@@ -4595,7 +5378,10 @@ class LauncherGUI(tk.Tk):
         try:
             reduced = int(snap.get("reduced_rows", 0))
             snips = int(snap.get("snips", 0))
-            disk_bytes = _to_int(snap.get("disk_bytes", self._capture_disk_size(data_dir_path)), self._capture_disk_size(data_dir_path))
+            sid = str(snap.get("session_id", "") or "")
+            disk_est = self._capture_disk_size(data_dir_path, sid)
+            snap_disk = _to_int(snap.get("disk_bytes", -1), -1)
+            disk_bytes = int(max(disk_est, snap_disk if snap_disk >= 0 else 0))
             self._live_written.set(
                 f"Written: reduced_rows={reduced:,}   snips={snips:,}   disk={_format_size_gib(disk_bytes)}"
             )
@@ -4634,10 +5420,18 @@ class LauncherGUI(tk.Tk):
             if errs:
                 messagebox.showerror("CAPPY", "Cannot save config:\n- " + "\n- ".join(errs))
                 return
-            _atomic_write_text(
-                cfg_path,
-                yaml.safe_dump(out_cfg, sort_keys=False, default_flow_style=False),
-            )
+            # Backup current config before overwriting
+            if cfg_path.exists():
+                bak = cfg_path.with_suffix(cfg_path.suffix + ".bak")
+                try:
+                    import shutil as _shutil_bak
+                    _shutil_bak.copy2(str(cfg_path), str(bak))
+                except Exception:
+                    pass
+            header = f"# CAPPY v1.3 config — saved {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            body = yaml.safe_dump(out_cfg, sort_keys=False, default_flow_style=False,
+                                  allow_unicode=True, width=120)
+            _atomic_write_text(cfg_path, header + body)
             self._append(f"[CAPPY] Saved controls to {cfg_path}")
             for w in warns:
                 self._append(f"[CAPPY] Config warning: {w}")
@@ -4676,9 +5470,20 @@ class LauncherGUI(tk.Tk):
             data_path = Path(self.var_data_dir.get())
             _ensure_dir(data_path)
             win = tk.Toplevel(self)
-            win.title('CAPPY Archive')
-            app = ArchiveBrowser(data_path, master=win)
-            app.pack(fill=tk.BOTH, expand=True)
+            # Prefer the optimized archive DB browser when available
+            try:
+                from cappy_archive_db import ArchiveDB, run_archive_db, C_BG
+                win.title('CAPPY.ARCH v1.3')
+                win.configure(bg=C_BG)
+                win.geometry("1440x920")
+                win.minsize(900, 600)
+                app = ArchiveDB(data_path, master=win)
+                app.pack(fill=tk.BOTH, expand=True)
+                win.protocol("WM_DELETE_WINDOW", lambda: (app.destroy(), win.destroy()))
+            except ImportError:
+                win.title('CAPPY Archive')
+                app = ArchiveBrowser(data_path, master=win)
+                app.pack(fill=tk.BOTH, expand=True)
         except Exception as e:
             messagebox.showerror('CAPPY', str(e))
 
@@ -4767,7 +5572,7 @@ class LauncherGUI(tk.Tk):
             messagebox.showerror("CAPPY", f"Failed to start capture:\n{e}")
             return
 
-        self.lbl.config(text="State: capturing")
+        self.lbl.config(text="State: capturing", foreground=T_GREEN)
         self.btn.config(text="Stop Capture")
 
     def _stop(self):
@@ -4847,7 +5652,7 @@ class LauncherGUI(tk.Tk):
                 self._append(f"[GUI] DAQ exited rc={rc}")
                 self.proc = None
                 self.pump = None
-                self.lbl.config(text="State: idle")
+                self.lbl.config(text="State: idle", foreground=T_TEXT_DIM)
                 self.btn.config(text="Start Capture")
 
         self._schedule_poll()
