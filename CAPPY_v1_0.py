@@ -205,7 +205,7 @@ RUNTIME_PROFILE_PRESETS = {
         "flush_every_records": 20000,
         "flush_every_seconds": 2.0,
         "sqlite_commit_every_snips": 200,
-        "stream_window_points": 20000,
+        "stream_window_points": 100000,
         "stream_window_seconds": 2.0,
         "max_waveforms_per_tick": 20,
     },
@@ -216,7 +216,7 @@ RUNTIME_PROFILE_PRESETS = {
         "flush_every_records": 20000,
         "flush_every_seconds": 2.0,
         "sqlite_commit_every_snips": 200,
-        "stream_window_points": 20000,
+        "stream_window_points": 100000,
         "stream_window_seconds": 2.0,
         "max_waveforms_per_tick": 20,
     },
@@ -434,9 +434,9 @@ runtime:
 
 live:
   ring_slots: 4096
-  ring_points: 512
+  ring_points: 4096
   waveform_every_n_buffers: 1
-  stream_window_points: 20000
+  stream_window_points: 100000
   stream_window_seconds: 2.0
   max_waveforms_per_tick: 20
   ui_fps: 10
@@ -694,11 +694,62 @@ def _write_json_atomic(path: Path, obj: dict) -> None:
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
+def _send_status_email(cfg: dict, subject: str, body: str) -> None:
+    """Send status email. Supports sendmail (local MTA) or SMTP."""
+    notify = (cfg.get("notify", {}) or {})
+    if not bool(notify.get("enabled", False)):
+        return
+
+    to_addr = str(notify.get("to", "")).strip()
+    if not to_addr:
+        return
+    from_addr = str(notify.get("from", "cappy@localhost")).strip() or "cappy@localhost"
+    method = str(notify.get("method", "sendmail")).strip().lower()
+
+    msg = EmailMessage()
+    msg["To"] = to_addr
+    msg["From"] = from_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if method == "sendmail":
+            sendmail_path = str(notify.get("sendmail_path", "/usr/sbin/sendmail"))
+            p = subprocess.Popen([sendmail_path, "-t", "-i"], stdin=subprocess.PIPE)
+            p.communicate(msg.as_bytes())
+        elif method == "smtp":
+            host = str(notify.get("smtp_host", "")).strip()
+            port = int(notify.get("smtp_port", 587))
+            user = str(notify.get("smtp_user", "")).strip()
+            pwd_env = str(notify.get("smtp_password_env", "CAPPY_SMTP_PASSWORD")).strip() or "CAPPY_SMTP_PASSWORD"
+            password = os.environ.get(pwd_env, "")
+            starttls = bool(notify.get("smtp_starttls", True))
+
+            if not host:
+                print("[WARN] SMTP host not configured, skipping email")
+                return
+
+            with smtplib.SMTP(host, port, timeout=20) as s:
+                s.ehlo()
+                if starttls:
+                    s.starttls()
+                    s.ehlo()
+                if user:
+                    if not password:
+                        raise RuntimeError(f"SMTP password env var not set: {pwd_env}")
+                    s.login(user, password)
+                s.send_message(msg)
+    except Exception as e:
+        print(f"[WARN] Failed to send status email: {e}")
+
+
 class LiveRingWriter:
     """
     Rolling on-disk ring buffer for live waveform display.
+
+    Why: You want EVERY buffer's waveform captured, but you only want to *render* at a stable UI cadence.
     The capture process writes one downsampled waveform per buffer into a fixed-size ring file.
-    The GUI reads forward at its own pace (e.g., 10–30 fps) so my brain doesnt hurt more
+    The GUI reads forward at its own pace (e.g., 10–30 fps) for smooth, consistent visualization.
 
     File format (little-endian, fixed record size):
       header: 32 bytes
@@ -1030,9 +1081,10 @@ def _decode_wave_payload(payload: bytes, n_samples: int) -> np.ndarray:
 
 class WaveBinSqliteStore:
     """
-    Store waveform snippets as: channel-separated payloads appended to time-rolled .bin files inside hourly folders
+    Store waveform snippets as:
+      - channel-separated payloads appended to time-rolled .bin files inside hourly folders
         (raw float32 or compressed, depending on waveform_codec)
-        and SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
+      - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
 
     Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/):
       - index/snips_<session>.sqlite
@@ -1715,9 +1767,9 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     )
 
     live["ring_slots"] = _clamp_int(live.get("ring_slots", 4096), 16, 1_000_000, 4096)
-    live["ring_points"] = _clamp_int(live.get("ring_points", 512), 32, 16384, 512)
+    live["ring_points"] = _clamp_int(live.get("ring_points", 4096), 32, 16384, 512)
     live["waveform_every_n_buffers"] = _clamp_int(live.get("waveform_every_n_buffers", 1), 1, WAVEFORM_EVERY_N_MAX, 1)
-    live["stream_window_points"] = _clamp_int(live.get("stream_window_points", 20000), 256, 5_000_000, 20000)
+    live["stream_window_points"] = _clamp_int(live.get("stream_window_points", 100000), 256, 5_000_000, 100000)
     live["stream_window_seconds"] = _clamp_float(live.get("stream_window_seconds", 2.0), 0.25, 120.0, 2.0)
     live["max_waveforms_per_tick"] = _clamp_int(live.get("max_waveforms_per_tick", 20), 1, 2000, 20)
     live["ui_fps"] = _clamp_float(live.get("ui_fps", 10.0), 1.0, 60.0, 10.0)
@@ -1886,6 +1938,10 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
         125e6: "SAMPLE_RATE_125MSPS",
         160e6: "SAMPLE_RATE_160MSPS",
         180e6: "SAMPLE_RATE_180MSPS",
+        200e6: "SAMPLE_RATE_200MSPS",
+        250e6: "SAMPLE_RATE_250MSPS",
+        500e6: "SAMPLE_RATE_500MSPS",
+        1000e6: "SAMPLE_RATE_1000MSPS",
     }
 
     if int(source) == int(getattr(ats, "INTERNAL_CLOCK", source)) and sr_hz in RATE_MAP and hasattr(ats, RATE_MAP[sr_hz]):
@@ -2266,7 +2322,7 @@ def run_capture(cfg_path: Path) -> int:
             ring_slots=int(live_cfg.get('ring_slots', ring_nslots)),
             ring_points=int(live_cfg.get('ring_points', ring_npts)),
             waveform_every_n_buffers=int(live_waveform_every_n),
-            stream_window_points=int(live_cfg.get('stream_window_points', 20000)),
+            stream_window_points=int(live_cfg.get('stream_window_points', 100000)),
             stream_window_seconds=float(live_cfg.get('stream_window_seconds', 2.0)),
             max_waveforms_per_tick=int(live_cfg.get('max_waveforms_per_tick', 20)),
             ui_fps=float(live_cfg.get('ui_fps', 10.0)),
@@ -3610,24 +3666,36 @@ class LiveDashboard(ttk.Frame):
         self._last_redraw_unix = 0.0
         self._last_redraw_status_seq = -1
         self._last_redraw_ring_seq = -1
+        self._rate_history: list[float] = []
 
-        # --- top stats ---
-        stats = ttk.Frame(self)
-        stats.pack(fill=tk.X, pady=(0, 6))
+        # ── Stats bar (color-coded cards) ───────────────────────────────
+        stats = tk.Frame(self, bg=T_BG)
+        stats.pack(fill=tk.X, pady=(0, 4))
 
-        def mkrow(label: str):
-            f = ttk.Frame(stats)
-            f.pack(side=tk.LEFT, padx=(0, 14))
-            ttk.Label(f, text=label).pack(anchor="w")
-            v = ttk.Label(f, text="—")
-            v.pack(anchor="w")
+        def mkcard(parent, label: str, color: str = T_TEXT_DIM, width: int = 0):
+            f = tk.Frame(parent, bg=T_SURFACE, padx=10, pady=4,
+                         highlightbackground=T_BORDER, highlightthickness=1)
+            f.pack(side=tk.LEFT, padx=(0, 3), fill=tk.Y)
+            tk.Label(f, text=label, font=('Consolas', 7, 'bold'),
+                     fg=color, bg=T_SURFACE, anchor='w').pack(anchor='w')
+            v = tk.Label(f, text="—", font=('Consolas', 11),
+                         fg=T_TEXT_BRIGHT, bg=T_SURFACE, anchor='w')
+            v.pack(anchor='w')
             return v
 
-        self.lbl_rate = mkrow("Rate (Hz)")
-        self.lbl_caps = mkrow("Captures (buffers)")
-        self.lbl_started = mkrow("Started")
-        self.lbl_last = mkrow("Last capture")
-        self.lbl_peak = mkrow("Mean peak (V)")
+        self.lbl_rate = mkcard(stats, "RATE (Hz)", T_CYAN)
+        self.lbl_caps = mkcard(stats, "BUFFERS", T_TEXT_DIM)
+        self.lbl_started = mkcard(stats, "STARTED", T_TEXT_DIM)
+        self.lbl_last = mkcard(stats, "LAST CAPTURE", T_GREEN)
+        self.lbl_peak = mkcard(stats, "PEAK (V)", T_GOLD)
+
+        stats2 = tk.Frame(self, bg=T_BG)
+        stats2.pack(fill=tk.X, pady=(0, 4))
+        self.lbl_uptime = mkcard(stats2, "UPTIME", T_GOLD)
+        self.lbl_throughput = mkcard(stats2, "THROUGHPUT", T_CYAN)
+        self.lbl_ring_lag = mkcard(stats2, "RING LAG", T_ORANGE)
+        self.lbl_state = mkcard(stats2, "STATE", T_GREEN)
+        self.lbl_disk = mkcard(stats2, "DISK (session)", T_MAGENTA)
 
         # --- plots ---
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
@@ -4138,7 +4206,11 @@ class LiveDashboard(ttk.Frame):
                         pass
                 # stats
                 try:
-                    self.lbl_rate.configure(text=f"{float(snap.get('rate_hz',0.0)):.3f}")
+                    rate_val = float(snap.get('rate_hz',0.0))
+                    self.lbl_rate.configure(text=f"{rate_val:.3f}")
+                    self._rate_history.append(rate_val)
+                    if len(self._rate_history) > 30:
+                        self._rate_history = self._rate_history[-30:]
                 except Exception:
                     self.lbl_rate.configure(text=str(snap.get("rate_hz", "—")))
                 self.lbl_caps.configure(text=str(snap.get("buffers", "—")))
@@ -4261,6 +4333,60 @@ class LiveDashboard(ttk.Frame):
                     self._trig_labelB.set_visible(show_on_b and self._streamB.size > 1)
                 except Exception:
                     pass
+
+                # ── Enhanced live stats ─────────────────────────────────
+                try:
+                    if self._started_unix is not None:
+                        elapsed = time.time() - float(self._started_unix)
+                        h, rem = divmod(int(elapsed), 3600)
+                        m, s = divmod(rem, 60)
+                        self.lbl_uptime.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
+                    else:
+                        self.lbl_uptime.configure(text="—")
+                except Exception:
+                    self.lbl_uptime.configure(text="—")
+
+                try:
+                    rpb = _to_int(snap.get("records_per_buffer", 0), 0)
+                    avg_rate = np.mean(self._rate_history) if self._rate_history else 0.0
+                    tput = avg_rate * max(1, rpb)
+                    if tput > 1e6:
+                        self.lbl_throughput.configure(text=f"{tput/1e6:.2f} Mrec/s")
+                    elif tput > 1e3:
+                        self.lbl_throughput.configure(text=f"{tput/1e3:.1f} krec/s")
+                    else:
+                        self.lbl_throughput.configure(text=f"{tput:.0f} rec/s")
+                except Exception:
+                    self.lbl_throughput.configure(text="—")
+
+                try:
+                    lag = max(0, int(self._ring_last_seq) - int(self._ring_play_seq))
+                    lag_color = T_GREEN if lag < 10 else (T_ORANGE if lag < 100 else T_RED)
+                    self.lbl_ring_lag.configure(text=f"{lag:,}", fg=lag_color)
+                except Exception:
+                    self.lbl_ring_lag.configure(text="—")
+
+                try:
+                    state = str(snap.get('state', '?') or '?')
+                    state_color = T_GREEN if state == 'capturing' or state == 'running' else (T_ORANGE if state == 'waiting' or 'waiting' in state else T_TEXT_DIM)
+                    self.lbl_state.configure(text=state, fg=state_color)
+                except Exception:
+                    self.lbl_state.configure(text="?")
+
+                try:
+                    disk_bytes = _to_int(snap.get("disk_bytes", 0), 0)
+                    if disk_bytes <= 0:
+                        reduced = _to_int(snap.get("reduced_rows", 0), 0)
+                        snips = _to_int(snap.get("snips", 0), 0)
+                        self.lbl_disk.configure(text=f"{reduced:,}r {snips:,}s")
+                    elif disk_bytes > 1024**3:
+                        self.lbl_disk.configure(text=f"{disk_bytes/1024**3:.2f} GiB")
+                    elif disk_bytes > 1024**2:
+                        self.lbl_disk.configure(text=f"{disk_bytes/1024**2:.1f} MiB")
+                    else:
+                        self.lbl_disk.configure(text=f"{disk_bytes/1024:.0f} KiB")
+                except Exception:
+                    self.lbl_disk.configure(text="—")
 
                 now_unix = time.time()
                 status_seq = _to_int(snap.get("status_seq", -1), -1)
@@ -4400,8 +4526,8 @@ class LiveControlPanel(ttk.Frame):
         self.var_rotate_hours = tk.DoubleVar(value=24.0)
 
         self.var_ring_slots = tk.IntVar(value=4096)
-        self.var_ring_points = tk.IntVar(value=512)
-        self.var_stream_pts = tk.IntVar(value=20000)
+        self.var_ring_points = tk.IntVar(value=4096)
+        self.var_stream_pts = tk.IntVar(value=100000)
         self.var_stream_s = tk.DoubleVar(value=2.0)
         self.var_max_wf_tick = tk.IntVar(value=20)
         self.var_show_channel_b_live = tk.BooleanVar(value=False)
@@ -4516,7 +4642,7 @@ class LiveControlPanel(ttk.Frame):
             row=10, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
 
-        # Engine K 
+        # ── Engine K ────────────────────────────────────────────────────
         ttk.Separator(trig, orient=tk.HORIZONTAL).grid(row=11, column=0, columnspan=2, sticky="ew", pady=6)
         ttk.Label(trig, text="Engine K", font=('Consolas', 9, 'bold')).grid(row=12, column=0, sticky="w")
         self._add_combobox(trig, 13, "K Source", self.var_trig_sourceK, list(TRIGGER_SOURCEK_LABEL_TO_CONST.keys()), width=12)
@@ -4559,7 +4685,7 @@ class LiveControlPanel(ttk.Frame):
         self._add_spinbox(live, 6, "SQLite commit every snips", self.var_sqlite_commit, from_=1, to=10_000_000, increment=128)
         self._add_spinbox(live, 7, "Session rotate (hours)", self.var_rotate_hours, from_=0.0, to=720.0, increment=0.5, width=10)
         self._add_spinbox(live, 8, "Ring slots", self.var_ring_slots, from_=16, to=1_000_000, increment=16)
-        self._add_spinbox(live, 9, "Ring points", self.var_ring_points, from_=32, to=16_384, increment=32)
+        self._add_spinbox(live, 9, "Ring points", self.var_ring_points, from_=32, to=65_536, increment=32)
         self._spin_stream_pts = self._add_spinbox(
             live, 10, "Live window points", self.var_stream_pts, from_=256, to=5_000_000, increment=512
         )
@@ -4860,10 +4986,10 @@ class LiveControlPanel(ttk.Frame):
             sqlite_commit = self._round_up_to_step(sqlite_commit, rpb, rpb)
             sqlite_commit = min(sqlite_commit, 10_000_000)
 
-            ring_points = _clamp_int(self._safe_int(self.var_ring_points, 512), 32, 16384, 512)
+            ring_points = _clamp_int(self._safe_int(self.var_ring_points, 4096), 32, 65536, 4096)
             ring_points = self._round_nearest_step(ring_points, 32, 32)
 
-            stream_pts = _clamp_int(self._safe_int(self.var_stream_pts, 20000), 256, 5_000_000, 20000)
+            stream_pts = _clamp_int(self._safe_int(self.var_stream_pts, 100000), 256, 5_000_000, 100000)
             stream_s = _clamp_float(self._safe_float(self.var_stream_s, 2.0), 0.25, 120.0, 2.0)
             sr_hz = max(1.0, self._safe_float(self.var_rate_msps, 250.0) * 1e6)
             record_s = float(spr) / float(sr_hz)
@@ -4934,7 +5060,7 @@ class LiveControlPanel(ttk.Frame):
             flush_every_records=self._safe_int(self.var_flush_records, 20000),
             flush_every_seconds=self._safe_float(self.var_flush_seconds, 2.0),
             sqlite_commit_every_snips=self._safe_int(self.var_sqlite_commit, 200),
-            stream_window_points=self._safe_int(self.var_stream_pts, 20000),
+            stream_window_points=self._safe_int(self.var_stream_pts, 100000),
             stream_window_seconds=self._safe_float(self.var_stream_s, 2.0),
             max_waveforms_per_tick=self._safe_int(self.var_max_wf_tick, 20),
         )
@@ -5073,9 +5199,9 @@ class LiveControlPanel(ttk.Frame):
             self.var_rotate_hours.set(_to_float(storage.get("session_rotate_hours", 24.0), 24.0))
 
             self.var_ring_slots.set(_to_int(live.get("ring_slots", 4096), 4096))
-            self.var_ring_points.set(_to_int(live.get("ring_points", 512), 512))
+            self.var_ring_points.set(_to_int(live.get("ring_points", 4096), 512))
             self.var_live_waveform_every_n.set(_to_int(live.get("waveform_every_n_buffers", 1), 1))
-            self.var_stream_pts.set(_to_int(live.get("stream_window_points", 20000), 20000))
+            self.var_stream_pts.set(_to_int(live.get("stream_window_points", 100000), 100000))
             self.var_stream_s.set(_to_float(live.get("stream_window_seconds", 2.0), 2.0))
             self.var_max_wf_tick.set(_to_int(live.get("max_waveforms_per_tick", 20), 20))
             self.var_show_channel_b_live.set(_to_bool(live.get("show_channel_b", False), False))
@@ -5191,9 +5317,9 @@ class LiveControlPanel(ttk.Frame):
         storage["session_rotate_hours"] = self._safe_float(self.var_rotate_hours, 24.0)
 
         live["ring_slots"] = self._safe_int(self.var_ring_slots, 4096)
-        live["ring_points"] = self._safe_int(self.var_ring_points, 512)
+        live["ring_points"] = self._safe_int(self.var_ring_points, 4096)
         live["waveform_every_n_buffers"] = _clamp_int(self._safe_int(self.var_live_waveform_every_n, 1), 1, WAVEFORM_EVERY_N_MAX, 1)
-        live["stream_window_points"] = self._safe_int(self.var_stream_pts, 20000)
+        live["stream_window_points"] = self._safe_int(self.var_stream_pts, 100000)
         live["stream_window_seconds"] = self._safe_float(self.var_stream_s, 2.0)
         live["max_waveforms_per_tick"] = self._safe_int(self.var_max_wf_tick, 20)
         live["show_channel_b"] = bool(self.var_show_channel_b_live.get()) and bool(mask & 0x2)
