@@ -694,62 +694,11 @@ def _write_json_atomic(path: Path, obj: dict) -> None:
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
-def _send_status_email(cfg: dict, subject: str, body: str) -> None:
-    """Send status email. Supports sendmail (local MTA) or SMTP."""
-    notify = (cfg.get("notify", {}) or {})
-    if not bool(notify.get("enabled", False)):
-        return
-
-    to_addr = str(notify.get("to", "")).strip()
-    if not to_addr:
-        return
-    from_addr = str(notify.get("from", "cappy@localhost")).strip() or "cappy@localhost"
-    method = str(notify.get("method", "sendmail")).strip().lower()
-
-    msg = EmailMessage()
-    msg["To"] = to_addr
-    msg["From"] = from_addr
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    try:
-        if method == "sendmail":
-            sendmail_path = str(notify.get("sendmail_path", "/usr/sbin/sendmail"))
-            p = subprocess.Popen([sendmail_path, "-t", "-i"], stdin=subprocess.PIPE)
-            p.communicate(msg.as_bytes())
-        elif method == "smtp":
-            host = str(notify.get("smtp_host", "")).strip()
-            port = int(notify.get("smtp_port", 587))
-            user = str(notify.get("smtp_user", "")).strip()
-            pwd_env = str(notify.get("smtp_password_env", "CAPPY_SMTP_PASSWORD")).strip() or "CAPPY_SMTP_PASSWORD"
-            password = os.environ.get(pwd_env, "")
-            starttls = bool(notify.get("smtp_starttls", True))
-
-            if not host:
-                print("[WARN] SMTP host not configured, skipping email")
-                return
-
-            with smtplib.SMTP(host, port, timeout=20) as s:
-                s.ehlo()
-                if starttls:
-                    s.starttls()
-                    s.ehlo()
-                if user:
-                    if not password:
-                        raise RuntimeError(f"SMTP password env var not set: {pwd_env}")
-                    s.login(user, password)
-                s.send_message(msg)
-    except Exception as e:
-        print(f"[WARN] Failed to send status email: {e}")
-
-
 class LiveRingWriter:
     """
     Rolling on-disk ring buffer for live waveform display.
-
-    Why: You want EVERY buffer's waveform captured, but you only want to *render* at a stable UI cadence.
     The capture process writes one downsampled waveform per buffer into a fixed-size ring file.
-    The GUI reads forward at its own pace (e.g., 10–30 fps) for smooth, consistent visualization.
+    The GUI reads forward at its own pace (e.g., 10–30 fps) so my brain doesnt hurt more
 
     File format (little-endian, fixed record size):
       header: 32 bytes
@@ -1081,10 +1030,9 @@ def _decode_wave_payload(payload: bytes, n_samples: int) -> np.ndarray:
 
 class WaveBinSqliteStore:
     """
-    Store waveform snippets as:
-      - channel-separated payloads appended to time-rolled .bin files inside hourly folders
+    Store waveform snippets as: channel-separated payloads appended to time-rolled .bin files inside hourly folders
         (raw float32 or compressed, depending on waveform_codec)
-      - SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
+        and SQLite index (WAL) at day_dir/index/snips_<session>.sqlite pointing to file+offset per channel
 
     Directory layout (under captures/<YYYY>/<YYYY-MM>/<YYYY-MM-DD>/):
       - index/snips_<session>.sqlite
@@ -1938,10 +1886,6 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
         125e6: "SAMPLE_RATE_125MSPS",
         160e6: "SAMPLE_RATE_160MSPS",
         180e6: "SAMPLE_RATE_180MSPS",
-        200e6: "SAMPLE_RATE_200MSPS",
-        250e6: "SAMPLE_RATE_250MSPS",
-        500e6: "SAMPLE_RATE_500MSPS",
-        1000e6: "SAMPLE_RATE_1000MSPS",
     }
 
     if int(source) == int(getattr(ats, "INTERNAL_CLOCK", source)) and sr_hz in RATE_MAP and hasattr(ats, RATE_MAP[sr_hz]):
@@ -4572,7 +4516,7 @@ class LiveControlPanel(ttk.Frame):
             row=10, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
 
-        # ── Engine K ────────────────────────────────────────────────────
+        # Engine K 
         ttk.Separator(trig, orient=tk.HORIZONTAL).grid(row=11, column=0, columnspan=2, sticky="ew", pady=6)
         ttk.Label(trig, text="Engine K", font=('Consolas', 9, 'bold')).grid(row=12, column=0, sticky="w")
         self._add_combobox(trig, 13, "K Source", self.var_trig_sourceK, list(TRIGGER_SOURCEK_LABEL_TO_CONST.keys()), width=12)
