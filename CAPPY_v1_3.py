@@ -149,7 +149,7 @@ RUNTIME_PROFILE_PRESETS = {
         "flush_every_records": 20000,
         "flush_every_seconds": 2.0,
         "sqlite_commit_every_snips": 200,
-        "stream_window_points": 20000,
+        "stream_window_points": 100000,
         "stream_window_seconds": 2.0,
         "max_waveforms_per_tick": 20,
     },
@@ -160,7 +160,7 @@ RUNTIME_PROFILE_PRESETS = {
         "flush_every_records": 20000,
         "flush_every_seconds": 2.0,
         "sqlite_commit_every_snips": 200,
-        "stream_window_points": 20000,
+        "stream_window_points": 100000,
         "stream_window_seconds": 2.0,
         "max_waveforms_per_tick": 20,
     },
@@ -379,9 +379,9 @@ runtime:
 
 live:
   ring_slots: 4096
-  ring_points: 512
+  ring_points: 4096
   waveform_every_n_buffers: 1
-  stream_window_points: 20000
+  stream_window_points: 100000
   stream_window_seconds: 2.0
   max_waveforms_per_tick: 6
   ui_fps: 4
@@ -1727,11 +1727,11 @@ def validate_and_normalize_capture_cfg(cfg: Dict[str, Any]) -> Tuple[Dict[str, A
     )
 
     live["ring_slots"] = _clamp_int(live.get("ring_slots", 4096), 16, 1_000_000, 4096)
-    live["ring_points"] = _clamp_int(live.get("ring_points", 512), 32, 16384, 512)
+    live["ring_points"] = _clamp_int(live.get("ring_points", 4096), 32, 65536, 4096)
     live["waveform_every_n_buffers"] = _clamp_int(
         live.get("waveform_every_n_buffers", 1), 1, WAVEFORM_EVERY_N_MAX, 1
     )
-    live["stream_window_points"] = _clamp_int(live.get("stream_window_points", 20000), 256, 5_000_000, 20000)
+    live["stream_window_points"] = _clamp_int(live.get("stream_window_points", 100000), 256, 5_000_000, 100000)
     live["stream_window_seconds"] = _clamp_float(live.get("stream_window_seconds", 2.0), 0.25, 120.0, 2.0)
     live["max_waveforms_per_tick"] = _clamp_int(live.get("max_waveforms_per_tick", 12), 1, 2000, 12)
     live["ui_fps"] = _clamp_float(live.get("ui_fps", 6.0), 1.0, LIVE_UI_FPS_MAX, 6.0)
@@ -2185,7 +2185,7 @@ def run_capture(cfg_path: Path) -> int:
             ring_slots=int(live_cfg.get('ring_slots', ring_nslots)),
             ring_points=int(live_cfg.get('ring_points', ring_npts)),
             waveform_every_n_buffers=int(live_waveform_every_n),
-            stream_window_points=int(live_cfg.get('stream_window_points', 20000)),
+            stream_window_points=int(live_cfg.get('stream_window_points', 100000)),
             stream_window_seconds=float(live_cfg.get('stream_window_seconds', 2.0)),
             max_waveforms_per_tick=int(live_cfg.get('max_waveforms_per_tick', 12)),
             ui_fps=float(live_cfg.get('ui_fps', 6.0)),
@@ -3531,9 +3531,10 @@ class LiveDashboard(ttk.Frame):
         stats2 = tk.Frame(self, bg=T_BG)
         stats2.pack(fill=tk.X, pady=(0, 4))
         self.lbl_uptime = mkcard(stats2, "UPTIME", T_GOLD)
-        self.lbl_throughput = mkcard(stats2, "THROUGHPUT", T_TEAL)
+        self.lbl_throughput = mkcard(stats2, "THROUGHPUT", T_CYAN)
         self.lbl_ring_lag = mkcard(stats2, "RING LAG", T_ORANGE)
         self.lbl_state = mkcard(stats2, "STATE", T_GREEN)
+        self.lbl_disk = mkcard(stats2, "DISK (session)", T_MAGENTA)
 
         # ── Plots (artist reuse for smooth updates) ─────────────────────
         _, plt, _FigureCanvasTkAgg = _lazy_mpl()
@@ -4192,6 +4193,22 @@ class LiveDashboard(ttk.Frame):
                 except Exception:
                     self.lbl_state.configure(text="?")
 
+                # Disk usage for this session
+                try:
+                    disk_bytes = _to_int(snap.get("disk_bytes", 0), 0)
+                    if disk_bytes <= 0:
+                        reduced = _to_int(snap.get("reduced_rows", 0), 0)
+                        snips = _to_int(snap.get("snips", 0), 0)
+                        self.lbl_disk.configure(text=f"{reduced:,}r {snips:,}s")
+                    elif disk_bytes > 1024**3:
+                        self.lbl_disk.configure(text=f"{disk_bytes/1024**3:.2f} GiB")
+                    elif disk_bytes > 1024**2:
+                        self.lbl_disk.configure(text=f"{disk_bytes/1024**2:.1f} MiB")
+                    else:
+                        self.lbl_disk.configure(text=f"{disk_bytes/1024:.0f} KiB")
+                except Exception:
+                    self.lbl_disk.configure(text="—")
+
                 self._set_meta(
                     f"State: {snap.get('state','?')}    Last ring wf: {latest_ring}    "
                     f"Points A/B: {self._streamA.size}/{self._streamB.size} (mode={mode}, window={self._stream_window})    Status: {self.status_path}"
@@ -4307,8 +4324,8 @@ class LiveControlPanel(ttk.Frame):
         self.var_rotate_hours = tk.DoubleVar(value=24.0)
 
         self.var_ring_slots = tk.IntVar(value=4096)
-        self.var_ring_points = tk.IntVar(value=512)
-        self.var_stream_pts = tk.IntVar(value=20000)
+        self.var_ring_points = tk.IntVar(value=4096)
+        self.var_stream_pts = tk.IntVar(value=100000)
         self.var_stream_s = tk.DoubleVar(value=2.0)
         self.var_max_wf_tick = tk.IntVar(value=12)
         self.var_show_channel_b_live = tk.BooleanVar(value=False)
@@ -4461,7 +4478,7 @@ class LiveControlPanel(ttk.Frame):
         self._add_spinbox(live, 6, "SQLite commit every snips", self.var_sqlite_commit, from_=1, to=10_000_000, increment=128)
         self._add_spinbox(live, 7, "Session rotate (hours)", self.var_rotate_hours, from_=0.0, to=720.0, increment=0.5, width=10)
         self._add_spinbox(live, 8, "Ring slots", self.var_ring_slots, from_=16, to=1_000_000, increment=16)
-        self._add_spinbox(live, 9, "Ring points", self.var_ring_points, from_=32, to=16_384, increment=32)
+        self._add_spinbox(live, 9, "Ring points", self.var_ring_points, from_=32, to=65536, increment=32)
         self._spin_stream_pts = self._add_spinbox(
             live, 10, "Live window points", self.var_stream_pts, from_=256, to=5_000_000, increment=512
         )
@@ -4737,10 +4754,10 @@ class LiveControlPanel(ttk.Frame):
             sqlite_commit = self._round_up_to_step(sqlite_commit, rpb, rpb)
             sqlite_commit = min(sqlite_commit, 10_000_000)
 
-            ring_points = _clamp_int(self._safe_int(self.var_ring_points, 512), 32, 16384, 512)
+            ring_points = _clamp_int(self._safe_int(self.var_ring_points, 4096), 32, 65536, 4096)
             ring_points = self._round_nearest_step(ring_points, 32, 32)
 
-            stream_pts = _clamp_int(self._safe_int(self.var_stream_pts, 20000), 256, 5_000_000, 20000)
+            stream_pts = _clamp_int(self._safe_int(self.var_stream_pts, 100000), 256, 5_000_000, 100000)
             stream_s = _clamp_float(self._safe_float(self.var_stream_s, 2.0), 0.25, 120.0, 2.0)
             sr_hz = max(1.0, self._safe_float(self.var_rate_msps, 250.0) * 1e6)
             record_s = float(spr) / float(sr_hz)
@@ -4802,7 +4819,7 @@ class LiveControlPanel(ttk.Frame):
             flush_every_records=self._safe_int(self.var_flush_records, 20000),
             flush_every_seconds=self._safe_float(self.var_flush_seconds, 2.0),
             sqlite_commit_every_snips=self._safe_int(self.var_sqlite_commit, 200),
-            stream_window_points=self._safe_int(self.var_stream_pts, 20000),
+            stream_window_points=self._safe_int(self.var_stream_pts, 100000),
             stream_window_seconds=self._safe_float(self.var_stream_s, 2.0),
             max_waveforms_per_tick=self._safe_int(self.var_max_wf_tick, 12),
         )
@@ -4940,9 +4957,9 @@ class LiveControlPanel(ttk.Frame):
             self.var_rotate_hours.set(_to_float(storage.get("session_rotate_hours", 24.0), 24.0))
 
             self.var_ring_slots.set(_to_int(live.get("ring_slots", 4096), 4096))
-            self.var_ring_points.set(_to_int(live.get("ring_points", 512), 512))
+            self.var_ring_points.set(_to_int(live.get("ring_points", 4096), 512))
             self.var_live_waveform_every_n.set(_to_int(live.get("waveform_every_n_buffers", 1), 1))
-            self.var_stream_pts.set(_to_int(live.get("stream_window_points", 20000), 20000))
+            self.var_stream_pts.set(_to_int(live.get("stream_window_points", 100000), 100000))
             self.var_stream_s.set(_to_float(live.get("stream_window_seconds", 2.0), 2.0))
             self.var_max_wf_tick.set(_to_int(live.get("max_waveforms_per_tick", 12), 12))
             self.var_show_channel_b_live.set(_to_bool(live.get("show_channel_b", False), False))
@@ -5051,7 +5068,7 @@ class LiveControlPanel(ttk.Frame):
         live["waveform_every_n_buffers"] = _clamp_int(
             self._safe_int(self.var_live_waveform_every_n, 1), 1, WAVEFORM_EVERY_N_MAX, 1
         )
-        live["stream_window_points"] = self._safe_int(self.var_stream_pts, 20000)
+        live["stream_window_points"] = self._safe_int(self.var_stream_pts, 100000)
         live["stream_window_seconds"] = self._safe_float(self.var_stream_s, 2.0)
         live["max_waveforms_per_tick"] = self._safe_int(self.var_max_wf_tick, 12)
         live["show_channel_b"] = bool(self.var_show_channel_b_live.get())
