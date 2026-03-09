@@ -2732,6 +2732,269 @@ def run_capture(cfg_path: Path) -> int:
 
     return 0
 
+
+# ---------------------------------------------------------------------------
+# Quick Config  —  disposable ~10-buffer scout capture + waveform analysis
+# ---------------------------------------------------------------------------
+# Captures a handful of buffers with current board settings, analyses the raw
+# ADC data to derive optimal trigger level, samples_per_record, and input
+# range, then emits a single JSON line on stdout so the GUI can parse it.
+#
+# Design follows cappyarchive_db.py style:
+#   • background thread owns all hardware access
+#   • GUI thread only reads final JSON result
+#   • compact numpy analysis, no pandas
+#   • graceful cleanup in all paths
+# ---------------------------------------------------------------------------
+
+_QC_BUFFERS = 10          # quick-dispose buffer count
+_QC_NOISE_SIGMA = 5.0     # noise floor = median ± N * MAD
+_QC_HEADROOM = 1.20       # 20 % headroom on range selection
+_QC_TAIL_PAD_FRAC = 0.15  # pad record length 15 % beyond last active sample
+
+# Input ranges ordered by Vpp (ascending) for auto-range selection
+_INPUT_RANGE_VPP_ORDERED: List[Tuple[str, float]] = [
+    ("PM_20_MV",  0.04), ("PM_40_MV",  0.08), ("PM_50_MV",  0.10),
+    ("PM_80_MV",  0.16), ("PM_100_MV", 0.20), ("PM_200_MV", 0.40),
+    ("PM_400_MV", 0.80), ("PM_500_MV", 1.00), ("PM_800_MV", 1.60),
+    ("PM_1_V",    2.00), ("PM_2_V",    4.00), ("PM_4_V",    8.00),
+]
+
+
+def _qc_analyse_buffers(
+    bufs: List[np.ndarray],
+    spr: int,
+    rpb: int,
+    sr_hz: float,
+    vpp: float,
+    ch_count: int,
+) -> dict:
+    """Analyse raw uint16 ADC buffers and return optimal settings as a dict.
+
+    Parameters
+    ----------
+    bufs : list[np.ndarray]
+        Each element is an (rpb * spr * ch_count,) uint16 array straight from
+        DMA (one per completed buffer).
+    spr, rpb : int
+        Samples-per-record, records-per-buffer used during scout capture.
+    sr_hz : float
+        Sample rate in Hz.
+    vpp : float
+        Current channel A Vpp (used for initial voltage conversion).
+    ch_count : int
+        1 or 2 (number of interleaved channels in the DMA buffer).
+
+    Returns
+    -------
+    dict  with keys:
+        trigger_level_pct, samples_per_record, input_range,
+        peak_v, noise_v, active_samples, analysis_note
+    """
+    # Deinterleave channel A from every buffer → list of (rpb, spr) matrices
+    records: List[np.ndarray] = []
+    for raw in bufs:
+        try:
+            if ch_count == 2:
+                both = raw.reshape(rpb, spr, 2)
+                recs = both[:, :, 0]  # channel A
+            else:
+                recs = raw.reshape(rpb, spr)
+            records.append(recs)
+        except Exception:
+            continue
+
+    if not records:
+        return {"error": "no valid buffers captured"}
+
+    # Stack into one big (N_total_records, spr) array
+    all_recs = np.vstack(records)                       # uint16
+    n_recs   = all_recs.shape[0]
+
+    # Convert to volts  (same transform as _codes_to_volts_u16)
+    volts = (all_recs.astype(np.float32) - 32768.0) * (vpp / 65536.0)
+
+    # ── Noise floor from first 64 samples (pre-trigger baseline) ──────
+    pre_win = min(64, spr)
+    baselines = volts[:, :pre_win]
+    median_bl = float(np.median(baselines))
+    mad        = float(np.median(np.abs(baselines - median_bl)))
+    sigma_est  = 1.4826 * mad if mad > 0 else float(np.std(baselines))
+
+    # ── Peak / range analysis across all records ──────────────────────
+    rec_maxes = np.max(volts, axis=1)
+    rec_mins  = np.min(volts, axis=1)
+    peak_pos  = float(np.percentile(rec_maxes, 95))     # robust P95
+    peak_neg  = float(np.percentile(rec_mins, 5))
+    peak_abs  = max(abs(peak_pos), abs(peak_neg))
+
+    # ── Optimal input range ───────────────────────────────────────────
+    needed_vpp = 2.0 * peak_abs * _QC_HEADROOM
+    best_range = "PM_4_V"
+    best_vpp   = 8.0
+    for rname, rvpp in _INPUT_RANGE_VPP_ORDERED:
+        if rvpp >= needed_vpp:
+            best_range = rname
+            best_vpp   = rvpp
+            break
+
+    # ── Optimal trigger level ─────────────────────────────────────────
+    # Place trigger at ~3σ above the noise floor (positive slope assumed)
+    trig_v = median_bl + _QC_NOISE_SIGMA * sigma_est
+    # Clamp so trigger sits between noise and 80 % of peak
+    trig_v = max(trig_v, median_bl + 3.0 * sigma_est)
+    trig_v = min(trig_v, peak_pos * 0.8) if peak_pos > trig_v else trig_v
+    # Convert to %FS relative to the *recommended* range
+    half_range = best_vpp / 2.0
+    trig_pct   = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
+    trig_pct   = max(-95.0, min(95.0, trig_pct))
+
+    # ── Optimal samples_per_record (active waveform length) ───────────
+    # Find the last sample index above noise in the average waveform
+    avg_wave = np.mean(np.abs(volts - median_bl), axis=0)
+    noise_thr = _QC_NOISE_SIGMA * sigma_est * 0.5
+    active_mask = avg_wave > noise_thr
+    active_idxs = np.flatnonzero(active_mask)
+    if active_idxs.size > 0:
+        last_active = int(active_idxs[-1])
+        opt_spr = int(last_active * (1.0 + _QC_TAIL_PAD_FRAC))
+        # Round up to multiple of 16 (ATS alignment)
+        opt_spr = max(64, ((opt_spr + 15) // 16) * 16)
+        opt_spr = min(opt_spr, spr)  # don't exceed what we captured
+    else:
+        opt_spr = spr  # no signal detected — keep current
+
+    notes: List[str] = []
+    if sigma_est < 1e-8:
+        notes.append("noise floor undetectable; signal may be DC or absent")
+    if peak_abs < sigma_est * 3:
+        notes.append("signal amplitude very close to noise; results may be unreliable")
+    if n_recs < 5:
+        notes.append(f"only {n_recs} records analysed; increase buffers for better stats")
+
+    return {
+        "trigger_level_pct":    round(trig_pct, 2),
+        "samples_per_record":   opt_spr,
+        "input_range":          best_range,
+        "input_range_vpp":      best_vpp,
+        "peak_v":               round(peak_abs, 6),
+        "noise_sigma_v":        round(sigma_est, 8),
+        "baseline_v":           round(median_bl, 6),
+        "active_samples":       int(active_idxs[-1]) if active_idxs.size else 0,
+        "total_records":        n_recs,
+        "analysis_note":        "; ".join(notes) if notes else "OK",
+    }
+
+
+def run_quick_config(cfg_path: Path) -> int:
+    """Run a disposable ~10-buffer scout capture and print optimal settings JSON.
+
+    Designed to be invoked as a subprocess by the GUI:
+        python CAPPY_v1_0_.py quick_config --config <yaml>
+
+    Prints exactly one line of JSON prefixed with 'CAPPY_QC_RESULT ' on success.
+    """
+    if not ATS_AVAILABLE or ats is None:
+        print(json.dumps({"error": "atsapi not available"}))
+        return 2
+
+    cfg = load_config(cfg_path)
+    cfg, _, cfg_errors = validate_and_normalize_capture_cfg(cfg)
+    if cfg_errors:
+        print(json.dumps({"error": f"config errors: {'; '.join(cfg_errors)}"}))
+        return 2
+
+    acq  = cfg.get("acquisition", {})
+    trig = cfg.get("trigger", {})
+
+    pre  = int(acq.get("pre_trigger_samples", 0))
+    post = int(acq.get("post_trigger_samples", 256))
+    spr  = pre + post
+    rpb  = int(acq.get("records_per_buffer", 128))
+    bufN = max(4, _QC_BUFFERS + 2)  # allocate a few spare DMA buffers
+    ch_expr = str(acq.get("channels_mask", "CHANNEL_A"))
+
+    binfo = cfg.get("board", {}) if isinstance(cfg, dict) else {}
+    systemId = int(binfo.get("system_id", 2))
+    boardId  = int(binfo.get("board_id", 1))
+
+    try:
+        board = ats.Board(systemId=systemId, boardId=boardId)
+        if not hasattr(board, 'handle') or board.handle is None:
+            print(json.dumps({"error": "board handle is None"}))
+            return 2
+    except Exception as ex:
+        print(json.dumps({"error": f"board init failed: {ex}"}))
+        return 2
+
+    try:
+        sr_hz, vppA, vppB = configure_board(board, cfg)
+    except Exception as ex:
+        print(json.dumps({"error": f"configure_board failed: {ex}"}))
+        return 2
+
+    ch_mask  = channels_from_mask_expr(ch_expr)
+    ch_count = infer_channel_count_from_mask(ch_mask)
+    _, bps   = board.getChannelInfo()
+    bpS      = (bps.value + 7) // 8
+    stype    = ctypes.c_uint8 if bpS == 1 else ctypes.c_uint16
+    bpBuf    = bpS * spr * rpb * ch_count
+
+    buffers = [ats.DMABuffer(board.handle, stype, bpBuf) for _ in range(bufN)]
+    board.setRecordSize(pre, post)
+
+    recs_per_acq = rpb * _QC_BUFFERS  # finite acquisition
+    adma_flags   = ats.ADMA_TRADITIONAL_MODE
+    if bool(trig.get("external_startcapture", False)):
+        adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
+
+    board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recs_per_acq, adma_flags)
+    for b in buffers:
+        board.postAsyncBuffer(b.addr, b.size_bytes)
+
+    captured: List[np.ndarray] = []
+    wt_ms = int(acq.get("wait_timeout_ms", 5000))
+    # Use a generous timeout for the scout capture
+    wt_ms = max(wt_ms, 5000)
+
+    print(f"[QC] capturing {_QC_BUFFERS} buffers (spr={spr} rpb={rpb} ch={ch_count})…", flush=True)
+    board.startCapture()
+
+    try:
+        for bi in range(_QC_BUFFERS):
+            buf = buffers[bi % bufN]
+            try:
+                board.waitAsyncBufferComplete(buf.addr, timeout_ms=wt_ms)
+            except Exception as ex:
+                if _is_ats_dma_done(ex):
+                    break
+                print(f"[QC] timeout/error on buffer {bi}: {ex}", flush=True)
+                break
+
+            raw = np.array(buf.buffer, copy=True)
+            captured.append(raw)
+            board.postAsyncBuffer(buf.addr, buf.size_bytes)
+            print(f"[QC] buffer {bi+1}/{_QC_BUFFERS} OK", flush=True)
+    finally:
+        try:
+            board.abortAsyncRead()
+        except Exception:
+            pass
+
+    if not captured:
+        print(json.dumps({"error": "no buffers captured — check trigger or signal"}))
+        return 1
+
+    result = _qc_analyse_buffers(captured, spr, rpb, sr_hz, vppA, ch_count)
+    result["scout_buffers"] = len(captured)
+    result["sample_rate_hz"] = sr_hz
+    result["current_vpp"] = vppA
+
+    # Prefix so the GUI can reliably parse this line from mixed output
+    print(f"CAPPY_QC_RESULT {json.dumps(result)}", flush=True)
+    return 0
+
+
 class ArchiveBrowser(ttk.Frame):
     def __init__(self, data_dir: Path, master=None):
         super().__init__(master)
@@ -4730,8 +4993,49 @@ class LiveControlPanel(ttk.Frame):
         self._flush_lbl = ttk.Label(disk, textvariable=self._flush_var, wraplength=700, justify=tk.LEFT)
         self._flush_lbl.pack(anchor="w", pady=(2, 0))
 
+        # ── Quick Config  ─────────────────────────────────────────────
+        # Scout-capture ~10 buffers, analyse waveform, auto-set optimal
+        # trigger level, samples/record, and input range.
+        qc = ttk.LabelFrame(self._controls_root, text="  ⚡ Quick Config", padding=8, style='Trigger.TLabelframe')
+        qc.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        qc.columnconfigure(1, weight=1)
+
+        self._qc_status_var = tk.StringVar(value="Scout ~10 buffers → auto-tune trigger, range & record length")
+        self._qc_running    = False
+        self._qc_proc       = None
+
+        qc_top = ttk.Frame(qc)
+        qc_top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self._qc_btn = ttk.Button(
+            qc_top, text="⚡ Quick Config",
+            command=self._quick_config,
+            style="Primary.TButton",
+        )
+        self._qc_btn.pack(side=tk.LEFT)
+        self._qc_apply_btn = ttk.Button(
+            qc_top, text="↩ Undo",
+            command=self._qc_undo,
+            state=tk.DISABLED,
+        )
+        self._qc_apply_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        tk.Label(qc, textvariable=self._qc_status_var,
+                 font=("Consolas", 8), fg=T_TEAL, bg=T_BG,
+                 anchor="w", wraplength=340, justify=tk.LEFT,
+                 ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
+        # Result details (populated after analysis)
+        self._qc_detail_var = tk.StringVar(value="")
+        tk.Label(qc, textvariable=self._qc_detail_var,
+                 font=("Consolas", 8), fg=T_TEXT_DIM, bg=T_BG,
+                 anchor="w", wraplength=340, justify=tk.LEFT,
+                 ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
+        # Stash for undo
+        self._qc_prev_settings: Optional[dict] = None
+
         tools = ttk.Frame(self._controls_root, padding=(0, 0, 0, 8))
-        tools.grid(row=5, column=0, sticky="ew")
+        tools.grid(row=6, column=0, sticky="ew")
         ttk.Button(tools, text="Save Controls To YAML", command=self.launcher._save_controls_to_yaml).pack(side=tk.LEFT)
         ttk.Button(tools, text="Reload Controls From YAML", command=self.launcher._load_controls_from_yaml).pack(side=tk.LEFT)
         ttk.Label(tools, textvariable=self._msg_var).pack(side=tk.LEFT, padx=(12, 0))
@@ -4848,6 +5152,176 @@ class LiveControlPanel(ttk.Frame):
             return "break"
         except Exception:
             return "break"
+
+    # ── Quick Config methods ──────────────────────────────────────────
+    # Launches a subprocess that captures ~10 disposable buffers, analyses
+    # the waveform characteristics, and returns optimal settings as JSON.
+    # GUI polls the subprocess and applies results when ready.
+
+    def _quick_config(self) -> None:
+        """Launch a scout capture in a subprocess and poll for results."""
+        if self._qc_running:
+            self._qc_status_var.set("Quick Config already running…")
+            return
+        if self.launcher.proc is not None:
+            self._qc_status_var.set("⚠ Stop the active capture first.")
+            return
+
+        # Save current settings so we can undo later
+        self._qc_prev_settings = {
+            "trigger_level_pct":    self._safe_float(self.var_trig_level_pct, 0.0),
+            "samples_per_record":   self._safe_int(self.var_samples_per_record, 256),
+            "range_a":              self._var_text(self.var_range_a, "PM_1_V"),
+            "range_b":              self._var_text(self.var_range_b, "PM_1_V"),
+        }
+
+        # Build a temporary run config from current panel settings
+        cfg_path = Path(self.launcher.var_config.get()).expanduser()
+        if not cfg_path.exists():
+            self._qc_status_var.set("⚠ Config YAML not found")
+            return
+
+        try:
+            base_cfg = load_config(cfg_path)
+            run_cfg  = self.apply_to_cfg(dict(base_cfg))
+            # Force a finite, quick acquisition
+            acq = run_cfg.setdefault("acquisition", {})
+            acq["buffers_per_acquisition"] = _QC_BUFFERS
+            run_cfg, _, errs = validate_and_normalize_capture_cfg(run_cfg)
+            if errs:
+                self._qc_status_var.set(f"⚠ Config error: {errs[0]}")
+                return
+        except Exception as ex:
+            self._qc_status_var.set(f"⚠ {ex}")
+            return
+
+        qc_cfg_path = cfg_path.with_suffix(cfg_path.suffix + ".qc.yaml")
+        try:
+            _atomic_write_text(qc_cfg_path, yaml.safe_dump(run_cfg, sort_keys=False))
+        except Exception as ex:
+            self._qc_status_var.set(f"⚠ write failed: {ex}")
+            return
+
+        cmd = [sys.executable, str(self.launcher.script_path),
+               "quick_config", "--config", str(qc_cfg_path)]
+
+        try:
+            self._qc_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                cwd=str(self.launcher.script_path.parent),
+            )
+        except Exception as ex:
+            self._qc_status_var.set(f"⚠ launch failed: {ex}")
+            return
+
+        self._qc_running = True
+        self._qc_btn.configure(state=tk.DISABLED)
+        self._qc_status_var.set("⏳ Capturing scout buffers…")
+        self._qc_detail_var.set("")
+        self._qc_lines: List[str] = []
+        self.after(150, self._qc_poll)
+
+    def _qc_poll(self) -> None:
+        """Poll the scout subprocess; when done, parse JSON and apply."""
+        if self._qc_proc is None:
+            self._qc_running = False
+            self._qc_btn.configure(state=tk.NORMAL)
+            return
+
+        # Read available lines
+        try:
+            while True:
+                ln = self._qc_proc.stdout.readline()
+                if not ln:
+                    break
+                ln = ln.strip()
+                if ln:
+                    self._qc_lines.append(ln)
+                    # Update status with progress lines
+                    if ln.startswith("[QC]"):
+                        self._qc_status_var.set(ln)
+        except Exception:
+            pass
+
+        rc = self._qc_proc.poll()
+        if rc is None:
+            # Still running
+            self.after(200, self._qc_poll)
+            return
+
+        # Process finished
+        self._qc_running = False
+        self._qc_btn.configure(state=tk.NORMAL)
+        self._qc_proc = None
+
+        # Find the CAPPY_QC_RESULT line
+        result = None
+        for ln in self._qc_lines:
+            if ln.startswith("CAPPY_QC_RESULT "):
+                try:
+                    result = json.loads(ln[len("CAPPY_QC_RESULT "):])
+                except Exception:
+                    pass
+
+        if result is None:
+            self._qc_status_var.set("⚠ No analysis result received")
+            self._qc_detail_var.set("\n".join(self._qc_lines[-5:]))
+            return
+
+        if "error" in result:
+            self._qc_status_var.set(f"⚠ {result['error']}")
+            return
+
+        self._qc_apply(result)
+
+    def _qc_apply(self, result: dict) -> None:
+        """Apply Quick Config analysis results to the GUI controls."""
+        trig_pct = float(result.get("trigger_level_pct", 0.0))
+        opt_spr  = int(result.get("samples_per_record", 256))
+        opt_range = str(result.get("input_range", "PM_1_V"))
+        peak_v    = float(result.get("peak_v", 0.0))
+        noise_v   = float(result.get("noise_sigma_v", 0.0))
+        note      = str(result.get("analysis_note", ""))
+        n_bufs    = int(result.get("scout_buffers", 0))
+        n_recs    = int(result.get("total_records", 0))
+        active    = int(result.get("active_samples", 0))
+
+        # Apply to controls
+        self.var_trig_level_pct.set(round(trig_pct, 1))
+        self.var_samples_per_record.set(opt_spr)
+        self.var_range_a.set(opt_range)
+        # Sync dependent controls
+        self._sync_trigger_level_code()
+        self._harmonize_controls()
+
+        # Status feedback
+        self._qc_status_var.set(
+            f"✓ Applied: trigger={trig_pct:+.1f}%  spr={opt_spr}  range={opt_range}"
+        )
+        self._qc_detail_var.set(
+            f"peak={peak_v:.4g} V  noise σ={noise_v:.2g} V  "
+            f"active={active} pts  {n_bufs} bufs / {n_recs} recs  {note}"
+        )
+        self._qc_apply_btn.configure(state=tk.NORMAL)
+        self._msg_var.set("Quick Config applied. Review settings before capture.")
+
+    def _qc_undo(self) -> None:
+        """Restore the settings that were active before Quick Config."""
+        prev = self._qc_prev_settings
+        if prev is None:
+            return
+        self.var_trig_level_pct.set(float(prev.get("trigger_level_pct", 0.0)))
+        self.var_samples_per_record.set(int(prev.get("samples_per_record", 256)))
+        self.var_range_a.set(str(prev.get("range_a", "PM_1_V")))
+        self.var_range_b.set(str(prev.get("range_b", "PM_1_V")))
+        self._sync_trigger_level_code()
+        self._harmonize_controls()
+        self._qc_status_var.set("↩ Settings restored to pre-Quick Config values.")
+        self._qc_detail_var.set("")
+        self._qc_apply_btn.configure(state=tk.DISABLED)
+        self._qc_prev_settings = None
+        self._msg_var.set("Quick Config undone.")
 
     def _on_resize_wraplabels(self, _evt=None) -> None:
         try:
@@ -6009,7 +6483,7 @@ def main() -> int:
     argv = sys.argv[1:]
     if not argv:
         argv = ["gui"]
-    if argv and argv[0] not in {"init","capture","browse","gui"}:
+    if argv and argv[0] not in {"init","capture","browse","gui","quick_config"}:
         ap = argparse.ArgumentParser(prog="CAPPY_v1_3 (legacy)")
         ap.add_argument("--config", default=DEFAULT_YAML_FILENAME)
         args = ap.parse_args(argv)
@@ -6024,6 +6498,8 @@ def main() -> int:
     br = sub.add_parser("browse")
     br.add_argument("--data_dir", default="dataFile")
     sub.add_parser("gui")
+    qc = sub.add_parser("quick_config")
+    qc.add_argument("--config", default=DEFAULT_YAML_FILENAME)
 
     args = ap.parse_args(argv)
 
@@ -6035,6 +6511,8 @@ def main() -> int:
         return 0
     if args.cmd == "capture":
         return run_capture(Path(args.config))
+    if args.cmd == "quick_config":
+        return run_quick_config(Path(args.config))
     if args.cmd == "browse":
         return run_browse(Path(args.data_dir))
     if args.cmd == "gui":
