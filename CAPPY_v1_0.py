@@ -148,7 +148,7 @@ T_SURFACE2  = "#151b28"
 T_BORDER    = "#1e2636"
 T_BORDER_HI = "#2a3550"
 T_TEXT      = "#c8d4e6"
-T_TEXT_DIM  = "#6e7f99"
+T_TEXT_DIM  = "#6e7f99" 
 T_TEXT_BRIGHT = "#eef2f8"
 T_CYAN      = "#00d4ff"
 T_GOLD      = "#ffb700"
@@ -167,7 +167,7 @@ T_BTN_ACT   = "#00d4ff"
 NEON_PINK = T_CYAN         # Channel A plots
 NEON_GREEN = T_GOLD        # Channel B plots
 
-SAMPLE_RATE_OPTIONS_MSPS = [20.0, 50.0, 100.0, 125.0, 160.0, 180.0, 200.0, 250.0, 500.0, 1000.0]
+SAMPLE_RATE_OPTIONS_MSPS = [20.0, 50.0, 100.0, 125.0, 160.0, 180.0]
 INPUT_RANGE_OPTIONS = [
     "PM_20_MV", "PM_40_MV", "PM_50_MV", "PM_80_MV", "PM_100_MV", "PM_200_MV",
     "PM_400_MV", "PM_500_MV", "PM_800_MV", "PM_1_V", "PM_2_V", "PM_4_V",
@@ -2082,30 +2082,43 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
     ext_coupling_name = str(t.get("ext_coupling", "DC_COUPLING"))
     if not ext_coupling_name.endswith("_COUPLING"):
         ext_coupling_name = ext_coupling_name + "_COUPLING"
-    # External trigger range with fallback (ATS-9462 commonly uses ETR_1V / ETR_2V5)
     ext_range_name = str(t.get("ext_range", "ETR_2V5"))
-    try:
-        ext_range_const = ats_const(ext_range_name)
-    except AttributeError as e:
-        print(f"[WARN] {ext_range_name} not found in atsapi, trying fallbacks.")
-        fallbacks = ["ETR_2V5", "ETR_1V", "ETR_5V", "ETR_TTL"]
-        ext_range_const = None
-        for fb in fallbacks:
-            if fb == ext_range_name:
-                continue
+    ext_candidates = [ext_range_name]
+    for fallback in ["ETR_2V5", "ETR_1V", "ETR_5V", "ETR_TTL"]:
+        if fallback != ext_range_name:
+            ext_candidates.append(fallback)
+    ext_configured = False
+    ext_last_err: Optional[Exception] = None
+    chosen_ext_range = ext_range_name
+    for candidate in ext_candidates:
+        try:
+            ext_range_const = ats_const(candidate)
+        except AttributeError as e:
+            ext_last_err = e
+            continue
+        for attempt in range(2):
             try:
-                ext_range_const = ats_const(fb)
-                print(f"[WARN] Using {fb} instead of {ext_range_name}")
+                board.setExternalTrigger(
+                    ats_const(ext_coupling_name),
+                    ext_range_const
+                )
+                chosen_ext_range = candidate
+                ext_configured = True
                 break
-            except AttributeError:
-                continue
-        if ext_range_const is None:
-            raise AttributeError(f"External trigger range '{ext_range_name}' not found.") from e
-
-    board.setExternalTrigger(
-        ats_const(ext_coupling_name),
-        ext_range_const
-    )
+            except Exception as e:
+                ext_last_err = e
+                if "ApiFailed" in str(e) and attempt == 0:
+                    time.sleep(0.05)
+                    continue
+                break
+        if ext_configured:
+            break
+    if not ext_configured:
+        raise ext_last_err if ext_last_err is not None else RuntimeError(
+            f"Failed to configure external trigger range {ext_range_name}."
+        )
+    if chosen_ext_range != ext_range_name:
+        print(f"[CAPPY] Warning: External trigger range {ext_range_name} failed; using fallback {chosen_ext_range}.")
 
     # Trigger delay: prefer trigger_delay_us if set, otherwise use delay_samples
     delay_us = float(t.get("trigger_delay_us", 0.0) or 0.0)
@@ -5186,7 +5199,19 @@ class LiveControlPanel(ttk.Frame):
             run_cfg  = self.apply_to_cfg(dict(base_cfg))
             # Force a finite, quick acquisition
             acq = run_cfg.setdefault("acquisition", {})
+            trig = run_cfg.setdefault("trigger", {})
+            runtime = run_cfg.setdefault("runtime", {})
             acq["buffers_per_acquisition"] = _QC_BUFFERS
+            # Scout captures should not hang on a missing external trigger or a
+            # stale threshold. Use a short auto-trigger fallback and do not
+            # require external start-capture for this disposable run.
+            trig["timeout_ms"] = max(
+                _to_int(trig.get("timeout_ms", 0), 0),
+                _to_int(runtime.get("autotrigger_timeout_ms", 10), 10),
+                10,
+            )
+            trig["allow_autotrigger_with_external"] = True
+            trig["external_startcapture"] = False
             run_cfg, _, errs = validate_and_normalize_capture_cfg(run_cfg)
             if errs:
                 self._qc_status_var.set(f"⚠ Config error: {errs[0]}")
@@ -5255,22 +5280,37 @@ class LiveControlPanel(ttk.Frame):
         self._qc_btn.configure(state=tk.NORMAL)
         self._qc_proc = None
 
-        # Find the CAPPY_QC_RESULT line
         result = None
+        fallback_error = None
         for ln in self._qc_lines:
             if ln.startswith("CAPPY_QC_RESULT "):
                 try:
                     result = json.loads(ln[len("CAPPY_QC_RESULT "):])
                 except Exception:
                     pass
+                continue
+            if not ln.startswith("{"):
+                continue
+            try:
+                payload = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and "error" in payload:
+                fallback_error = payload
 
         if result is None:
-            self._qc_status_var.set("⚠ No analysis result received")
+            result = fallback_error
+
+        if result is None:
+            self._qc_status_var.set(
+                f"⚠ Quick Config exited without a result{'' if rc == 0 else f' (code {rc})'}"
+            )
             self._qc_detail_var.set("\n".join(self._qc_lines[-5:]))
             return
 
         if "error" in result:
             self._qc_status_var.set(f"⚠ {result['error']}")
+            self._qc_detail_var.set("\n".join(self._qc_lines[-5:]))
             return
 
         self._qc_apply(result)
