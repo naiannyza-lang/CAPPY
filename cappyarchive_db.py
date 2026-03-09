@@ -41,13 +41,10 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# ---------------------------------------------------------------------------
-# Lazy matplotlib -- only imported when the window actually opens
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Optional: load cappy_native.so for C-accelerated batch decode
-# Falls back gracefully if the .so is absent.
-# ---------------------------------------------------------------------------
+
+# failed: cappy_native.so — C-accelerated batch decode.future update pending...
+# Falls back to pure-Python zlib silently if the .so is absent.
+
 _NATIVE_ARCH = None
 try:
     import ctypes as _ct_arch
@@ -66,8 +63,14 @@ try:
 except Exception:
     _NATIVE_ARCH = None
 
-_MPL = None
-def _lazy_mpl():
+
+# Lazy matplotlib — deferred until the archive window opens so the
+# acquisition path pays zero import cost at module load time.
+
+_MPL: Optional[tuple] = None
+
+
+def _lazy_mpl() -> tuple:
     global _MPL
     if _MPL is not None:
         return _MPL
@@ -82,9 +85,8 @@ def _lazy_mpl():
     _MPL = (matplotlib, plt, FigureCanvasTkAgg)
     return _MPL
 
-# ---------------------------------------------------------------------------
 # Colour palette — matches CAPPY v1.3 main GUI theme
-# ---------------------------------------------------------------------------
+
 C_BG     = "#0b0e14"
 C_PANEL  = "#111620"
 C_PANEL2 = "#151b28"
@@ -105,9 +107,8 @@ FONT     = ("Consolas", 9)
 FONT_SM  = ("Consolas", 8)
 FONT_B   = ("Consolas", 9, "bold")
 
-# ---------------------------------------------------------------------------
-# Waveform codec  (mirrors cappy_native CWZ1 format)
-# ---------------------------------------------------------------------------
+
+# Waveform codec 
 _CWZ1_MAGIC = b"CWZ1"
 _CWZ1_FMT   = "<4sBBIf"
 _CWZ1_SIZE  = struct.calcsize(_CWZ1_FMT)
@@ -138,9 +139,9 @@ def _decode_payload(raw: bytes, n: int) -> np.ndarray:
             pass
     return np.frombuffer(raw, dtype=np.float32)[:n]
 
-# ---------------------------------------------------------------------------
+
 # LRU waveform cache
-# ---------------------------------------------------------------------------
+
 class _WaveCache:
     def __init__(self, maxsize: int = 256):
         self._d: OrderedDict = OrderedDict()
@@ -161,11 +162,10 @@ class _WaveCache:
     def clear(self):
         self._d.clear()
 
-# ---------------------------------------------------------------------------
 # DB worker thread
 # Owns ALL sqlite connections. GUI never touches sqlite.
 # Priority queue: 0 = user-visible (wave load), 1 = navigation, 2 = background
-# ---------------------------------------------------------------------------
+
 class _Req:
     __slots__ = ("kind", "payload", "token", "cb")
     def __init__(self, kind, payload, token, cb):
@@ -229,7 +229,7 @@ class _DBWorker(threading.Thread):
     def _dispatch(self, req: _Req):
         k, p, tok, cb = req.kind, req.payload, req.token, req.cb
 
-        # -- list_sessions: one cheap GROUP BY per DB file --------------------
+        #list_sessions: one cheap GROUP BY per DB file 
         if k == "list_sessions":
             rows = []
             for db in p:
@@ -252,7 +252,7 @@ class _DBWorker(threading.Thread):
                     pass
             cb({"token": tok, "rows": rows})
 
-        # -- list_days: GROUP BY (timestamp_ns / DAY) -------------------------
+        #  list_days: GROUP BY (timestamp_ns / DAY) 
         elif k == "list_days":
             db, sid = p["db_path"], p["session_id"]
             try:
@@ -269,7 +269,7 @@ class _DBWorker(threading.Thread):
                 rows = []
             cb({"token": tok, "rows": rows})
 
-        # -- list_hours: GROUP BY hour within a day bucket --------------------
+        #list_hours: GROUP BY hour within a day bucket 
         elif k == "list_hours":
             db, sid, day = p["db_path"], p["session_id"], p["bucket"]
             t0 = day * self._DAY; t1 = t0 + self._DAY
@@ -287,7 +287,7 @@ class _DBWorker(threading.Thread):
                 rows = []
             cb({"token": tok, "rows": rows})
 
-        # -- list_minutes: GROUP BY minute within an hour bucket --------------
+        #list_minutes: GROUP BY minute within an hour bucket 
         elif k == "list_minutes":
             db, sid, hr = p["db_path"], p["session_id"], p["bucket"]
             t0 = hr * self._HOUR; t1 = t0 + self._HOUR
@@ -305,10 +305,10 @@ class _DBWorker(threading.Thread):
                 rows = []
             cb({"token": tok, "rows": rows})
 
-        # -- load_minute: fetch lightweight index for ONE minute only ---------
+        # load_minute: fetch lightweight index for ONE minute only 
         # This is the ONLY query that returns individual rows.
         # A minute at 1 MHz with 1-record-per-shot = at most ~60k rows.
-        # Typical physics experiments: hundreds to low thousands per minute.
+      
         elif k == "load_minute":
             db, sid, mb = p["db_path"], p["session_id"], p["bucket"]
             t0 = mb * self._MIN; t1 = t0 + self._MIN
@@ -329,7 +329,7 @@ class _DBWorker(threading.Thread):
                 rows = []
             cb({"token": tok, "rows": rows})
 
-        # -- load_wave: single waveform by id ---------------------------------
+        # load_wave: single waveform by id 
         elif k == "load_wave":
             db, sid_, dd = p["db_path"], p["snip_id"], Path(p["day_dir"])
             try:
@@ -383,9 +383,8 @@ class _DBWorker(threading.Thread):
                 "channels_mask": str(row["channels_mask"] or "CHANNEL_A"),
             })
 
-# ---------------------------------------------------------------------------
+
 # Numpy snip dtype  (compact packed; ~80 bytes per row)
-# ---------------------------------------------------------------------------
 _SNIP_DT = np.dtype([
     ("id",               "i8"),
     ("timestamp_ns",     "i8"),
@@ -417,9 +416,8 @@ def _rows_to_arr(rows) -> np.ndarray:
         a["n_samples"][i]        = int(r["n_samples"] or 0)
     return a
 
-# ---------------------------------------------------------------------------
 # Virtual Treeview -- numpy backing, PAGE_SIZE rows in Tk at all times
-# ---------------------------------------------------------------------------
+
 PAGE_SIZE = 200
 
 class _VirtualTree:
@@ -471,7 +469,7 @@ class _VirtualTree:
                  font=FONT_SM, fg=C_DIM2, bg=C_BG, anchor="w",
                  ).pack(fill=tk.X, padx=4, pady=(1, 0))
 
-    # public ------------------------------------------------------------------
+    # public
     def load(self, rows: list):
         if not rows:
             self._idx = None; self._pg = 0
@@ -510,7 +508,7 @@ class _VirtualTree:
         m = np.where(self._idx["id"] == snip_id)[0]
         return self._idx[m[0]] if len(m) else None
 
-    # private -----------------------------------------------------------------
+    # private
     def _render(self):
         t = self.tree
         for iid in t.get_children():
@@ -596,57 +594,54 @@ class _VirtualTree:
         self._idx = self._idx[o]
         self._pg = 0; self._render()
 
-# ---------------------------------------------------------------------------
 # Waveform plot panel   (artist reuse - never ax.clear())
-# ---------------------------------------------------------------------------
+
 class _WavePlot:
     def __init__(self, parent):
         _, plt, FC = _lazy_mpl()
         self.fig = plt.Figure(figsize=(7.5, 6.2), facecolor=C_BG)
         self.fig.subplots_adjust(left=0.13, right=0.97,
-                                 top=0.97, bottom=0.09, hspace=0.36)
+                                 top=0.97, bottom=0.09, hspace=0.38)
         self.axA = self.fig.add_subplot(311)
         self.axB = self.fig.add_subplot(312)
         self.axI = self.fig.add_subplot(313)
-        for ax in (self.axA, self.axB, self.axI):
-            ax.set_facecolor(C_PANEL)
-            ax.tick_params(colors=C_DIM2, labelsize=8, which='both', direction='in')
-            ax.tick_params(which='minor', length=2)
-            ax.tick_params(which='major', length=4)
-            for sp in ax.spines.values():
-                sp.set_color(C_BORDER)
-            ax.grid(True, which='major', color=C_DIM, alpha=0.3, linewidth=0.6, linestyle='-')
-            ax.grid(True, which='minor', color=C_DIM, alpha=0.12, linewidth=0.4, linestyle='-')
-            ax.minorticks_on()
+        self._style_axes(self.axA, self.axB, self.axI)
 
-        (self._lA,)  = self.axA.plot([], [], color=C_CYAN, lw=1.2)
-        (self._lB,)  = self.axB.plot([], [], color=C_GOLD, lw=1.2)
-        (self._lIA,) = self.axI.plot([], [], color=C_GREEN, lw=1.2, label="integral A")
-        (self._lIB,) = self.axI.plot([], [], color=C_GOLD, lw=1.2,
-                                      linestyle="--", label="integral B")
+        # Main waveform lines
+        (self._lA,)  = self.axA.plot([], [], color=C_CYAN,  lw=1.2, zorder=3)
+        (self._lB,)  = self.axB.plot([], [], color=C_GOLD,  lw=1.2, zorder=3)
+        (self._lIA,) = self.axI.plot([], [], color=C_GREEN, lw=1.2, label="integral A", zorder=3)
+        (self._lIB,) = self.axI.plot([], [], color=C_GOLD,  lw=1.2,
+                                      linestyle="--", label="integral B", zorder=3)
 
-        # Dot markers for selected point (click to pin)
-        (self._dotA,) = self.axA.plot([], [], 'o', color=C_MAGENTA, ms=8, mew=2,
+        # Ombre fill polygons (updated in plot())
+        self._fillA = self.axA.fill_between([], [], alpha=0)
+        self._fillB = self.axB.fill_between([], [], alpha=0)
+        self._fillI = self.axI.fill_between([], [], alpha=0)
+
+        # Dot markers for pinned point
+        (self._dotA,) = self.axA.plot([], [], 'o', color=C_MAGENTA, ms=7, mew=1.5,
                                        mec='white', zorder=10, visible=False)
-        (self._dotB,) = self.axB.plot([], [], 'o', color=C_MAGENTA, ms=8, mew=2,
+        (self._dotB,) = self.axB.plot([], [], 'o', color=C_MAGENTA, ms=7, mew=1.5,
                                        mec='white', zorder=10, visible=False)
 
         self.axA.set_ylabel("Ch A (V)",  color=C_CYAN,  fontsize=8)
         self.axB.set_ylabel("Ch B (V)",  color=C_GOLD,  fontsize=8)
-        self.axI.set_ylabel("integral",  color=C_GREEN, fontsize=8)
+        self.axI.set_ylabel("∫ (V·s)",   color=C_GREEN, fontsize=8)
         self.axI.set_xlabel("Time",      color=C_TEXT2, fontsize=8)
 
-        # Store last-plotted data for pop-out compare
-        self._last_wa = None
-        self._last_wb = None
-        self._last_sr = 1.0
-        self._last_tsns = 0
-        self._last_bA = 0.0
-        self._last_bB = 0.0
+        # Crosshair vlines
+        self._vlA = self.axA.axvline(0, color=C_CYAN,  alpha=0.3, lw=0.8, visible=False)
+        self._vlB = self.axB.axvline(0, color=C_GOLD,  alpha=0.3, lw=0.8, visible=False)
+        self._vlI = self.axI.axvline(0, color=C_TEXT2, alpha=0.3, lw=0.8, visible=False)
 
-        self._vlA = self.axA.axvline(0, color=C_CYAN,  alpha=0.35, lw=0.8, visible=False)
-        self._vlB = self.axB.axvline(0, color=C_GOLD,  alpha=0.35, lw=0.8, visible=False)
-        self._vlI = self.axI.axvline(0, color=C_TEXT2, alpha=0.35, lw=0.8, visible=False)
+        # Store last-plotted data for pop-out
+        self._last_wa   = None
+        self._last_wb   = None
+        self._last_sr   = 1.0
+        self._last_tsns = 0
+        self._last_bA   = 0.0
+        self._last_bB   = 0.0
 
         self.canvas = FC(self.fig, master=parent)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -662,19 +657,99 @@ class _WavePlot:
 
         self._tv   = None
         self._wap  = None
+        self._wbp  = None
+        self._iA   = None
         self._unit = "s"
         self._tsns = 0
         self._tz   = datetime.now().astimezone().tzinfo
-        self._rdv  = tk.StringVar(value="")
+
+        # Readout label (hover)
+        self._rdv = tk.StringVar(value="")
         self._rdv_lbl = tk.Label(parent, textvariable=self._rdv,
                  font=("Consolas", 9), fg=C_CYAN, bg=C_BG,
                  anchor="w", padx=6)
         self._rdv_lbl.pack(fill=tk.X, side=tk.BOTTOM)
-        self.canvas.mpl_connect("motion_notify_event", self._hover)
-        self.canvas.mpl_connect("button_press_event", self._on_click)
 
-    def _on_click(self, ev):
-        """Pin a dot marker on click to mark the current sample."""
+        # Draggy mode state
+        self._draggy_active = False
+        self._drag_p1: Optional[float] = None
+        self._drag_spans: list = []
+        self._drag_vlines: list = []
+        self._draggy_result_var = tk.StringVar(value="")
+        self._draggy_result_lbl = tk.Label(
+            parent, textvariable=self._draggy_result_var,
+            font=("Consolas", 9, "bold"), fg=C_MAGENTA, bg=C_BG,
+            anchor="w", padx=6)
+        self._draggy_result_lbl.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.canvas.mpl_connect("motion_notify_event", self._hover)
+        self.canvas.mpl_connect("button_press_event",  self._on_click)
+
+    @staticmethod
+    def _style_axes(*axes):
+        """Apply consistent dark styling to a set of axes."""
+        for ax in axes:
+            ax.set_facecolor(C_PANEL)
+            ax.tick_params(colors=C_DIM2, labelsize=8, which='both', direction='in')
+            ax.tick_params(which='minor', length=2)
+            ax.tick_params(which='major', length=4)
+            for sp in ax.spines.values():
+                sp.set_color(C_BORDER)
+            ax.grid(True, which='major', color=C_DIM, alpha=0.3, linewidth=0.6)
+            ax.grid(True, which='minor', color=C_DIM, alpha=0.10, linewidth=0.4)
+            ax.minorticks_on()
+
+    @staticmethod
+    def _clear_collections(ax) -> None:
+        """Remove all PolyCollection children (fill_between patches) from an axis."""
+        for coll in list(ax.collections):
+            try:
+                coll.remove()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _ombre(ax, tv, data, color, alpha_top: float = 0.22) -> None:
+        """Two-pass fill_between to fake a vertical ombre under a waveform.
+
+        Positive excursions get full alpha; negative lobes get half, so
+        the shading stays visually anchored to zero without an explicit
+        baseline offset.
+        """
+        baseline = np.zeros_like(data)
+        kw = dict(color=color, zorder=1, linewidth=0)
+        ax.fill_between(tv, data, baseline, where=(data >= baseline),
+                        alpha=alpha_top * 0.9, **kw)
+        ax.fill_between(tv, data, baseline, where=(data < baseline),
+                        alpha=alpha_top * 0.5, **kw)
+
+    #  draggy modeee
+
+    def toggle_draggy(self) -> bool:
+        """Flip draggy mode on/off. Returns the new active state."""
+        self._draggy_active = not self._draggy_active
+        if not self._draggy_active:
+            self._drag_p1 = None
+            self._clear_drag_artists()
+            self._draggy_result_var.set("")
+            if self._tv is not None and len(self._tv) > 1:
+                x0, x1 = float(self._tv[0]), float(self._tv[-1])
+                for ax in (self.axA, self.axB, self.axI):
+                    ax.set_xlim(x0, x1)
+            self.canvas.draw_idle()
+        return self._draggy_active
+
+    def _clear_drag_artists(self) -> None:
+        """Remove all draggy selection overlays from every axis."""
+        for artist in (*self._drag_spans, *self._drag_vlines):
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._drag_spans.clear()
+        self._drag_vlines.clear()
+
+    def _on_click(self, ev) -> None:  # mpl button_press_event
         if ev.inaxes is None or self._tv is None or self._wap is None:
             return
         if ev.button != 1:
@@ -682,14 +757,29 @@ class _WavePlot:
         x = ev.xdata
         if x is None:
             return
-        tv = self._tv
+
+        # Draggy Modee
+        if self._draggy_active:
+            if self._drag_p1 is None:
+                self._drag_p1 = x
+                self._clear_drag_artists()
+                self._draggy_result_var.set(
+                    f"✦ DRAGGY  P1 = {x:.4g} {self._unit}  →  click second point")
+                for ax in (self.axA, self.axB, self.axI):
+                    vl = ax.axvline(x, color=C_MAGENTA, lw=1.4, linestyle="--", alpha=0.8)
+                    self._drag_vlines.append(vl)
+                self.canvas.draw_idle()
+            else:
+                self._draggy_commit(x)
+            return
+
+        #  Normal click: pin dot marker
+        tv  = self._tv
         idx = int(np.clip(np.searchsorted(tv, x), 0, len(tv) - 1))
-        t_ = float(tv[idx])
-        # Show dot on Ch A
+        t_  = float(tv[idx])
         if idx < len(self._wap):
             self._dotA.set_data([t_], [float(self._wap[idx])])
             self._dotA.set_visible(True)
-        # Show dot on Ch B if data exists
         try:
             lbx, lby = self._lB.get_data()
             if lby is not None and hasattr(lby, '__len__') and len(lby) > 0 and idx < len(lby):
@@ -699,8 +789,61 @@ class _WavePlot:
             pass
         self.canvas.draw_idle()
 
-    def pop_out(self, title: str = "CAPPY Waveform Compare"):
-        """Create a detached Toplevel window with a copy of the current waveform for side-by-side comparison."""
+
+    def _draggy_commit(self, x2: float) -> None:
+        """Finalize a draggy selection: draw overlays, zoom, compute integrals."""
+        x1, x2 = sorted([self._drag_p1, x2])
+        self._drag_p1 = None
+        self._clear_drag_artists()
+
+        tv   = self._tv
+        unit = self._unit
+        scale = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3}.get(unit, 1.0)
+
+        i1 = int(np.clip(np.searchsorted(tv, x1), 0, len(tv) - 1))
+        i2 = int(np.clip(np.searchsorted(tv, x2), 0, len(tv) - 1))
+        if i2 <= i1:
+            i2 = min(i1 + 1, len(tv) - 1)
+
+        t1_f, t2_f = float(tv[i1]), float(tv[i2])
+        span = t2_f - t1_f
+        pad  = span * 0.05 if span > 0 else 1e-9
+
+        for ax in (self.axA, self.axB, self.axI):
+            sp = ax.axvspan(t1_f, t2_f, color=C_MAGENTA, alpha=0.10, zorder=0)
+            self._drag_spans.append(sp)
+            for xb in (t1_f, t2_f):
+                vl = ax.axvline(xb, color=C_MAGENTA, lw=1.0, linestyle="--", alpha=0.55)
+                self._drag_vlines.append(vl)
+            ax.set_xlim(t1_f - pad, t2_f + pad)
+
+        # dt in seconds, estimated from the time axis
+        dt_s = scale * (float(tv[1]) - float(tv[0])) if len(tv) > 1 else 1.0
+
+        def _integral_stats(seg: np.ndarray):
+            cum  = np.cumsum(seg.astype(np.float64)) * dt_s
+            return float(np.mean(cum)), float(cum[-1]) if len(cum) else 0.0
+
+        mean_iA, total_iA = _integral_stats(self._wap[i1:i2 + 1])
+        result = (
+            f"◈ {t1_f:.4g}–{t2_f:.4g} {unit}"
+            f"  n={i2 - i1}"
+            f"  ∫A μ={mean_iA:.5g} V·s  Σ={total_iA:.5g} V·s"
+        )
+
+        try:
+            _, lby = self._lB.get_data()
+            if lby is not None and len(lby) > i2:
+                mean_iB, _ = _integral_stats(np.asarray(lby[i1:i2 + 1]))
+                result += f"  ∫B μ={mean_iB:.5g} V·s"
+        except Exception:
+            pass
+
+        self._draggy_result_var.set(result)
+        self.canvas.draw_idle()
+
+    def pop_out(self, title: str = "cappy · waveform compare") -> Optional[tk.Toplevel]:
+        """Detached compare window — full feature parity with main window."""
         if self._last_wa is None:
             return None
         _, plt, FC = _lazy_mpl()
@@ -708,65 +851,67 @@ class _WavePlot:
         win = tk.Toplevel()
         win.title(title)
         win.configure(bg=C_BG)
-        win.geometry("720x600")
-        win.minsize(500, 400)
+        win.geometry("760x640")
+        win.minsize(520, 420)
 
-        fig = plt.Figure(figsize=(7, 5.5), facecolor=C_BG)
-        fig.subplots_adjust(left=0.13, right=0.97, top=0.95, bottom=0.09, hspace=0.36)
+        # ── figure ──────────────────────────────────────────────────────────
+        fig = plt.Figure(figsize=(7.2, 5.6), facecolor=C_BG)
+        fig.subplots_adjust(left=0.13, right=0.97, top=0.93, bottom=0.09, hspace=0.38)
         axA = fig.add_subplot(311)
         axB = fig.add_subplot(312)
         axI = fig.add_subplot(313)
-        for ax in (axA, axB, axI):
-            ax.set_facecolor(C_PANEL)
-            ax.tick_params(colors=C_DIM2, labelsize=8, which='both', direction='in')
-            ax.tick_params(which='minor', length=2)
-            ax.tick_params(which='major', length=4)
-            for sp in ax.spines.values(): sp.set_color(C_BORDER)
-            ax.grid(True, which='major', color=C_DIM, alpha=0.3, linewidth=0.6, linestyle='-')
-            ax.grid(True, which='minor', color=C_DIM, alpha=0.12, linewidth=0.4, linestyle='-')
-            ax.minorticks_on()
+        self._style_axes(axA, axB, axI)
 
-        wa = self._last_wa; wb = self._last_wb
-        sr = self._last_sr; bA = self._last_bA; bB = self._last_bB
+        wa, wb = self._last_wa, self._last_wb
+        sr, bA, bB = self._last_sr, self._last_bA, self._last_bB
         tv, unit = self._tax(len(wa), sr)
         wap = wa - bA
-        dt = 1.0 / sr
+        dt  = 1.0 / sr
 
-        axA.plot(tv, wap, color=C_CYAN, lw=1.2)
-        axA.set_ylabel("Ch A (V)", color=C_CYAN, fontsize=8)
+        lA,  = axA.plot(tv, wap, color=C_CYAN, lw=1.2, zorder=3)
+        self._ombre(axA, tv, wap, C_CYAN, alpha_top=0.18)
+        axA.set_ylabel("Ch A (V)", color=C_CYAN,  fontsize=8)
         axA.set_xlabel(f"Time ({unit})", color=C_TEXT2, fontsize=8)
 
+        lB = None
         if wb is not None:
             wbp = wb - bB
-            axB.plot(tv, wbp, color=C_GOLD, lw=1.2)
+            lB, = axB.plot(tv, wbp, color=C_GOLD, lw=1.2, zorder=3)
+            self._ombre(axB, tv, wbp, C_GOLD, alpha_top=0.15)
             axB.set_ylabel("Ch B (V)", color=C_GOLD, fontsize=8)
         else:
             axB.set_visible(False)
         axB.set_xlabel(f"Time ({unit})", color=C_TEXT2, fontsize=8)
 
         iA = np.cumsum((wa - bA).astype(np.float64)) * dt
-        axI.plot(tv, iA, color=C_GREEN, lw=1.2, label="integral A")
+        lIA, = axI.plot(tv, iA, color=C_GREEN, lw=1.2, label="integral A", zorder=3)
+        self._ombre(axI, tv, iA, C_GREEN, alpha_top=0.14)
         if wb is not None:
             iB = np.cumsum((wb - bB).astype(np.float64)) * dt
             axI.plot(tv, iB, color=C_GOLD, lw=1.2, linestyle="--", label="integral B")
-        axI.set_ylabel("integral", color=C_GREEN, fontsize=8)
+        axI.set_ylabel("∫ (V·s)", color=C_GREEN, fontsize=8)
         axI.set_xlabel(f"Time ({unit})", color=C_TEXT2, fontsize=8)
-        axI.legend(loc="best", fontsize=7, facecolor=C_PANEL, edgecolor=C_BORDER, labelcolor=C_TEXT)
+        axI.legend(loc="best", fontsize=7, facecolor=C_PANEL,
+                   edgecolor=C_BORDER, labelcolor=C_TEXT)
 
-        # Auto-trim flat tail
+        # Auto-trim
         if len(tv) > 8:
             trim = self._tail(wa - bA)
             if wb is not None: trim = max(trim, self._tail(wb - bB))
             if trim < len(tv) - 2:
                 right = float(tv[max(1, trim)])
-                for ax in (axA, axB, axI): ax.set_xlim(left=float(tv[0]), right=right)
+                for ax in (axA, axB, axI):
+                    ax.set_xlim(left=float(tv[0]), right=right)
 
         # Timestamp title
         ts_dt = datetime.fromtimestamp(self._last_tsns / 1e9, tz=self._tz)
-        fig.suptitle(ts_dt.strftime("%Y-%m-%d %H:%M:%S.%f"), color=C_CYAN, fontsize=9, y=0.99)
+        fig.suptitle(ts_dt.strftime("%Y-%m-%d  %H:%M:%S.%f"),
+                     color=C_CYAN, fontsize=9, y=0.99)
 
         canvas = FC(fig, master=win)
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Toolbar
         try:
             from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk as NTB
             tbf = tk.Frame(win, bg=C_PANEL, height=28)
@@ -774,25 +919,221 @@ class _WavePlot:
             NTB(canvas, tbf).update()
         except Exception:
             pass
+
+        #  state for this pop-out
+        po_state = {
+            "draggy_active": False,
+            "drag_p1":       None,
+            "drag_spans":    [],
+            "drag_vlines":   [],
+            "tv":            tv,
+            "wap":           wap,
+            "unit":          unit,
+        }
+
+        # crosshair vlines
+        vlA = axA.axvline(0, color=C_CYAN,  alpha=0.3, lw=0.8, visible=False)
+        vlB = axB.axvline(0, color=C_GOLD,  alpha=0.3, lw=0.8, visible=False)
+        vlI = axI.axvline(0, color=C_TEXT2, alpha=0.3, lw=0.8, visible=False)
+
+        # dot markers
+        dotA, = axA.plot([], [], 'o', color=C_MAGENTA, ms=7, mew=1.5,
+                          mec='white', zorder=10, visible=False)
+        dotB, = axB.plot([], [], 'o', color=C_MAGENTA, ms=7, mew=1.5,
+                          mec='white', zorder=10, visible=False) if wb is not None else (None,)
+
+        # bottom bar
+        bar = tk.Frame(win, bg=C_BG)
+        bar.pack(fill=tk.X, side=tk.BOTTOM, padx=4, pady=(0, 2))
+
+        draggy_var = tk.BooleanVar(value=False)
+        draggy_btn_txt = tk.StringVar(value="⬡  Draggy Mode")
+        draggy_result  = tk.StringVar(value="")
+        rdv            = tk.StringVar(value="")
+
+        def _toggle_po_draggy():
+            po_state["draggy_active"] = not po_state["draggy_active"]
+            po_state["drag_p1"] = None
+            _clear_po_drag()
+            draggy_result.set("")
+            if po_state["draggy_active"]:
+                draggy_btn_txt.set("✦  Draggy Mode  ON")
+            else:
+                draggy_btn_txt.set("⬡  Draggy Mode")
+                # restore full xlim
+                x0, x1_ = float(tv[0]), float(tv[-1])
+                for ax in (axA, axB, axI):
+                    ax.set_xlim(x0, x1_)
+                canvas.draw_idle()
+
+        def _reset_po_zoom():
+            po_state["drag_p1"] = None
+            _clear_po_drag()
+            draggy_result.set("")
+            x0, x1_ = float(tv[0]), float(tv[-1])
+            for ax in (axA, axB, axI): ax.set_xlim(x0, x1_)
+            canvas.draw_idle()
+
+        def _clear_po_drag():
+            for p in po_state["drag_spans"]:
+                try: p.remove()
+                except Exception: pass
+            po_state["drag_spans"].clear()
+            for l in po_state["drag_vlines"]:
+                try: l.remove()
+                except Exception: pass
+            po_state["drag_vlines"].clear()
+
+        ttk.Button(bar, textvariable=draggy_btn_txt,
+                   command=_toggle_po_draggy, style="TButton").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(bar, text="↺ Reset Zoom",
+                   command=_reset_po_zoom,   style="TButton").pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(bar, textvariable=draggy_result,
+                 font=("Consolas", 9, "bold"), fg=C_MAGENTA, bg=C_BG,
+                 anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        tk.Label(win, textvariable=rdv,
+                 font=("Consolas", 9), fg=C_CYAN, bg=C_BG,
+                 anchor="w", padx=6).pack(fill=tk.X, side=tk.BOTTOM)
+
+        # event handler
+        def _po_hover(ev):
+            if ev.inaxes is None or po_state["tv"] is None:
+                for vl in (vlA, vlB, vlI): vl.set_visible(False)
+                canvas.draw_idle(); return
+            x = ev.xdata
+            if x is None: return
+            tv_ = po_state["tv"]; unit_ = po_state["unit"]
+            idx = int(np.clip(np.searchsorted(tv_, x), 0, len(tv_) - 1))
+            t_  = float(tv_[idx])
+            for vl in (vlA, vlB, vlI):
+                vl.set_xdata([t_]); vl.set_visible(True)
+            scale = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3}.get(unit_, 1.0)
+            ans   = self._last_tsns + int(t_ * scale * 1e9)
+            ts    = (datetime.fromtimestamp(ans / 1e9, tz=self._tz)
+                     .strftime("%H:%M:%S") + f".{ans % 1_000_000_000:09d}")
+            wap_  = po_state["wap"]
+            if ev.inaxes == axA:
+                v = float(wap_[idx]) if idx < len(wap_) else 0.0
+                rdv.set(f"Ch A   t={t_:.4g} {unit_}   V={v:.6g} V   @ {ts}")
+            elif ev.inaxes == axB and lB is not None:
+                try:
+                    _, lby = lB.get_data()
+                    v = float(lby[idx]) if lby is not None and idx < len(lby) else 0.0
+                except Exception: v = 0.0
+                rdv.set(f"Ch B   t={t_:.4g} {unit_}   V={v:.6g} V   @ {ts}")
+            elif ev.inaxes == axI:
+                try:
+                    _, liy = lIA.get_data()
+                    v = float(liy[idx]) if liy is not None and idx < len(liy) else 0.0
+                except Exception: v = 0.0
+                rdv.set(f"∫A     t={t_:.4g} {unit_}   I={v:.6g} V·s   @ {ts}")
+            canvas.draw_idle()
+
+        def _po_click(ev):
+            if ev.inaxes is None or ev.button != 1: return
+            x = ev.xdata
+            if x is None: return
+            tv_ = po_state["tv"]; unit_ = po_state["unit"]
+
+            if po_state["draggy_active"]:
+                if po_state["drag_p1"] is None:
+                    po_state["drag_p1"] = x
+                    _clear_po_drag()
+                    draggy_result.set(f"✦ DRAGGY  P1={x:.4g} {unit_}  →  click P2")
+                    for ax in (axA, axB, axI):
+                        vl = ax.axvline(x, color=C_MAGENTA, lw=1.4, linestyle="--", alpha=0.8)
+                        po_state["drag_vlines"].append(vl)
+                    canvas.draw_idle()
+                else:
+                    x1, x2 = sorted([po_state["drag_p1"], x])
+                    po_state["drag_p1"] = None
+                    _clear_po_drag()
+                    i1 = int(np.clip(np.searchsorted(tv_, x1), 0, len(tv_)-1))
+                    i2 = int(np.clip(np.searchsorted(tv_, x2), 0, len(tv_)-1))
+                    if i2 <= i1: i2 = min(i1+1, len(tv_)-1)
+                    for ax in (axA, axB, axI):
+                        sp = ax.axvspan(float(tv_[i1]), float(tv_[i2]),
+                                        color=C_MAGENTA, alpha=0.10, zorder=0)
+                        po_state["drag_spans"].append(sp)
+                        for xb in (float(tv_[i1]), float(tv_[i2])):
+                            vl = ax.axvline(xb, color=C_MAGENTA, lw=1.0,
+                                            linestyle="--", alpha=0.55)
+                            po_state["drag_vlines"].append(vl)
+                    span = float(tv_[i2]) - float(tv_[i1])
+                    pad  = span * 0.05 if span > 0 else 1e-9
+                    for ax in (axA, axB, axI):
+                        ax.set_xlim(float(tv_[i1])-pad, float(tv_[i2])+pad)
+                    scale = {"ns":1e-9,"us":1e-6,"ms":1e-3}.get(unit_,1.0)
+                    sr_est = 1.0/(scale*(float(tv_[1])-float(tv_[0]))) if len(tv_)>1 else 1.0
+                    dt_s   = 1.0/sr_est
+                    wap_   = po_state["wap"]
+                    seg_a  = wap_[i1:i2+1].astype(np.float64)
+                    iA_seg = np.cumsum(seg_a)*dt_s
+                    mean_iA  = float(np.mean(iA_seg))
+                    total_iA = float(iA_seg[-1]) if len(iA_seg) else 0.0
+                    res = (f"✦ {float(tv_[i1]):.4g}–{float(tv_[i2]):.4g} {unit_}"
+                           f"  ({i2-i1} pts)"
+                           f"  ∫A mean={mean_iA:.5g} V·s"
+                           f"  total={total_iA:.5g} V·s")
+                    if lB is not None:
+                        try:
+                            _, lby = lB.get_data()
+                            if lby is not None and len(lby) > i2:
+                                seg_b  = np.asarray(lby[i1:i2+1], dtype=np.float64)
+                                iB_seg = np.cumsum(seg_b)*dt_s
+                                res += f"  ∫B mean={float(np.mean(iB_seg)):.5g} V·s"
+                        except Exception: pass
+                    draggy_result.set(res)
+                    canvas.draw_idle()
+                return
+
+            # Normal click — pin dot
+            idx = int(np.clip(np.searchsorted(tv_, x), 0, len(tv_)-1))
+            t_  = float(tv_[idx])
+            wap_ = po_state["wap"]
+            if idx < len(wap_):
+                dotA.set_data([t_], [float(wap_[idx])])
+                dotA.set_visible(True)
+            if dotB is not None and lB is not None:
+                try:
+                    _, lby = lB.get_data()
+                    if lby is not None and idx < len(lby):
+                        dotB.set_data([t_], [float(lby[idx])])
+                        dotB.set_visible(True)
+                except Exception: pass
+            canvas.draw_idle()
+
+        canvas.mpl_connect("motion_notify_event", _po_hover)
+        canvas.mpl_connect("button_press_event",  _po_click)
         canvas.draw()
         return win
 
-    def _tax(self, n, sr):
-        t = np.arange(n, dtype=np.float64) / sr
+    @staticmethod
+    def _tax(n: int, sr: float) -> tuple[np.ndarray, str]:
+        """Build a time axis of length *n* at sample rate *sr* Hz.
+
+        Returns (tv, unit) where unit is the SI prefix that keeps the
+        largest value comfortably ≥ 1 (ns / us / ms / s).
+        """
+        t  = np.arange(n, dtype=np.float64) / sr
         mx = float(t[-1]) if t.size else 0.0
-        if mx < 1e-6: return t * 1e9, "ns"
-        if mx < 1e-3: return t * 1e6, "us"
-        if mx < 1.0:  return t * 1e3, "ms"
+        if mx < 1e-6: return t * 1e9,  "ns"
+        if mx < 1e-3: return t * 1e6,  "us"
+        if mx < 1.0:  return t * 1e3,  "ms"
         return t, "s"
 
-    def plot(self, wa: np.ndarray, wb, sr: float, tsns: int,
-             bA: float = 0.0, bB: float = 0.0):
+    def plot(self, wa: np.ndarray, wb: Optional[np.ndarray],
+             sr: float, tsns: int,
+             bA: float = 0.0, bB: float = 0.0) -> None:
         tv, unit = self._tax(len(wa), sr)
         self._tv = tv; self._unit = unit; self._tsns = tsns
         wap = wa - bA
         wbp = (wb - bB) if wb is not None else None
         dt  = 1.0 / sr
         self._wap = wap
+        self._wbp = wbp
 
         # Store for pop-out compare
         self._last_wa = wa.copy()
@@ -802,9 +1143,12 @@ class _WavePlot:
         self._last_bA = bA
         self._last_bB = bB
 
-        # Clear dot markers on new waveform
+        # Clear dot markers and draggy on new waveform
         self._dotA.set_data([], []); self._dotA.set_visible(False)
         self._dotB.set_data([], []); self._dotB.set_visible(False)
+        self._drag_p1 = None
+        self._clear_drag_artists()
+        self._draggy_result_var.set("")
 
         def _slim(v):
             lo, hi = float(v.min()), float(v.max())
@@ -813,18 +1157,27 @@ class _WavePlot:
 
         self._lA.set_data(tv, wap)
         self.axA.set_xlim(tv[0], tv[-1]); self.axA.set_ylim(*_slim(wap))
+        # ombre under Ch A  (remove stale fills before redrawing)
+        self._clear_collections(self.axA)
+        self._ombre(self.axA, tv, wap, C_CYAN, alpha_top=0.18)
 
         if wbp is not None:
             self._lB.set_data(tv, wbp)
             self.axB.set_xlim(tv[0], tv[-1]); self.axB.set_ylim(*_slim(wbp))
             self.axB.set_visible(True)
+            self._clear_collections(self.axB)
+            self._ombre(self.axB, tv, wbp, C_GOLD, alpha_top=0.15)
         else:
             self._lB.set_data([], []); self.axB.set_visible(False)
 
         wai = wa - bA
         wbi = (wb - bB) if wb is not None else None
         iA  = np.cumsum(wai.astype(np.float64)) * dt
+        self._iA = iA
         self._lIA.set_data(tv, iA)
+        self._clear_collections(self.axI)
+        self._ombre(self.axI, tv, iA, C_GREEN, alpha_top=0.14)
+
         if wbi is not None:
             iB = np.cumsum(wbi.astype(np.float64)) * dt
             self._lIB.set_data(tv, iB); self._lIB.set_visible(True)
@@ -847,13 +1200,11 @@ class _WavePlot:
 
         self.canvas.draw_idle()
         if self._tb:
-            try:
-                self._tb.update()
-            except Exception:
-                pass
+            try: self._tb.update()
+            except Exception: pass
 
     @staticmethod
-    def _tail(a):
+    def _tail(a: np.ndarray) -> int:
         a = np.asarray(a, dtype=np.float64).ravel(); n = len(a)
         if n <= 8: return n - 1
         tail = a[int(n * .8):]
@@ -864,7 +1215,7 @@ class _WavePlot:
         idx  = np.flatnonzero(dev > thr)
         return min(n - 1, int(idx[-1]) + max(4, n // 100)) if idx.size else n - 1
 
-    def _hover(self, ev):
+    def _hover(self, ev) -> None:  # mpl motion_notify_event
         if ev.inaxes is None or self._tv is None:
             for vl in (self._vlA, self._vlB, self._vlI):
                 vl.set_visible(False)
@@ -912,450 +1263,655 @@ class _WavePlot:
         self.canvas.draw_idle()
 
 # ---------------------------------------------------------------------------
-# ArchiveDB  --  main widget
+# Time bucket constants  (nanoseconds)
+# ---------------------------------------------------------------------------
+_NS_PER_DAY  = 86_400_000_000_000
+_NS_PER_HOUR =  3_600_000_000_000
+_NS_PER_MIN  =     60_000_000_000
+
+_UNIT_SCALE: Dict[str, float] = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# ArchiveDB  —  root widget
+#
+# Navigation hierarchy (left panel):
+#   Session → Day → Hour → Minute → Snips
+#
+# Each drill level is a single GROUP BY query dispatched to _DBWorker.
+# The GUI thread only ever holds PAGE_SIZE Treeview rows at a time.
 # ---------------------------------------------------------------------------
 class ArchiveDB(ttk.Frame):
-    """
-    Hierarchical lazy-loading archive browser.
-    Session -> Day -> Hour -> Minute -> Snips (one minute at a time).
-    Each level is one GROUP BY query on the DB thread.
-    The GUI thread only ever sees at most PAGE_SIZE rows in Tk.
-    """
 
-    def __init__(self, data_dir, master=None):
+    #lifecycle
+
+    def __init__(self, data_dir: Path, master=None) -> None:
         super().__init__(master)
-        self._tz      = datetime.now().astimezone().tzinfo
-        self.data_dir = Path(data_dir)
-        self.captures = self.data_dir / "captures"
-        self._worker  = _DBWorker(); self._worker.start()
-        self._cache   = _WaveCache(256)
-        self._tok_val = 0
+        self._tz       = datetime.now().astimezone().tzinfo
+        self.data_dir  = Path(data_dir)
+        self.captures  = self.data_dir / "captures"
 
-        # navigation state
-        self._db_map: Dict[str, tuple] = {}  # session_id -> (db_path, day_dir)
-        self._cur_sid = self._cur_db = self._cur_daydir = None
-        self._cur_snip: Optional[int] = None
+        self._worker   = _DBWorker()
+        self._worker.start()
+        self._cache    = _WaveCache(256)
+        self._tok_val  = 0
+
+        # session → (db_path, day_dir)
+        self._db_map:    Dict[str, tuple]  = {}
+        self._cur_sid:   Optional[str]     = None
+        self._cur_db:    Optional[str]     = None
+        self._cur_daydir: Optional[str]    = None
+        self._cur_snip:  Optional[int]     = None
+        self._popout_count = 0
+        self._draggy_on    = False
 
         self._apply_theme()
         self._build()
         self.after(80, self._refresh_sessions)
 
-    # token -------------------------------------------------------------------
-    def _tok(self) -> int:
-        self._tok_val += 1; return self._tok_val
+    def destroy(self) -> None:
+        try:
+            self._worker.stop()
+        except Exception:
+            pass
+        super().destroy()
 
-    # theme -------------------------------------------------------------------
-    def _apply_theme(self):
+    def _tok(self) -> int:
+        """Monotonic request token — stale callbacks self-discard on mismatch."""
+        self._tok_val += 1
+        return self._tok_val
+
+    # theme
+
+    def _apply_theme(self) -> None:
         s = ttk.Style(self)
-        try: s.theme_use("clam")
-        except Exception: pass
-        s.configure("Dark.TFrame",       background=C_BG)
-        s.configure("Treeview",          background=C_PANEL, foreground=C_TEXT,
+        try:
+            s.theme_use("clam")
+        except Exception:
+            pass
+
+        s.configure("Dark.TFrame",      background=C_BG)
+        s.configure("Treeview",         background=C_PANEL, foreground=C_TEXT,
                     fieldbackground=C_PANEL, rowheight=22, font=FONT)
-        s.configure("Treeview.Heading",  background=C_BORDER, foreground=C_CYAN,
+        s.configure("Treeview.Heading", background=C_BORDER, foreground=C_CYAN,
                     font=FONT_B)
-        s.map("Treeview", background=[("selected", C_SEL2)],
+        s.map("Treeview",
+              background=[("selected", C_SEL2)],
               foreground=[("selected", C_CYAN)])
-        s.configure("TScrollbar",  background=C_BORDER, troughcolor=C_BG,
+
+        s.configure("TScrollbar", background=C_BORDER, troughcolor=C_BG,
                     arrowcolor=C_DIM)
-        s.configure("TButton",     background=C_BDR2, foreground=C_TEXT, font=FONT,
-                    borderwidth=1, relief="flat", padding=(8, 3))
-        s.map("TButton",           background=[("active", C_SEL)])
-        s.configure("Hi.TButton",  background=C_BDR2, foreground=C_CYAN, font=FONT_B,
-                    padding=(10, 4), relief="flat", borderwidth=1)
-        s.map("Hi.TButton",        background=[("active", C_SEL)],
+
+        _btn_common = dict(borderwidth=1, relief="flat")
+        s.configure("TButton",    background=C_BDR2, foreground=C_TEXT,
+                    font=FONT,   padding=(8, 3),  **_btn_common)
+        s.configure("Hi.TButton", background=C_BDR2, foreground=C_CYAN,
+                    font=FONT_B, padding=(10, 4), **_btn_common)
+        s.map("TButton",    background=[("active", C_SEL)])
+        s.map("Hi.TButton", background=[("active", C_SEL)],
               foreground=[("active", C_TEXT)])
 
-    # layout ------------------------------------------------------------------
-    def _build(self):
-        self.configure(style="Dark.TFrame")
+    # layout
 
-        # top bar
-        top = tk.Frame(self, bg=C_PANEL, bd=0)
-        top.pack(fill=tk.X, side=tk.TOP)
-        tk.Label(top, text="CAPPY.ARCH", font=("Consolas", 12, "bold"),
+    def _build(self) -> None:
+        self.configure(style="Dark.TFrame")
+        self._build_topbar()
+        self._build_main_pane()
+
+    def _build_topbar(self) -> None:
+        bar = tk.Frame(self, bg=C_PANEL, bd=0)
+        bar.pack(fill=tk.X, side=tk.TOP)
+
+        tk.Label(bar, text="CAPPY.ARCH", font=("Consolas", 12, "bold"),
                  fg=C_CYAN, bg=C_PANEL, padx=12, pady=5).pack(side=tk.LEFT)
+
         self._dir_var = tk.StringVar(value=str(self.data_dir))
-        tk.Entry(top, textvariable=self._dir_var,
+        tk.Entry(bar, textvariable=self._dir_var,
                  bg="#06080d", fg=C_TEXT2, insertbackground=C_TEXT,
-                 font=FONT, relief=tk.FLAT, bd=4
+                 font=FONT, relief=tk.FLAT, bd=4,
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(top, text="Browse...", command=self._pick_dir,
+
+        ttk.Button(bar, text="Browse…",  command=self._pick_dir,
                    style="TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="Reload",   command=self._refresh_sessions,
+        ttk.Button(bar, text="↺ Reload", command=self._refresh_sessions,
                    style="Hi.TButton").pack(side=tk.LEFT, padx=(2, 10))
 
-        # main pane
-        pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+    def _build_main_pane(self) -> None:
+        pane  = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         pane.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
         left  = tk.Frame(pane, bg=C_BG)
         right = tk.Frame(pane, bg=C_BG)
-        pane.add(left, weight=1); pane.add(right, weight=2)
+        pane.add(left, weight=1)
+        pane.add(right, weight=2)
 
         self._build_nav(left)
+        self._build_wave_panel(right)
 
-        # right: plot + meta + pop-out button
-        self._wave_plot = _WavePlot(right)
+    def _build_wave_panel(self, parent: tk.Frame) -> None:
+        """Right side: waveform plot + action bar + metadata text."""
+        self._wave_plot = _WavePlot(parent)
 
-        # Pop-out compare button bar
-        popbar = tk.Frame(right, bg=C_BG)
-        popbar.pack(fill=tk.X, side=tk.BOTTOM, padx=4, pady=(2, 0))
-        ttk.Button(popbar, text="Compare", command=self._pop_out_waveform,
-                   style="Hi.TButton").pack(side=tk.LEFT, padx=(0, 8))
-        self._popout_count = 0
+        # action bar (packed bottom-up, so define before meta)
+        bar = tk.Frame(parent, bg=C_BG)
+        bar.pack(fill=tk.X, side=tk.BOTTOM, padx=4, pady=(2, 0))
 
-        self._meta = tk.Text(right, height=6, bg=C_PANEL, fg=C_TEXT,
-                             insertbackground=C_TEXT, font=FONT_SM,
-                             relief=tk.FLAT, bd=0, padx=8, pady=6)
+        ttk.Button(bar, text="⎋ Compare",
+                   command=self._pop_out_waveform,
+                   style="Hi.TButton").pack(side=tk.LEFT, padx=(0, 6))
+
+        self._draggy_btn_var = tk.StringVar(value="◇ Draggy")
+        self._draggy_btn = ttk.Button(
+            bar, textvariable=self._draggy_btn_var,
+            command=self._toggle_draggy, style="TButton")
+        self._draggy_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        ttk.Button(bar, text="↺ Reset Zoom",
+                   command=self._reset_wave_zoom,
+                   style="TButton").pack(side=tk.LEFT, padx=(0, 4))
+
+        # snip metadata text box
+        self._meta = tk.Text(
+            parent, height=6,
+            bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
+            font=FONT_SM, relief=tk.FLAT, bd=0, padx=8, pady=6,
+            state=tk.DISABLED,
+        )
         self._meta.pack(fill=tk.X, side=tk.BOTTOM, padx=4, pady=(0, 4))
-        self._meta.configure(state=tk.DISABLED)
 
-    def _sh(self, parent, title):
-        """Section header bar."""
-        f = tk.Frame(parent, bg=C_PANEL, bd=0)
-        f.pack(fill=tk.X)
-        tk.Label(f, text=title, font=FONT_B,
-                 fg=C_CYAN, bg=C_PANEL, padx=8, pady=4).pack(side=tk.LEFT)
-        lbl = tk.Label(f, text="", font=FONT_SM, fg=C_DIM2, bg=C_PANEL)
-        lbl.pack(side=tk.LEFT)
-        return lbl
+    # nav panel
+    def _build_nav(self, parent: tk.Frame) -> None:
+        self._sh(parent, "SESSIONS")
+        self._t_sess = self._mk_tree(
+            parent,
+            cols=("started", "session_id", "snips"),
+            hdrs=("Started", "Session ID", "Snips"),
+            wids=(140, 155, 60),
+            on_sel=self._on_session, height=5,
+        )
 
-    def _mk_tree(self, parent, cols, hdrs, wids, on_sel, height=5):
-        f = tk.Frame(parent, bg=C_BG); f.pack(fill=tk.BOTH, expand=True)
-        t = ttk.Treeview(f, columns=cols, show="headings",
-                         selectmode="browse", height=height)
-        for c, h, w in zip(cols, hdrs, wids):
-            t.heading(c, text=h)
-            t.column(c, width=w, anchor="w" if c == "label" else "e")
-        vsb = ttk.Scrollbar(f, orient=tk.VERTICAL, command=t.yview)
-        t.configure(yscrollcommand=vsb.set)
-        t.grid(row=0, column=0, sticky="nsew"); vsb.grid(row=0, column=1, sticky="ns")
-        f.columnconfigure(0, weight=1); f.rowconfigure(0, weight=1)
-        t.bind("<<TreeviewSelect>>", on_sel)
-        return t
+        self._sh(parent, "DAY")
+        self._t_day = self._mk_tree(
+            parent,
+            cols=("label", "n"), hdrs=("Date", "Snips"),
+            wids=(140, 70), on_sel=self._on_day, height=4,
+        )
 
-    def _build_nav(self, parent):
-        # Sessions
-        self._lbl_sess = self._sh(parent, "SESSIONS")
-        self._t_sess = self._mk_tree(parent,
-            ("started", "session_id", "snips"),
-            ("Started", "Session ID", "Snips"),
-            (140, 155, 60), self._on_session, height=5)
+        # Hour + Minute side-by-side
+        hm = tk.Frame(parent, bg=C_BG)
+        hm.pack(fill=tk.BOTH)
 
-        # Day
-        self._lbl_day = self._sh(parent, "DAY")
-        self._t_day = self._mk_tree(parent,
-            ("label", "n"), ("Date", "Snips"),
-            (140, 70), self._on_day, height=4)
-
-        # Hour + Minute side by side
-        hm = tk.Frame(parent, bg=C_BG); hm.pack(fill=tk.BOTH)
-        hf = tk.Frame(hm, bg=C_BG); hf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        mf = tk.Frame(hm, bg=C_BG); mf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        tk.Label(hf, text="HOUR",   font=FONT_B, fg=C_CYAN,
-                 bg=C_PANEL, padx=6, pady=3).pack(fill=tk.X)
-        self._t_hour = self._mk_tree(hf,
-            ("label", "n"), ("Hour", "Snips"),
-            (68, 54), self._on_hour, height=7)
-
-        tk.Label(mf, text="MINUTE", font=FONT_B, fg=C_CYAN,
-                 bg=C_PANEL, padx=6, pady=3).pack(fill=tk.X)
-        self._t_min = self._mk_tree(mf,
-            ("label", "n"), ("Min", "Snips"),
-            (56, 54), self._on_minute, height=7)
+        for side_frame, label, tree_attr, on_sel, wids, height in (
+            (tk.Frame(hm, bg=C_BG), "HOUR",   "_t_hour", self._on_hour,   (68, 54), 7),
+            (tk.Frame(hm, bg=C_BG), "MINUTE", "_t_min",  self._on_minute, (56, 54), 7),
+        ):
+            side_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            tk.Label(side_frame, text=label, font=FONT_B,
+                     fg=C_CYAN, bg=C_PANEL, padx=6, pady=3).pack(fill=tk.X)
+            tree = self._mk_tree(side_frame,
+                cols=("label", "n"), hdrs=(label.capitalize(), "Snips"),
+                wids=wids, on_sel=on_sel, height=height,
+            )
+            setattr(self, tree_attr, tree)
 
         # Seek bar
-        seek = tk.Frame(parent, bg=C_BG); seek.pack(fill=tk.X, padx=4, pady=3)
-        tk.Label(seek, text="SEEK", font=FONT_SM,
-                 fg=C_DIM2, bg=C_BG).pack(side=tk.LEFT)
-        self._seek_var = tk.StringVar()
-        e = tk.Entry(seek, textvariable=self._seek_var, width=11,
-                     bg="#06080d", fg=C_TEXT, insertbackground=C_TEXT,
-                     font=FONT, relief=tk.FLAT, bd=3)
-        e.pack(side=tk.LEFT, padx=(6, 4))
-        e.bind("<Return>", lambda _: self._seek())
-        ttk.Button(seek, text="Go", command=self._seek,
-                   style="Hi.TButton").pack(side=tk.LEFT)
+        self._build_seek_bar(parent)
 
-        # Snips
-        tk.Label(parent, text="SNIPS", font=FONT_B, fg=C_CYAN,
-                 bg=C_PANEL, padx=8, pady=3).pack(fill=tk.X)
+        # Snip list
+        tk.Label(parent, text="SNIPS", font=FONT_B,
+                 fg=C_CYAN, bg=C_PANEL, padx=8, pady=3).pack(fill=tk.X)
         self._vtree = _VirtualTree(parent, on_select=self._on_snip_select)
 
-        # Status
-        self._status_var = tk.StringVar(value="Ready")
+        # Status line (packed last → sits at bottom of nav column)
+        self._status_var = tk.StringVar(value="ready")
         tk.Label(parent, textvariable=self._status_var,
                  font=FONT_SM, fg=C_DIM2, bg=C_PANEL,
-                 anchor="w", padx=6, pady=3).pack(fill=tk.X, side=tk.BOTTOM)
+                 anchor="w", padx=6, pady=3,
+                 ).pack(fill=tk.X, side=tk.BOTTOM)
 
-    # helpers -----------------------------------------------------------------
-    def _status(self, msg: str, loading=False):
-        self._status_var.set((">> " if loading else "") + msg)
+    def _build_seek_bar(self, parent: tk.Frame) -> None:
+        row = tk.Frame(parent, bg=C_BG)
+        row.pack(fill=tk.X, padx=4, pady=3)
 
-    def _set_meta(self, s: str):
+        tk.Label(row, text="SEEK", font=FONT_SM,
+                 fg=C_DIM2, bg=C_BG).pack(side=tk.LEFT)
+
+        self._seek_var = tk.StringVar()
+        entry = tk.Entry(row, textvariable=self._seek_var, width=11,
+                         bg="#06080d", fg=C_TEXT, insertbackground=C_TEXT,
+                         font=FONT, relief=tk.FLAT, bd=3)
+        entry.pack(side=tk.LEFT, padx=(6, 4))
+        entry.bind("<Return>", lambda _: self._seek())
+
+        ttk.Button(row, text="Go", command=self._seek,
+                   style="Hi.TButton").pack(side=tk.LEFT)
+
+    #  widget helpers
+    def _sh(self, parent: tk.Frame, title: str) -> tk.Label:
+        """Render a section header bar and return its counter label."""
+        bar = tk.Frame(parent, bg=C_PANEL, bd=0)
+        bar.pack(fill=tk.X)
+        tk.Label(bar, text=title, font=FONT_B,
+                 fg=C_CYAN, bg=C_PANEL, padx=8, pady=4).pack(side=tk.LEFT)
+        counter = tk.Label(bar, text="", font=FONT_SM, fg=C_DIM2, bg=C_PANEL)
+        counter.pack(side=tk.LEFT)
+        return counter
+
+    def _mk_tree(self, parent: tk.Frame, cols: tuple, hdrs: tuple,
+                 wids: tuple, on_sel, height: int = 5) -> ttk.Treeview:
+        """Build a scrollable Treeview inside its own grid frame."""
+        frame = tk.Frame(parent, bg=C_BG)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(frame, columns=cols, show="headings",
+                            selectmode="browse", height=height)
+        for col, hdr, width in zip(cols, hdrs, wids):
+            tree.heading(col, text=hdr)
+            tree.column(col, width=width, anchor="w" if col == "label" else "e")
+
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0,  column=1, sticky="ns")
+
+        tree.bind("<<TreeviewSelect>>", on_sel)
+        return tree
+
+    # misc helpers
+    def _status(self, msg: str, loading: bool = False) -> None:
+        prefix = ">> " if loading else ""
+        self._status_var.set(prefix + msg)
+
+    def _set_meta(self, text: str) -> None:
         self._meta.configure(state=tk.NORMAL)
         self._meta.delete("1.0", tk.END)
-        self._meta.insert(tk.END, s)
+        self._meta.insert(tk.END, text)
         self._meta.configure(state=tk.DISABLED)
 
-    def _pick_dir(self):
-        p = filedialog.askdirectory(title="Select CAPPY data directory")
-        if p:
-            self.data_dir = Path(p); self.captures = self.data_dir / "captures"
-            self._dir_var.set(p); self._refresh_sessions()
+    def _clr(self, tree: ttk.Treeview) -> None:
+        tree.delete(*tree.get_children())
 
-    def _clr(self, t: ttk.Treeview):
-        for iid in t.get_children(): t.delete(iid)
+    def _pick_dir(self) -> None:
+        chosen = filedialog.askdirectory(title="Select CAPPY data directory")
+        if chosen:
+            self.data_dir = Path(chosen)
+            self.captures = self.data_dir / "captures"
+            self._dir_var.set(chosen)
+            self._refresh_sessions()
 
     def _iter_db(self):
-        if not self.captures.exists(): return
-        for ydir in sorted(self.captures.iterdir()):
-            if not ydir.is_dir(): continue
-            for mdir in sorted(ydir.iterdir()):
-                if not mdir.is_dir(): continue
-                for ddir in sorted(mdir.iterdir()):
-                    if not ddir.is_dir(): continue
-                    try: datetime.strptime(ddir.name, "%Y-%m-%d")
-                    except ValueError: continue
-                    idx = ddir / "index"
-                    if not idx.exists(): continue
-                    for db in sorted(idx.glob("snips_*.sqlite")):
-                        yield str(db), ddir
+        """Yield (db_path_str, day_dir) for every snips_*.sqlite found under captures/."""
+        if not self.captures.exists():
+            return
+        for day_dir in sorted(self.captures.glob("*/*/*")):
+            if not day_dir.is_dir():
+                continue
+            try:
+                datetime.strptime(day_dir.name, "%Y-%m-%d")
+            except ValueError:
+                continue
+            idx_dir = day_dir / "index"
+            if not idx_dir.exists():
+                continue
+            for db in sorted(idx_dir.glob("snips_*.sqlite")):
+                yield str(db), day_dir
 
-    # Level 0: Sessions -------------------------------------------------------
-    def _refresh_sessions(self):
-        self._cache.clear(); self._db_map = {}
+    # level 0: sessions 
+    def _refresh_sessions(self) -> None:
+        self._cache.clear()
+        self._db_map = {}
         db_paths = [p for p, _ in self._iter_db()]
         if not db_paths:
-            self._status("No archive databases found."); return
-        self._status("Loading sessions...", loading=True)
-        tok = self._tok()
-        self._worker.submit(0, "list_sessions", db_paths, tok,
-            lambda r: self.after(0, lambda: self._on_sessions(r, tok)))
+            self._status("no archive databases found"); return
 
-    def _on_sessions(self, r: dict, tok: int):
-        if r.get("token") != tok: return
-        rows = r.get("rows", []); self._clr(self._t_sess)
-        if not rows: self._status("No sessions found."); return
-        total = 0
+        self._status("loading sessions…", loading=True)
+        tok = self._tok()
+        self._worker.submit(
+            0, "list_sessions", db_paths, tok,
+            lambda r: self.after(0, lambda: self._on_sessions(r, tok)),
+        )
+
+    def _on_sessions(self, r: dict, tok: int) -> None:
+        if r.get("token") != tok:
+            return
+        rows = r.get("rows", [])
+        self._clr(self._t_sess)
+        if not rows:
+            self._status("no sessions found"); return
+
+        total_snips = 0
         for row in rows:
-            sid = str(row["session_id"])
-            t0  = datetime.fromtimestamp(int(row["t0"] or 0) / 1e9, tz=self._tz)
-            n   = int(row["n"]); total += n
+            sid    = str(row["session_id"])
+            t0     = datetime.fromtimestamp(int(row["t0"] or 0) / 1e9, tz=self._tz)
+            n      = int(row["n"])
+            total_snips += n
             self._db_map[sid] = (row["db_path"], None)
             self._t_sess.insert("", tk.END, iid=f"sess_{sid}",
                 values=(t0.strftime("%Y-%m-%d %H:%M:%S"), sid, f"{n:,}"))
-        self._status(f"{len(rows)} sessions  |  {total:,} total snips")
 
-    def _on_session(self, _=None):
+        self._status(f"{len(rows)} sessions  ·  {total_snips:,} snips total")
+
+    def _on_session(self, _=None) -> None:
         sel = self._t_sess.selection()
-        if not sel: return
+        if not sel:
+            return
         vals = self._t_sess.item(sel[0], "values")
-        if not vals or len(vals) < 2: return
+        if not vals or len(vals) < 2:
+            return
         sid = str(vals[1]).strip()
-        if not sid or sid not in self._db_map: return
+        if not sid or sid not in self._db_map:
+            return
+
         self._cur_sid = sid
-        db_path, _ = self._db_map[sid]; self._cur_db = db_path
+        db_path, _   = self._db_map[sid]
+        self._cur_db = db_path
+
+        # resolve day_dir for this db (needed for blob reads)
         for p, ddir in self._iter_db():
             if p == db_path:
-                self._cur_daydir = str(ddir)
-                self._db_map[sid] = (db_path, ddir); break
-        for t in (self._t_day, self._t_hour, self._t_min): self._clr(t)
-        self._vtree.clear(); self._cache.clear()
-        self._status("Loading days...", loading=True)
-        tok = self._tok()
-        self._worker.submit(1, "list_days",
-            {"db_path": db_path, "session_id": sid}, tok,
-            lambda r: self.after(0, lambda: self._on_days(r, tok)))
+                self._cur_daydir        = str(ddir)
+                self._db_map[sid]       = (db_path, ddir)
+                break
 
-    # Level 1: Days -----------------------------------------------------------
-    def _on_days(self, r: dict, tok: int):
-        if r.get("token") != tok: return
-        rows = r.get("rows", []); self._clr(self._t_day)
-        if not rows: self._status("No days found."); return
-        DAY = 86_400_000_000_000
+        for tree in (self._t_day, self._t_hour, self._t_min):
+            self._clr(tree)
+        self._vtree.clear()
+        self._cache.clear()
+
+        self._status("loading days…", loading=True)
+        tok = self._tok()
+        self._worker.submit(
+            1, "list_days",
+            {"db_path": db_path, "session_id": sid}, tok,
+            lambda r: self.after(0, lambda: self._on_days(r, tok)),
+        )
+
+    #  level 1: days 
+
+    def _on_days(self, r: dict, tok: int) -> None:
+        if r.get("token") != tok:
+            return
+        rows = r.get("rows", [])
+        self._clr(self._t_day)
+        if not rows:
+            self._status("no days found"); return
+
         for row in rows:
             bkt = int(row["bucket"])
-            lbl = datetime.fromtimestamp(bkt * DAY / 1e9, tz=self._tz).strftime("%Y-%m-%d")
+            lbl = datetime.fromtimestamp(bkt * _NS_PER_DAY / 1e9,
+                                         tz=self._tz).strftime("%Y-%m-%d")
             self._t_day.insert("", tk.END, iid=f"day_{bkt}",
                 values=(lbl, f"{int(row['n']):,}"))
+
         self._status(f"{len(rows)} days")
-        fc = self._t_day.get_children()
-        if fc: self._t_day.selection_set(fc[0]); self._t_day.event_generate("<<TreeviewSelect>>")
+        self._autoselect(self._t_day)
 
-    def _on_day(self, _=None):
-        sel = self._t_day.selection()
-        if not sel: return
-        try: bkt = int(sel[0].split("_")[1])
-        except Exception: return
-        for t in (self._t_hour, self._t_min): self._clr(t)
+    def _on_day(self, _=None) -> None:
+        bkt = self._selected_bucket(self._t_day)
+        if bkt is None:
+            return
+        for tree in (self._t_hour, self._t_min):
+            self._clr(tree)
         self._vtree.clear()
-        self._status("Loading hours...", loading=True)
-        tok = self._tok()
-        self._worker.submit(1, "list_hours",
-            {"db_path": self._cur_db, "session_id": self._cur_sid, "bucket": bkt}, tok,
-            lambda r: self.after(0, lambda: self._on_hours(r, tok)))
 
-    # Level 2: Hours ----------------------------------------------------------
-    def _on_hours(self, r: dict, tok: int):
-        if r.get("token") != tok: return
-        rows = r.get("rows", []); self._clr(self._t_hour)
-        if not rows: self._status("No hours found."); return
-        HOUR = 3_600_000_000_000
+        self._status("loading hours…", loading=True)
+        tok = self._tok()
+        self._worker.submit(
+            1, "list_hours",
+            {"db_path": self._cur_db, "session_id": self._cur_sid, "bucket": bkt}, tok,
+            lambda r: self.after(0, lambda: self._on_hours(r, tok)),
+        )
+
+    # level 2: hours
+    def _on_hours(self, r: dict, tok: int) -> None:
+        if r.get("token") != tok:
+            return
+        rows = r.get("rows", [])
+        self._clr(self._t_hour)
+        if not rows:
+            self._status("no hours found"); return
+
         for row in rows:
             bkt = int(row["bucket"])
-            lbl = datetime.fromtimestamp(bkt * HOUR / 1e9, tz=self._tz).strftime("%H:00")
+            lbl = datetime.fromtimestamp(bkt * _NS_PER_HOUR / 1e9,
+                                         tz=self._tz).strftime("%H:00")
             self._t_hour.insert("", tk.END, iid=f"hour_{bkt}",
                 values=(lbl, f"{int(row['n']):,}"))
+
         self._status(f"{len(rows)} hours")
-        fc = self._t_hour.get_children()
-        if fc: self._t_hour.selection_set(fc[0]); self._t_hour.event_generate("<<TreeviewSelect>>")
+        self._autoselect(self._t_hour)
 
-    def _on_hour(self, _=None):
-        sel = self._t_hour.selection()
-        if not sel: return
-        try: bkt = int(sel[0].split("_")[1])
-        except Exception: return
-        self._clr(self._t_min); self._vtree.clear()
-        self._status("Loading minutes...", loading=True)
+    def _on_hour(self, _=None) -> None:
+        bkt = self._selected_bucket(self._t_hour)
+        if bkt is None:
+            return
+        self._clr(self._t_min)
+        self._vtree.clear()
+
+        self._status("loading minutes…", loading=True)
         tok = self._tok()
-        self._worker.submit(1, "list_minutes",
+        self._worker.submit(
+            1, "list_minutes",
             {"db_path": self._cur_db, "session_id": self._cur_sid, "bucket": bkt}, tok,
-            lambda r: self.after(0, lambda: self._on_minutes(r, tok)))
+            lambda r: self.after(0, lambda: self._on_minutes(r, tok)),
+        )
 
-    # Level 3: Minutes --------------------------------------------------------
-    def _on_minutes(self, r: dict, tok: int):
-        if r.get("token") != tok: return
-        rows = r.get("rows", []); self._clr(self._t_min)
-        if not rows: self._status("No minutes found."); return
-        MIN = 60_000_000_000
+    # level 3: minutes 
+
+    def _on_minutes(self, r: dict, tok: int) -> None:
+        if r.get("token") != tok:
+            return
+        rows = r.get("rows", [])
+        self._clr(self._t_min)
+        if not rows:
+            self._status("no minutes found"); return
+
         for row in rows:
             bkt = int(row["bucket"])
-            lbl = datetime.fromtimestamp(bkt * MIN / 1e9, tz=self._tz).strftime(":%M")
+            lbl = datetime.fromtimestamp(bkt * _NS_PER_MIN / 1e9,
+                                         tz=self._tz).strftime(":%M")
             self._t_min.insert("", tk.END, iid=f"min_{bkt}",
                 values=(lbl, f"{int(row['n']):,}"))
+
         self._status(f"{len(rows)} minutes")
-        fc = self._t_min.get_children()
-        if fc: self._t_min.selection_set(fc[0]); self._t_min.event_generate("<<TreeviewSelect>>")
+        self._autoselect(self._t_min)
 
-    def _on_minute(self, _=None):
-        sel = self._t_min.selection()
-        if not sel: return
-        try: bkt = int(sel[0].split("_")[1])
-        except Exception: return
+    def _on_minute(self, _=None) -> None:
+        bkt = self._selected_bucket(self._t_min)
+        if bkt is None:
+            return
         self._vtree.clear()
-        self._status("Loading snips...", loading=True)
-        tok = self._tok()
-        self._worker.submit(1, "load_minute",
-            {"db_path": self._cur_db, "session_id": self._cur_sid, "bucket": bkt}, tok,
-            lambda r: self.after(0, lambda: self._on_minute_loaded(r, tok)))
 
-    def _on_minute_loaded(self, r: dict, tok: int):
-        if r.get("token") != tok: return
-        if "error" in r: self._status(f"Error: {r['error']}"); return
+        self._status("loading snips…", loading=True)
+        tok = self._tok()
+        self._worker.submit(
+            1, "load_minute",
+            {"db_path": self._cur_db, "session_id": self._cur_sid, "bucket": bkt}, tok,
+            lambda r: self.after(0, lambda: self._on_minute_loaded(r, tok)),
+        )
+
+    def _on_minute_loaded(self, r: dict, tok: int) -> None:
+        if r.get("token") != tok:
+            return
+        if "error" in r:
+            self._status(f"error: {r['error']}"); return
         rows = r.get("rows", [])
         self._vtree.load(rows)
-        self._status(f"{len(rows):,} snips loaded")
+        self._status(f"{len(rows):,} snips")
 
-    # Level 4: Waveform -------------------------------------------------------
-    def _on_snip_select(self, snip_id: int, row_idx: int):
+    # level 4: waveform
+    def _on_snip_select(self, snip_id: int, row_idx: int) -> None:
         self._cur_snip = snip_id
+
         cached = self._cache.get(snip_id)
         if cached is not None:
             wa, wb = cached
-            row = self._vtree.get_by_id(snip_id)
-            self._display(wa, wb, row); return
-        if not self._cur_db or not self._cur_daydir: return
+            self._display(wa, wb, self._vtree.get_by_id(snip_id))
+            return
+
+        if not (self._cur_db and self._cur_daydir):
+            return
+
         tok = self._tok()
-        self._worker.submit(0, "load_wave",
+        self._worker.submit(
+            0, "load_wave",
             {"db_path": self._cur_db, "snip_id": snip_id,
              "day_dir": self._cur_daydir}, tok,
-            lambda r: self.after(0, lambda: self._on_wave(r, tok, snip_id)))
+            lambda r: self.after(0, lambda: self._on_wave(r, tok, snip_id)),
+        )
 
-    def _on_wave(self, r: dict, tok: int, snip_id: int):
-        if snip_id != self._cur_snip: return
-        if "error" in r: self._set_meta(f"Error: {r['error']}"); return
+    def _on_wave(self, r: dict, tok: int, snip_id: int) -> None:
+        # discard if user already moved to a different snip
+        if snip_id != self._cur_snip:
+            return
+        if "error" in r:
+            self._set_meta(f"error loading waveform:\n{r['error']}"); return
+
         wa = r.get("wa")
-        if wa is None: self._set_meta("No waveform data."); return
+        if wa is None:
+            self._set_meta("no waveform data in this record"); return
+
         wb = r.get("wb")
         self._cache.put(snip_id, wa, wb)
-        row = self._vtree.get_by_id(snip_id)
-        self._display(wa, wb, row, bA=r.get("baseline_A", 0.0), bB=r.get("baseline_B", 0.0))
+        self._display(wa, wb, self._vtree.get_by_id(snip_id),
+                      bA=r.get("baseline_A", 0.0),
+                      bB=r.get("baseline_B", 0.0))
 
-    def _display(self, wa, wb, row, bA=0.0, bB=0.0):
+    def _display(self, wa: np.ndarray, wb, row,
+                 bA: float = 0.0, bB: float = 0.0) -> None:
         sr   = float(row["sample_rate_hz"]) if row is not None else 1.0
         tsns = int(row["timestamp_ns"])     if row is not None else 0
-        if sr <= 0 or not np.isfinite(sr): sr = 1.0
-        if bA == 0.0 and len(wa) >= 64: bA = float(np.mean(wa[:64]))
-        if bB == 0.0 and wb is not None and len(wb) >= 64: bB = float(np.mean(wb[:64]))
+
+        if sr <= 0 or not np.isfinite(sr):
+            sr = 1.0
+
+        # auto-baseline from first 64 samples if not provided
+        if bA == 0.0 and len(wa) >= 64:
+            bA = float(np.mean(wa[:64]))
+        if bB == 0.0 and wb is not None and len(wb) >= 64:
+            bB = float(np.mean(wb[:64]))
+
         self._wave_plot.plot(wa, wb, sr, tsns, bA=bA, bB=bB)
-        if row is not None:
-            ts_dt = datetime.fromtimestamp(tsns / 1e9, tz=self._tz)
-            ts_s  = ts_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{tsns % 1_000_000_000:09d}"
-            snip_id = int(row["id"])
-            self._set_meta(
-                f"◆ Snip #{snip_id}   Timestamp: {ts_s}\n"
-                f"Session   : {self._cur_sid or '?'}\n"
-                f"Buffer    : {int(row['buffer_index'])}   "
-                f"Rec: {int(row['record_in_buffer'])}   "
-                f"Global: {int(row['record_global'])}\n"
-                f"SR        : {sr:.6g} Hz   Points: {len(wa)}\n"
-                f"Area A    : {float(row['area_A_Vs']):.6g} V*s   "
-                f"Peak A: {float(row['peak_A_V']):.6g} V\n"
-                f"Baseline A: {bA:.6g} V   B: {bB:.6g} V"
-            )
 
-    # Seek --------------------------------------------------------------------
-    def _seek(self):
-        txt = self._seek_var.get().strip()
-        if not txt: return
+        if row is None:
+            return
+
+        ts_dt   = datetime.fromtimestamp(tsns / 1e9, tz=self._tz)
+        ts_str  = ts_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{tsns % 1_000_000_000:09d}"
+        snip_id = int(row["id"])
+
+        self._set_meta("\n".join([
+            f"snip       #{snip_id}",
+            f"timestamp   {ts_str}",
+            f"session     {self._cur_sid or '?'}",
+            f"buffer      {int(row['buffer_index'])}   "
+                f"rec {int(row['record_in_buffer'])}   "
+                f"global {int(row['record_global'])}",
+            f"sample_rate {sr:.6g} Hz   pts {len(wa)}",
+            f"area_A      {float(row['area_A_Vs']):.6g} V·s   "
+                f"peak_A {float(row['peak_A_V']):.6g} V",
+            f"baseline    A={bA:.6g} V   B={bB:.6g} V",
+        ]))
+
+    # seek 
+
+    def _seek(self) -> None:
+        raw = self._seek_var.get().strip()
+        if not raw:
+            return
         try:
-            parts = [int(x) for x in txt.replace("-", ":").split(":")]
-            hh, mm, ss = (
-                (0, 0, parts[0]) if len(parts) == 1 else
-                (0, parts[0], parts[1]) if len(parts) == 2 else
-                (parts[0], parts[1], parts[2])
-            )
-            now    = datetime.now(tz=self._tz)
-            tgt    = now.replace(hour=hh % 24, minute=mm % 60,
-                                 second=ss % 60, microsecond=0)
-            tgt_ns = int(tgt.timestamp() * 1e9)
-            if not self._vtree.seek_to_ns(tgt_ns):
-                messagebox.showinfo("Seek", "Select a minute first, then seek within it.")
-        except Exception as ex:
-            messagebox.showerror("Seek", f"Invalid time: {ex}")
+            parts  = [int(x) for x in raw.replace("-", ":").split(":")]
+            hh, mm, ss = {
+                1: (0,        0,        parts[0]),
+                2: (0,        parts[0], parts[1]),
+            }.get(len(parts), (parts[0], parts[1], parts[2]))
 
-    # Pop-out compare --------------------------------------------------------
-    def _pop_out_waveform(self):
-        """Detach current waveform into a separate window for side-by-side comparison."""
+            now    = datetime.now(tz=self._tz)
+            target = now.replace(hour=hh % 24, minute=mm % 60,
+                                 second=ss % 60, microsecond=0)
+            tgt_ns = int(target.timestamp() * 1e9)
+
+            if not self._vtree.seek_to_ns(tgt_ns):
+                messagebox.showinfo("Seek",
+                    "Select a minute window first, then seek within it.")
+        except Exception as ex:
+            messagebox.showerror("Seek", f"bad time string: {ex}")
+
+    # draggy mode
+    def _toggle_draggy(self) -> None:
+        self._draggy_on = self._wave_plot.toggle_draggy()
+        if self._draggy_on:
+            self._draggy_btn_var.set("◈ Draggy  ON")
+            self._draggy_btn.configure(style="Hi.TButton")
+        else:
+            self._draggy_btn_var.set("◇ Draggy")
+            self._draggy_btn.configure(style="TButton")
+
+    def _reset_wave_zoom(self) -> None:
+        wp = self._wave_plot
+        if wp._tv is None:
+            return
+        wp._drag_p1 = None
+        wp._clear_drag_artists()
+        wp._draggy_result_var.set("")
+        x0, x1 = float(wp._tv[0]), float(wp._tv[-1])
+        for ax in (wp.axA, wp.axB, wp.axI):
+            ax.set_xlim(x0, x1)
+        wp.canvas.draw_idle()
+
+    #  pop-out compare
+
+    def _pop_out_waveform(self) -> None:
         if self._wave_plot._last_wa is None:
-            messagebox.showinfo("Pop Out", "Select a snip first to view its waveform.")
+            messagebox.showinfo("Compare",
+                "Select a snip first to populate the waveform view.")
             return
         self._popout_count += 1
-        sid = self._cur_sid or "?"
-        snip = self._cur_snip or "?"
-        title = f"Compare #{self._popout_count}  —  Session {sid}  Snip {snip}"
+        title = (f"compare #{self._popout_count}"
+                 f"  ·  session {self._cur_sid or '?'}"
+                 f"  ·  snip {self._cur_snip or '?'}")
         self._wave_plot.pop_out(title=title)
 
-    def destroy(self):
-        try: self._worker.stop()
-        except Exception: pass
-        super().destroy()
+    # private utils
+  
+    @staticmethod
+    def _autoselect(tree: ttk.Treeview) -> None:
+        """Select and fire the first row of a Treeview if it has children."""
+        children = tree.get_children()
+        if children:
+            tree.selection_set(children[0])
+            tree.event_generate("<<TreeviewSelect>>")
+
+    @staticmethod
+    def _selected_bucket(tree: ttk.Treeview) -> Optional[int]:
+        """Return the integer bucket encoded in the selected row's iid, or None."""
+        sel = tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0].split("_")[1])
+        except (IndexError, ValueError):
+            return None
 
 
 # ---------------------------------------------------------------------------
-# Standalone entry point
+# Entry point
 # ---------------------------------------------------------------------------
+
 def run_archive_db(data_dir: Path) -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
+
     root = tk.Tk()
-    root.title("CAPPY.ARCH")
+    root.title("cappy.arch")
     root.configure(bg=C_BG)
     root.geometry("1440x920")
     root.minsize(900, 600)
+
     app = ArchiveDB(data_dir, master=root)
     app.pack(fill=tk.BOTH, expand=True)
+
     root.protocol("WM_DELETE_WINDOW", lambda: (app.destroy(), root.destroy()))
     root.mainloop()
     return 0
@@ -1363,5 +1919,5 @@ def run_archive_db(data_dir: Path) -> int:
 
 if __name__ == "__main__":
     import sys
-    d = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dataFile_ATS9462")
-    raise SystemExit(run_archive_db(d))
+    data_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dataFile_ATS9462")
+    raise SystemExit(run_archive_db(data_path))
