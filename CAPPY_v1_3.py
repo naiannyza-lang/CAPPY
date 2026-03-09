@@ -1916,6 +1916,42 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
     vpp_A = vpp_default
     vpp_B = vpp_default
 
+    def _input_range_const(rname: str) -> Optional[int]:
+        try:
+            return int(ats_const('INPUT_RANGE_', rname))
+        except Exception:
+            return None
+
+    def _range_candidates(primary: str) -> List[str]:
+        # Start with the requested range. If the hardware rejects it, prefer
+        # same-or-larger ranges first to avoid clipping, then try smaller ones.
+        rr_primary = str(primary or "").strip().upper().replace("INPUT_RANGE_", "")
+        catalog = [
+            "PM_20_MV", "PM_40_MV", "PM_50_MV", "PM_80_MV", "PM_100_MV",
+            "PM_200_MV", "PM_400_MV", "PM_500_MV", "PM_800_MV",
+            "PM_1_V", "PM_2_V", "PM_4_V",
+        ]
+        supported = [r for r in catalog if _input_range_const(r) is not None]
+        if _input_range_const(rr_primary) is not None and rr_primary not in supported:
+            supported.append(rr_primary)
+        if not supported:
+            return [rr_primary] if rr_primary else []
+
+        v0 = max(1e-12, float(_range_name_to_vpp(rr_primary or "PM_1_V", default_vpp=2.0)))
+
+        def _sort_key(rname: str) -> Tuple[int, float]:
+            vr = max(1e-12, float(_range_name_to_vpp(rname, default_vpp=2.0)))
+            below = 1 if vr < v0 else 0
+            ratio_dist = abs((vr / v0) - 1.0)
+            return (below, ratio_dist)
+
+        ordered = sorted(supported, key=_sort_key)
+        out = [rr_primary] if rr_primary else []
+        for rname in ordered:
+            if rname != rr_primary:
+                out.append(rname)
+        return out
+
     ch_cfg = cfg.get("channels", {}) or {}
     for nm, mask in [("A", ats.CHANNEL_A), ("B", ats.CHANNEL_B)]:
         if nm in ch_cfg:
@@ -1925,13 +1961,45 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
                 coupling_name = coupling_name + '_COUPLING'
             coupling = ats_const(coupling_name)
             rng_name = str(cc.get('range', 'PM_1_V'))
-            rng = ats_const('INPUT_RANGE_', rng_name)
-            if nm == 'A':
-                vpp_A = _range_name_to_vpp(rng_name, default_vpp=vpp_default)
-            elif nm == 'B':
-                vpp_B = _range_name_to_vpp(rng_name, default_vpp=vpp_default)
             imp = ats_const("IMPEDANCE_", str(cc.get("impedance", "50_OHM")))
-            board.inputControlEx(mask, coupling, rng, imp)
+            chosen_range = rng_name
+            try_ranges = _range_candidates(rng_name)
+            configured = False
+            last_err: Optional[Exception] = None
+            for rname in try_ranges:
+                rng = _input_range_const(rname)
+                if rng is None:
+                    continue
+                for attempt in range(2):
+                    try:
+                        board.inputControlEx(mask, coupling, rng, imp)
+                        chosen_range = rname
+                        configured = True
+                        break
+                    except Exception as ex:
+                        last_err = ex
+                        if "ApiFailed" in str(ex) and attempt == 0:
+                            time.sleep(0.05)
+                            continue
+                        break
+                if configured:
+                    break
+            if not configured:
+                print(
+                    f"[CAPPY] ERROR: inputControlEx failed for channel {nm} "
+                    f"(coupling={coupling_name}, requested_range={rng_name}, impedance={cc.get('impedance', '50_OHM')})."
+                )
+                raise last_err if last_err is not None else RuntimeError(f"Failed to configure channel {nm}.")
+            if chosen_range != rng_name:
+                print(f"[CAPPY] Warning: Channel {nm} range {rng_name} failed; using fallback {chosen_range}.")
+            if nm == 'A':
+                vpp_A = _range_name_to_vpp(chosen_range, default_vpp=vpp_default)
+            elif nm == 'B':
+                vpp_B = _range_name_to_vpp(chosen_range, default_vpp=vpp_default)
+            try:
+                board.setBWLimit(mask, 0)
+            except Exception as ex:
+                print(f"[WARN] setBWLimit failed for channel {nm}: {ex}")
 
     t = cfg.get("trigger", {}) or {}
     operation = ats_const(str(t.get("operation", "TRIG_ENGINE_OP_J")))
@@ -1972,10 +2040,43 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
     ext_coupling_name = str(t.get("ext_coupling", "DC_COUPLING"))
     if not ext_coupling_name.endswith("_COUPLING"):
         ext_coupling_name = ext_coupling_name + "_COUPLING"
-    board.setExternalTrigger(
-        ats_const(ext_coupling_name),
-        ats_const(str(t.get("ext_range", "ETR_5V")))
-    )
+    ext_range_name = str(t.get("ext_range", "ETR_2V5"))
+    ext_candidates = [ext_range_name]
+    for fallback in ["ETR_2V5", "ETR_1V", "ETR_5V", "ETR_TTL"]:
+        if fallback != ext_range_name:
+            ext_candidates.append(fallback)
+    ext_configured = False
+    ext_last_err: Optional[Exception] = None
+    chosen_ext_range = ext_range_name
+    for candidate in ext_candidates:
+        try:
+            ext_range_const = ats_const(candidate)
+        except AttributeError as ex:
+            ext_last_err = ex
+            continue
+        for attempt in range(2):
+            try:
+                board.setExternalTrigger(
+                    ats_const(ext_coupling_name),
+                    ext_range_const
+                )
+                chosen_ext_range = candidate
+                ext_configured = True
+                break
+            except Exception as ex:
+                ext_last_err = ex
+                if "ApiFailed" in str(ex) and attempt == 0:
+                    time.sleep(0.05)
+                    continue
+                break
+        if ext_configured:
+            break
+    if not ext_configured:
+        raise ext_last_err if ext_last_err is not None else RuntimeError(
+            f"Failed to configure external trigger range {ext_range_name}."
+        )
+    if chosen_ext_range != ext_range_name:
+        print(f"[CAPPY] Warning: External trigger range {ext_range_name} failed; using fallback {chosen_ext_range}.")
 
     # Trigger delay: prefer trigger_delay_us if set, otherwise use delay_samples
     delay_us = float(t.get("trigger_delay_us", 0.0) or 0.0)
@@ -2001,6 +2102,11 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
         timeout_ms = int(rt.get("autotrigger_timeout_ms", 10))
         print(f"[CAPPY] noise_test enabled -> using trigger.timeout_ms={timeout_ms} for auto-trigger noise captures")
     board.setTriggerTimeOut(timeout_ms)
+
+    try:
+        board.configureAuxIO(ats.AUX_OUT_TRIGGER, 0)
+    except Exception as ex:
+        print(f"[WARN] configureAuxIO failed: {ex}")
 
     return sr_hz, float(vpp_A), float(vpp_B)
 
@@ -4975,7 +5081,19 @@ class LiveControlPanel(ttk.Frame):
             run_cfg  = self.apply_to_cfg(dict(base_cfg))
             # Force a finite, quick acquisition
             acq = run_cfg.setdefault("acquisition", {})
+            trig = run_cfg.setdefault("trigger", {})
+            runtime = run_cfg.setdefault("runtime", {})
             acq["buffers_per_acquisition"] = _QC_BUFFERS
+            # Scout captures should not hang on a missing external trigger or a
+            # stale threshold. Use a short auto-trigger fallback and do not
+            # require external start-capture for this disposable run.
+            trig["timeout_ms"] = max(
+                _to_int(trig.get("timeout_ms", 0), 0),
+                _to_int(runtime.get("autotrigger_timeout_ms", 10), 10),
+                10,
+            )
+            trig["allow_autotrigger_with_external"] = True
+            trig["external_startcapture"] = False
             run_cfg, _, errs = validate_and_normalize_capture_cfg(run_cfg)
             if errs:
                 self._qc_status_var.set(f"⚠ Config error: {errs[0]}")
@@ -5046,20 +5164,36 @@ class LiveControlPanel(ttk.Frame):
 
         # Find the CAPPY_QC_RESULT line
         result = None
+        fallback_error = None
         for ln in self._qc_lines:
             if ln.startswith("CAPPY_QC_RESULT "):
                 try:
                     result = json.loads(ln[len("CAPPY_QC_RESULT "):])
                 except Exception:
                     pass
+                continue
+            if not ln.startswith("{"):
+                continue
+            try:
+                payload = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and "error" in payload:
+                fallback_error = payload
 
         if result is None:
-            self._qc_status_var.set("⚠ No analysis result received")
+            result = fallback_error
+
+        if result is None:
+            self._qc_status_var.set(
+                f"⚠ Quick Config exited without a result{'' if rc == 0 else f' (code {rc})'}"
+            )
             self._qc_detail_var.set("\n".join(self._qc_lines[-5:]))
             return
 
         if "error" in result:
             self._qc_status_var.set(f"⚠ {result['error']}")
+            self._qc_detail_var.set("\n".join(self._qc_lines[-5:]))
             return
 
         self._qc_apply(result)
