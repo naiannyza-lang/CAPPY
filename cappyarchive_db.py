@@ -18,7 +18,7 @@ Memory budget:
   - Snip index:                         one minute at a time, numpy packed dtype
   - Waveforms:                          LRU cache, 256 entries max
 
-CPU budget during normal browsing: near zero.
+CPU budget is low so we need near zero baseline.
   - All SQLite on a background thread (priority queue, stale results discarded)
   - GUI thread only does Tk widget inserts (PAGE_SIZE rows max)
   - np.argsort for column sort (sub-ms for thousands of rows)
@@ -27,7 +27,7 @@ CPU budget during normal browsing: near zero.
 Acquisition stays fast because nothing in this module runs during capture;
 it is loaded only when the archive window is open.
 
-Optional fast-decode: if cappy_native.so is present alongside this module,
+Optional fast-decode: if cappy_native.so is present alongside this module (eventually),
 cappy_batch_decode is used to decompress a minute's waveforms in one C call
 (fallback to Python zlib if not available).
 """
