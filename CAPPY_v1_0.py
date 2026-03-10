@@ -2272,8 +2272,6 @@ def run_capture(cfg_path: Path) -> int:
     pre = int(acq.get("pre_trigger_samples", 0))
     post = int(acq.get("post_trigger_samples", 256))
     spr = pre + post
-    rt0 = cfg.get("runtime", {}) or {}
-    use_npt_mode = bool(rt0.get("noise_test", False))
     rpb = int(acq.get("records_per_buffer", 128))
     bufN = int(acq.get("buffers_allocated", 16))
     bpa = int(acq.get("buffers_per_acquisition", 0))
@@ -2330,8 +2328,9 @@ def run_capture(cfg_path: Path) -> int:
     bytesPerBuffer = bytesPerSample * spr * rpb * ch_count
 
     buffers = [ats.DMABuffer(board.handle, sample_type, bytesPerBuffer) for _ in range(bufN)]
-    record_pre = 0 if use_npt_mode else pre
-    record_post = spr if use_npt_mode else post
+    rt = cfg.get("runtime", {}) or {}
+    record_pre = 0 if bool(rt.get("noise_test", False)) else pre
+    record_post = spr if bool(rt.get("noise_test", False)) else post
     board.setRecordSize(record_pre, record_post)
 
     if bpa <= 0:
@@ -2383,7 +2382,7 @@ def run_capture(cfg_path: Path) -> int:
         trigger_slope=str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE")),
         trigger_level_code=int(trig.get("levelJ", 128)),
         trigger_timeout_ms=int(trig.get("timeout_ms", 0)),
-        runtime_noise_test=_to_bool((cfg.get("runtime") or {}).get("noise_test", False), False),
+        runtime_noise_test=_to_bool(rt.get("noise_test", False), False),
         pre_trigger_samples=int(record_pre),
         live_ring_path=str(ring_path),
         live=dict(
@@ -2400,10 +2399,10 @@ def run_capture(cfg_path: Path) -> int:
     )
     notifier.maybe_emit()
 
-    # ATS-9462: Use NPT mode for no-signal/noise testing (pretrigger offset must be 0)
-    async_pretrig = -record_pre  # 0 when use_npt_mode (record_pre forced to 0 above)
+    use_npt_mode = bool(rt.get("noise_test", False))
+    async_pretrig = -record_pre
     if use_npt_mode:
-        print("[CAPPY] noise_test enabled -> using NPT mode (No Pre-Trigger) for ATS-9462")
+        print("[CAPPY] noise_test enabled -> using NPT mode (No Pre-Trigger)")
         adma_flags = getattr(ats, "ADMA_NPT", None)
         if adma_flags is None:
             adma_flags = getattr(ats, "ADMA_NPT_MODE", ats.ADMA_TRADITIONAL_MODE)
