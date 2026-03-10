@@ -198,7 +198,6 @@ EXT_TRIGGER_RANGE_OPTIONS = ["ETR_5V", "ETR_1V"]
 TRIGGER_LEVEL_PRESETS_PCT = [-50.0, -25.0, 0.0, 25.0, 50.0]
 WAVEFORM_EVERY_N_MAX = 3000
 
-# ── Dummy / Admin mode ────────────────────────────────────────────────────
 ADMIN_PASSWORD = "FermiAdmin1234"
 RUNTIME_PROFILE_PRESETS = {
     "Mu2e Spill": {
@@ -2763,13 +2762,11 @@ def run_capture(cfg_path: Path) -> int:
 #   • graceful cleanup in all paths
 # ---------------------------------------------------------------------------
 
-_QC_BUFFERS = 48          # large scout sample for stable zero-cross statistics
+_QC_BUFFERS = 48          # larger scout for reliable zero-crossing stats
 _QC_NOISE_SIGMA = 5.0     # noise floor = median ± N * MAD
 _QC_HEADROOM = 1.20       # 20 % headroom on range selection
-_QC_TAIL_PAD_FRAC = 0.25  # pad record length 25 % beyond the mean peak location
-_QC_ZERO_GUARD_SIGMA = 3.0
-_QC_ZERO_ALIGN_PRE_FRAC = 0.20
-_QC_MIN_ANALYSIS_RECORDS = 24
+_QC_TAIL_PAD_FRAC = 0.25  # pad record length 25 % beyond mean peak
+_QC_TRIG_FRAC = 0.50      # trigger at 50 % of mean peak on leading edge
 
 # Input ranges ordered by Vpp (ascending) for auto-range selection
 _INPUT_RANGE_VPP_ORDERED: List[Tuple[str, float]] = [
@@ -2780,57 +2777,6 @@ _INPUT_RANGE_VPP_ORDERED: List[Tuple[str, float]] = [
 ]
 
 
-def _qc_round_spr(n: int, lo: int = 64, hi: Optional[int] = None) -> int:
-    out = max(int(lo), ((int(n) + 15) // 16) * 16)
-    if hi is not None:
-        out = min(out, int(hi))
-    return out
-
-
-def _qc_find_zero_crossings(volts: np.ndarray, baseline_v: float, sigma_v: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (indices, slope_sign) for strong zero crossings in each record.
-
-    A crossing is accepted only if the record spans both sides of 0 V and the local
-    excursion around the crossing exceeds a sigma-based guard band so noise does not
-    dominate the alignment.
-    """
-    n_recs, spr = volts.shape
-    idxs = np.full((n_recs,), -1, dtype=np.int32)
-    slopes = np.zeros((n_recs,), dtype=np.int8)
-    if spr < 2:
-        return idxs, slopes
-
-    centered = volts - float(baseline_v)
-    guard = max(float(_QC_ZERO_GUARD_SIGMA) * float(sigma_v), 1e-6)
-    for i in range(n_recs):
-        rec = centered[i]
-        if float(np.min(rec)) >= -guard or float(np.max(rec)) <= guard:
-            continue
-        s0 = rec[:-1]
-        s1 = rec[1:]
-        cand = np.flatnonzero(((s0 <= 0.0) & (s1 > 0.0)) | ((s0 >= 0.0) & (s1 < 0.0)))
-        if cand.size == 0:
-            continue
-        best_j = -1
-        best_score = -1.0
-        best_slope = 0
-        for j in cand:
-            a = float(rec[j])
-            b = float(rec[j + 1])
-            score = abs(a) + abs(b)
-            if score < 2.0 * guard:
-                continue
-            slope = 1 if (b - a) >= 0.0 else -1
-            if score > best_score:
-                best_score = score
-                best_j = int(j)
-                best_slope = int(slope)
-        if best_j >= 0:
-            idxs[i] = best_j
-            slopes[i] = best_slope
-    return idxs, slopes
-
-
 def _qc_analyse_buffers(
     bufs: List[np.ndarray],
     spr: int,
@@ -2839,12 +2785,7 @@ def _qc_analyse_buffers(
     vpp: float,
     ch_count: int,
 ) -> dict:
-    """Analyse raw uint16 ADC buffers and return optimal settings as a dict.
-
-    Quick Config now uses a larger scout capture and aligns records on the first
-    robust 0 V crossing. The trigger is then set to 0 %FS and the record length is
-    chosen from the mean peak position after that crossing.
-    """
+    """Zero-crossing aligned analysis — see v1.3 for full docstring."""
     records: List[np.ndarray] = []
     for raw in bufs:
         try:
@@ -2856,131 +2797,135 @@ def _qc_analyse_buffers(
             records.append(recs)
         except Exception:
             continue
-
     if not records:
         return {"error": "no valid buffers captured"}
 
     all_recs = np.vstack(records)
-    n_recs = int(all_recs.shape[0])
-    volts = (all_recs.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
+    n_recs   = all_recs.shape[0]
+    volts = (all_recs.astype(np.float32) - 32768.0) * (vpp / 65536.0)
 
-    pre_win = min(max(32, spr // 8), spr)
-    baselines = volts[:, :pre_win]
-    baseline_per_rec = np.median(baselines, axis=1).astype(np.float32)
-    baseline_v = float(np.median(baseline_per_rec))
-    centered = volts - baseline_per_rec[:, None]
+    pre_win    = min(64, spr)
+    baselines  = volts[:, :pre_win]
+    median_bl  = float(np.median(baselines))
+    mad        = float(np.median(np.abs(baselines - median_bl)))
+    sigma_est  = 1.4826 * mad if mad > 0 else float(np.std(baselines))
 
-    mad = float(np.median(np.abs(centered[:, :pre_win])))
-    sigma_est = 1.4826 * mad if mad > 0 else float(np.std(centered[:, :pre_win]))
-    sigma_est = max(float(sigma_est), 1e-9)
+    rec_maxes  = np.max(volts, axis=1)
+    rec_mins   = np.min(volts, axis=1)
+    peak_pos   = float(np.percentile(rec_maxes, 95))
+    peak_neg   = float(np.percentile(rec_mins, 5))
+    peak_abs   = max(abs(peak_pos - median_bl), abs(peak_neg - median_bl))
 
-    rec_maxes = np.max(centered, axis=1)
-    rec_mins = np.min(centered, axis=1)
-    peak_pos = float(np.percentile(rec_maxes, 95))
-    peak_neg = float(np.percentile(rec_mins, 5))
-    peak_abs = max(abs(peak_pos), abs(peak_neg))
+    neg_excursion = abs(peak_neg - median_bl)
+    pos_excursion = abs(peak_pos - median_bl)
+    polarity = "negative" if neg_excursion > pos_excursion else "positive"
 
     needed_vpp = 2.0 * peak_abs * _QC_HEADROOM
     best_range = "PM_4_V"
-    best_vpp = 8.0
+    best_vpp   = 8.0
     for rname, rvpp in _INPUT_RANGE_VPP_ORDERED:
         if rvpp >= needed_vpp:
             best_range = rname
-            best_vpp = rvpp
+            best_vpp   = rvpp
             break
 
-    zc_idx, zc_slope = _qc_find_zero_crossings(volts, baseline_v, sigma_est)
-    valid = np.flatnonzero(zc_idx >= 0)
+    threshold = 3.0 * sigma_est
+    crossing_indices: List[int] = []
+    usable_records: List[np.ndarray] = []
+    for i in range(n_recs):
+        rec = volts[i]
+        deviation = np.abs(rec - median_bl)
+        crossings = np.flatnonzero(deviation > threshold)
+        if crossings.size > 0:
+            cx = int(crossings[0])
+            if 4 < cx < spr - 16:
+                crossing_indices.append(cx)
+                usable_records.append(rec)
+
+    n_usable = len(usable_records)
     notes: List[str] = []
+    method = "zero-cross"
 
-    crossing_mode = "zero-cross"
-    if valid.size >= max(8, min(_QC_MIN_ANALYSIS_RECORDS, n_recs // 4 if n_recs >= 4 else 8)):
-        pos_n = int(np.count_nonzero(zc_slope[valid] > 0))
-        neg_n = int(np.count_nonzero(zc_slope[valid] < 0))
-        dom_slope = 1 if pos_n >= neg_n else -1
-        use = valid[zc_slope[valid] == dom_slope]
-        if use.size < max(8, valid.size // 3):
-            use = valid
-            crossing_mode = "mixed zero-cross"
-        else:
-            crossing_mode = "rising zero-cross" if dom_slope > 0 else "falling zero-cross"
-
-        cross_mean = float(np.mean(zc_idx[use]))
-        cross_std = float(np.std(zc_idx[use])) if use.size > 1 else 0.0
-
-        pre_pts = max(16, int(round(spr * _QC_ZERO_ALIGN_PRE_FRAC)))
-        pre_pts = min(pre_pts, max(16, int(cross_mean) if cross_mean > 0 else 16))
-        max_post = int(max(8, spr - 1 - np.max(zc_idx[use])))
-        post_pts = max(8, max_post)
-
-        if pre_pts + post_pts < 8:
-            mean_peak_idx = float(cross_mean)
-            opt_spr = spr
-            active_samples = int(round(cross_mean))
-        else:
-            aligned = []
-            kept_cross = []
-            for ridx in use:
-                ci = int(zc_idx[ridx])
-                start = ci - pre_pts
-                stop = ci + post_pts
-                if start < 0 or stop > spr:
-                    continue
-                aligned.append(centered[int(ridx), start:stop])
-                kept_cross.append(ci)
-            if aligned:
-                mean_wave = np.mean(np.asarray(aligned, dtype=np.float32), axis=0)
-                zero_i = pre_pts
-                peak_rel = int(np.argmax(np.abs(mean_wave[zero_i:]))) if zero_i < mean_wave.size else 0
-                mean_peak_idx = float(np.mean(kept_cross)) + float(peak_rel)
-                active_samples = int(round(mean_peak_idx))
-                opt_spr = _qc_round_spr(int(np.ceil((mean_peak_idx + 1.0) * (1.0 + _QC_TAIL_PAD_FRAC))), hi=spr)
+    if n_usable >= 20:
+        mean_cx = int(np.median(crossing_indices))
+        aligned: List[np.ndarray] = []
+        for rec, cx in zip(usable_records, crossing_indices):
+            shift = cx - mean_cx
+            if shift >= 0 and shift + spr - mean_cx <= spr:
+                aligned.append(rec)
+        if len(aligned) >= 10:
+            mean_wave = np.mean(np.array(aligned), axis=0)
+            search_region = mean_wave[mean_cx:]
+            if polarity == "negative":
+                peak_idx_rel = int(np.argmin(search_region))
+                mean_peak_v  = float(search_region[peak_idx_rel])
             else:
-                mean_peak_idx = float(cross_mean)
-                active_samples = int(round(cross_mean))
-                opt_spr = _qc_round_spr(int(np.ceil((cross_mean + 1.0) * (1.0 + _QC_TAIL_PAD_FRAC))), hi=spr)
+                peak_idx_rel = int(np.argmax(search_region))
+                mean_peak_v  = float(search_region[peak_idx_rel])
+            peak_idx_abs = mean_cx + peak_idx_rel
+            excursion   = mean_peak_v - median_bl
+            trig_v      = median_bl + excursion * _QC_TRIG_FRAC
+            half_range  = best_vpp / 2.0
+            trig_pct    = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
+            trig_pct    = max(-95.0, min(95.0, trig_pct))
+            trig_slope = "negative" if polarity == "negative" else "positive"
+            cx_to_peak   = peak_idx_rel
+            opt_spr_post = int(cx_to_peak * (1.0 + _QC_TAIL_PAD_FRAC))
+            opt_spr      = mean_cx + opt_spr_post
+            opt_spr      = max(64, ((opt_spr + 15) // 16) * 16)
+            opt_spr      = min(opt_spr, spr)
+            notes.append(f"{n_usable} zero-crossing records; mean crossing={mean_cx}; mean peak @ {peak_idx_abs}")
+            return {
+                "trigger_level_pct": round(trig_pct, 2), "trigger_slope": trig_slope,
+                "samples_per_record": opt_spr, "input_range": best_range,
+                "input_range_vpp": best_vpp, "peak_v": round(peak_abs, 6),
+                "mean_peak_v": round(abs(mean_peak_v), 6),
+                "noise_sigma_v": round(sigma_est, 8), "baseline_v": round(median_bl, 6),
+                "active_samples": peak_idx_abs, "total_records": n_recs,
+                "usable_records": n_usable, "mean_crossing_idx": mean_cx,
+                "polarity": polarity, "method": method,
+                "analysis_note": "; ".join(notes) if notes else "OK",
+            }
 
-        trig_pct = 0.0
-        notes.append(f"{crossing_mode}: {use.size}/{n_recs} records")
-        notes.append(f"mean crossing={cross_mean:.1f}±{cross_std:.1f} samples")
-        notes.append(f"mean peak @ {mean_peak_idx:.1f} samples")
+    method = "envelope-fallback"
+    notes.append(f"only {n_usable}/{n_recs} zero-crossing records; using envelope fallback")
+    if polarity == "negative":
+        trig_v = median_bl + (peak_neg - median_bl) * _QC_TRIG_FRAC
     else:
-        avg_wave = np.mean(np.abs(centered), axis=0)
-        noise_thr = _QC_NOISE_SIGMA * sigma_est * 0.5
-        active_mask = avg_wave > noise_thr
-        active_idxs = np.flatnonzero(active_mask)
-        if active_idxs.size > 0:
-            last_active = int(active_idxs[-1])
-            opt_spr = _qc_round_spr(int(np.ceil((last_active + 1) * (1.0 + _QC_TAIL_PAD_FRAC))), hi=spr)
-            active_samples = last_active
-        else:
-            opt_spr = spr
-            active_samples = 0
-        trig_pct = 0.0
-        notes.append(f"only {valid.size}/{n_recs} usable zero-crossing records; fell back to envelope sizing")
-
-    if peak_abs < sigma_est * 3.0:
-        notes.append("signal amplitude very close to noise; results may be unreliable")
-    if valid.size == 0:
-        notes.append("no robust 0 V crossings found")
-
+        trig_v = median_bl + (peak_pos - median_bl) * _QC_TRIG_FRAC
+    half_range = best_vpp / 2.0
+    trig_pct   = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
+    trig_pct   = max(-95.0, min(95.0, trig_pct))
+    trig_slope = "negative" if polarity == "negative" else "positive"
+    avg_wave = np.mean(np.abs(volts - median_bl), axis=0)
+    noise_thr = _QC_NOISE_SIGMA * sigma_est * 0.5
+    active_mask = avg_wave > noise_thr
+    active_idxs = np.flatnonzero(active_mask)
+    if active_idxs.size > 0:
+        last_active = int(active_idxs[-1])
+        opt_spr = int(last_active * (1.0 + _QC_TAIL_PAD_FRAC))
+        opt_spr = max(64, ((opt_spr + 15) // 16) * 16)
+        opt_spr = min(opt_spr, spr)
+    else:
+        opt_spr = spr
+    if sigma_est < 1e-8:
+        notes.append("noise floor undetectable")
+    if peak_abs < sigma_est * 3:
+        notes.append("signal amplitude very close to noise")
     return {
-        "trigger_level_pct": round(trig_pct, 2),
-        "samples_per_record": int(opt_spr),
-        "input_range": best_range,
-        "input_range_vpp": best_vpp,
-        "peak_v": round(peak_abs, 6),
-        "noise_sigma_v": round(sigma_est, 8),
-        "baseline_v": round(baseline_v, 6),
-        "active_samples": int(active_samples),
-        "total_records": n_recs,
-        "zero_cross_records": int(valid.size),
+        "trigger_level_pct": round(trig_pct, 2), "trigger_slope": trig_slope,
+        "samples_per_record": opt_spr, "input_range": best_range,
+        "input_range_vpp": best_vpp, "peak_v": round(peak_abs, 6),
+        "noise_sigma_v": round(sigma_est, 8), "baseline_v": round(median_bl, 6),
+        "active_samples": int(active_idxs[-1]) if active_idxs.size else 0,
+        "total_records": n_recs, "usable_records": n_usable,
+        "polarity": polarity, "method": method,
         "analysis_note": "; ".join(notes) if notes else "OK",
     }
 
 
 def run_quick_config(cfg_path: Path) -> int:
-    """Run a disposable large-sample scout capture and print optimal settings JSON.
+    """Run a disposable ~10-buffer scout capture and print optimal settings JSON.
 
     Designed to be invoked as a subprocess by the GUI:
         python CAPPY_v1_0_.py quick_config --config <yaml>
@@ -3026,6 +2971,12 @@ def run_quick_config(cfg_path: Path) -> int:
         print(json.dumps({"error": f"configure_board failed: {ex}"}))
         return 2
 
+    try:
+        board.setTriggerTimeOut(10)
+        print("[QC] forced board auto-trigger timeout=10 for scout capture", flush=True)
+    except Exception as ex:
+        print(f"[QC] warning: setTriggerTimeOut failed: {ex}", flush=True)
+
     ch_mask  = channels_from_mask_expr(ch_expr)
     ch_count = infer_channel_count_from_mask(ch_mask)
     _, bps   = board.getChannelInfo()
@@ -3038,8 +2989,6 @@ def run_quick_config(cfg_path: Path) -> int:
 
     recs_per_acq = rpb * _QC_BUFFERS  # finite acquisition
     adma_flags   = ats.ADMA_TRADITIONAL_MODE
-    if bool(trig.get("external_startcapture", False)):
-        adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
 
     board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recs_per_acq, adma_flags)
     for b in buffers:
@@ -3048,7 +2997,7 @@ def run_quick_config(cfg_path: Path) -> int:
     captured: List[np.ndarray] = []
     wt_ms = int(acq.get("wait_timeout_ms", 5000))
     # Use a generous timeout for the scout capture
-    wt_ms = max(wt_ms, 5000)
+    wt_ms = max(wt_ms, 10000)
 
     print(f"[QC] capturing {_QC_BUFFERS} buffers (spr={spr} rpb={rpb} ch={ch_count})…", flush=True)
     board.startCapture()
@@ -5087,13 +5036,13 @@ class LiveControlPanel(ttk.Frame):
         self._flush_lbl.pack(anchor="w", pady=(2, 0))
 
         # ── Quick Config  ─────────────────────────────────────────────
-        # Scout-capture a large sample, align on 0 V crossings, auto-set optimal
+        # Scout-capture ~10 buffers, analyse waveform, auto-set optimal
         # trigger level, samples/record, and input range.
         qc = ttk.LabelFrame(self._controls_root, text="  ⚡ Quick Config", padding=8, style='Trigger.TLabelframe')
         qc.grid(row=5, column=0, sticky="ew", pady=(0, 8))
         qc.columnconfigure(1, weight=1)
 
-        self._qc_status_var = tk.StringVar(value="Large scout capture → zero-cross trigger + mean-peak record sizing")
+        self._qc_status_var = tk.StringVar(value="Scout ~10 buffers → auto-tune trigger, range & record length")
         self._qc_running    = False
         self._qc_proc       = None
 
@@ -5247,7 +5196,7 @@ class LiveControlPanel(ttk.Frame):
             return "break"
 
     # ── Quick Config methods ──────────────────────────────────────────
-    # Launches a subprocess that captures a large disposable scout sample, analyses
+    # Launches a subprocess that captures ~10 disposable buffers, analyses
     # the waveform characteristics, and returns optimal settings as JSON.
     # GUI polls the subprocess and applies results when ready.
 
@@ -5282,9 +5231,9 @@ class LiveControlPanel(ttk.Frame):
             trig = run_cfg.setdefault("trigger", {})
             runtime = run_cfg.setdefault("runtime", {})
             acq["buffers_per_acquisition"] = _QC_BUFFERS
-            # Scout captures should not hang on a missing external trigger or a
-            # stale threshold. Use a short auto-trigger fallback and do not
-            # require external start-capture for this disposable run.
+            runtime["noise_test"] = True
+            runtime["autotrigger_timeout_ms"] = max(
+                _to_int(runtime.get("autotrigger_timeout_ms", 10), 10), 10)
             trig["timeout_ms"] = max(
                 _to_int(trig.get("timeout_ms", 0), 0),
                 _to_int(runtime.get("autotrigger_timeout_ms", 10), 10),
@@ -5397,31 +5346,41 @@ class LiveControlPanel(ttk.Frame):
 
     def _qc_apply(self, result: dict) -> None:
         """Apply Quick Config analysis results to the GUI controls."""
-        trig_pct = float(result.get("trigger_level_pct", 0.0))
-        opt_spr  = int(result.get("samples_per_record", 256))
-        opt_range = str(result.get("input_range", "PM_1_V"))
-        peak_v    = float(result.get("peak_v", 0.0))
-        noise_v   = float(result.get("noise_sigma_v", 0.0))
-        note      = str(result.get("analysis_note", ""))
-        n_bufs    = int(result.get("scout_buffers", 0))
-        n_recs    = int(result.get("total_records", 0))
-        active    = int(result.get("active_samples", 0))
+        trig_pct   = float(result.get("trigger_level_pct", 0.0))
+        opt_spr    = int(result.get("samples_per_record", 256))
+        opt_range  = str(result.get("input_range", "PM_1_V"))
+        peak_v     = float(result.get("peak_v", 0.0))
+        noise_v    = float(result.get("noise_sigma_v", 0.0))
+        note       = str(result.get("analysis_note", ""))
+        n_bufs     = int(result.get("scout_buffers", 0))
+        n_recs     = int(result.get("total_records", 0))
+        n_usable   = int(result.get("usable_records", 0))
+        active     = int(result.get("active_samples", 0))
+        method     = str(result.get("method", "unknown"))
+        polarity   = str(result.get("polarity", ""))
+        trig_slope = str(result.get("trigger_slope", ""))
+        mean_cx    = int(result.get("mean_crossing_idx", 0))
 
-        # Apply to controls
         self.var_trig_level_pct.set(round(trig_pct, 1))
         self.var_samples_per_record.set(opt_spr)
         self.var_range_a.set(opt_range)
-        # Sync dependent controls
+        if trig_slope == "negative":
+            self.var_trig_slope.set("Negative")
+        elif trig_slope == "positive":
+            self.var_trig_slope.set("Positive")
         self._sync_trigger_level_code()
         self._harmonize_controls()
 
-        # Status feedback
         self._qc_status_var.set(
             f"✓ Applied: trigger={trig_pct:+.1f}%  spr={opt_spr}  range={opt_range}"
+            f"  slope={'neg' if trig_slope == 'negative' else 'pos'}"
         )
         self._qc_detail_var.set(
             f"peak={peak_v:.4g} V  noise σ={noise_v:.2g} V  "
-            f"active={active} pts  {n_bufs} bufs / {n_recs} recs  {note}"
+            f"active={active} pts  {n_bufs} bufs / {n_usable} usable / {n_recs} recs\n"
+            f"method={method}  polarity={polarity}"
+            f"{'  mean crossing @ ' + str(mean_cx) if mean_cx else ''}"
+            f"  {note}"
         )
         self._qc_apply_btn.configure(state=tk.NORMAL)
         self._msg_var.set("Quick Config applied. Review settings before capture.")
@@ -6019,7 +5978,6 @@ class LauncherGUI(tk.Tk):
 
         self.var_config = tk.StringVar(value=DEFAULT_YAML_FILENAME)
         self.var_data_dir = tk.StringVar(value=_preferred_data_dir("dataFile_ATS9462"))
-        # Live written-to-disk status (updated from flush events)
         self._live_out_dir = tk.StringVar(value="Output: -")
         self._live_written = tk.StringVar(value="Written: -")
         self._live_last_flush = tk.StringVar(value="Last flush: -")
@@ -6028,6 +5986,9 @@ class LauncherGUI(tk.Tk):
         self._last_disk_size_bytes = 0
         self._admin_unlocked = False
         self._noise_trigger_on = False
+        self._capy_frames = []
+        self._capy_idx = 0
+        self._capy_after_id = None
 
         self._restore_gui_state()
         try:
@@ -6038,7 +5999,6 @@ class LauncherGUI(tk.Tk):
         except Exception:
             pass
 
-        # Auto-create default config so you never need to run `init` in a terminal.
         cfgp = Path(self.var_config.get())
         if not cfgp.exists():
             try:
@@ -6046,23 +6006,22 @@ class LauncherGUI(tk.Tk):
             except Exception as ex:
                 messagebox.showerror('CAPPY', f'Failed to create default config {cfgp}: {ex}')
 
-        # ── Top bar — admin-only (config YAML / data dir / browse) ────
+        self._update_title_from_config()
+
+        # ── Top bar — admin-only ──────────────────────────────────────
         self._top_bar = ttk.Frame(self, padding=8)
-        # NOT packed yet — hidden until admin unlock
 
         ttk.Label(self._top_bar, text="Config YAML:").pack(side=tk.LEFT)
         ttk.Entry(self._top_bar, textvariable=self.var_config, width=52).pack(side=tk.LEFT, padx=(6,8))
         ttk.Button(self._top_bar, text="Browse…", command=self._pick_yaml).pack(side=tk.LEFT)
-
         ttk.Label(self._top_bar, text="Data dir:").pack(side=tk.LEFT, padx=(16,4))
         ttk.Entry(self._top_bar, textvariable=self.var_data_dir, width=24).pack(side=tk.LEFT)
-
         ttk.Button(self._top_bar, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
-        ttk.Button(self._top_bar, text="Browse Archive", command=self._browse).pack(side=tk.LEFT)
 
         # ── Control bar — always visible ──────────────────────────────
         ctrl = ttk.Frame(self, padding=8)
         ctrl.pack(fill=tk.X)
+        self._ctrl_bar = ctrl
 
         self.btn = ttk.Button(ctrl, text="Start Capture", command=self._arm_capture, style='Primary.TButton')
         self.btn.pack(side=tk.LEFT)
@@ -6070,18 +6029,18 @@ class LauncherGUI(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="State: idle", foreground=T_TEXT_DIM, font=('Consolas', 10))
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
-        # ── Noise trigger toggle ──────────────────────────────────────
         self._noise_btn_var = tk.StringVar(value="Noise Trigger: OFF")
         self._noise_btn = ttk.Button(ctrl, textvariable=self._noise_btn_var,
                                      command=self._toggle_noise_trigger)
         self._noise_btn.pack(side=tk.LEFT, padx=(20, 0))
 
-        # ── Admin lock button (far right) ─────────────────────────────
+        ttk.Button(ctrl, text="Browse Archive", command=self._browse).pack(side=tk.LEFT, padx=(12, 0))
+
         self._lock_btn_var = tk.StringVar(value="Unlock Admin")
         ttk.Button(ctrl, textvariable=self._lock_btn_var,
                    command=self._admin_gate).pack(side=tk.RIGHT)
 
-        # ── Main content area ─────────────────────────────────────────
+        # ── Main content ──────────────────────────────────────────────
         self._content = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self._content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         left = ttk.Frame(self._content)
@@ -6108,24 +6067,74 @@ class LauncherGUI(tk.Tk):
         self.live_panel.grid(row=0, column=0, sticky="nsew")
 
         self._load_controls_from_yaml()
-
-        # ── Start in DUMMY mode — hide admin surfaces ─────────────────
+        self._init_capybara()
         self._hide_admin_panels()
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_poll()
 
-    # ── Dummy / Admin mode ──────────────────────────────────────────────
+    def _update_title_from_config(self):
+        try:
+            cfg_path = Path(self.var_config.get()).expanduser()
+            if cfg_path.exists():
+                cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(cfg, dict):
+                    binfo = cfg.get("board", {}) or {}
+                    sid = binfo.get("system_id", "?")
+                    bid = binfo.get("board_id", "?")
+                    self.title(f"CAPPY v1.0 Launcher — Board S{sid}:B{bid}")
+                    return
+        except Exception:
+            pass
+        self.title("CAPPY v1.0 Launcher")
+
+    def _init_capybara(self):
+        try:
+            gif_path = self.script_path.parent / "capybara_blue_tinted_brighter.gif"
+            if not gif_path.exists():
+                return
+            self._capy_frames = []
+            idx = 0
+            while True:
+                try:
+                    frame = tk.PhotoImage(file=str(gif_path), format=f"gif -index {idx}")
+                    frame = frame.subsample(7, 7)
+                    self._capy_frames.append(frame)
+                    idx += 1
+                except tk.TclError:
+                    break
+            if not self._capy_frames:
+                frame = tk.PhotoImage(file=str(gif_path))
+                frame = frame.subsample(7, 7)
+                self._capy_frames = [frame]
+            self._capy_label = tk.Label(self._ctrl_bar, image=self._capy_frames[0],
+                                        bg=T_BG, cursor="hand2")
+            self._capy_label.pack(side=tk.RIGHT, padx=(0, 6))
+            self._capy_label.bind("<Button-1>", lambda _e: self._append("[CAPPY] Capybara says hello!"))
+            self._capy_idx = 0
+            if len(self._capy_frames) > 1:
+                self._animate_capybara()
+        except Exception:
+            pass
+
+    def _animate_capybara(self):
+        if self._is_closing or not self._capy_frames:
+            return
+        try:
+            self._capy_idx = (self._capy_idx + 1) % len(self._capy_frames)
+            self._capy_label.configure(image=self._capy_frames[self._capy_idx])
+            self._capy_after_id = self.after(120, self._animate_capybara)
+        except Exception:
+            pass
+
     def _admin_gate(self):
-        """Toggle between dummy and admin mode.  Requires password to unlock."""
         if self._admin_unlocked:
             self._admin_unlocked = False
             self._hide_admin_panels()
             self._lock_btn_var.set("Unlock Admin")
             self._append("[CAPPY] Admin controls locked.")
             return
-
         dlg = tk.Toplevel(self)
         dlg.title("Admin Unlock")
         dlg.geometry("310x120")
@@ -6137,8 +6146,7 @@ class LauncherGUI(tk.Tk):
                  font=('Consolas', 10)).pack(pady=(16, 6))
         pw = tk.StringVar()
         ent = tk.Entry(dlg, textvariable=pw, show="*", width=22,
-                       bg=T_SURFACE, fg=T_TEXT, insertbackground=T_CYAN,
-                       font=('Consolas', 10))
+                       bg=T_SURFACE, fg=T_TEXT, insertbackground=T_CYAN, font=('Consolas', 10))
         ent.pack()
         ent.focus_set()
         def _try(_e=None):
@@ -6174,11 +6182,10 @@ class LauncherGUI(tk.Tk):
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
                     self.live_panel.var_trig_timeout_ms.set(
-                        max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10)
-                    )
+                        max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10))
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger ON — board will auto-trigger on ambient noise.")
+            self._append("[CAPPY] Noise trigger ON — auto-trigger on ambient noise.")
         else:
             self._noise_btn_var.set("Noise Trigger: OFF")
             if hasattr(self, "live_panel") and self.live_panel is not None:
@@ -6186,7 +6193,34 @@ class LauncherGUI(tk.Tk):
                     self.live_panel.var_trig_timeout_ms.set(0)
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger OFF — reverting to normal trigger mode.")
+            self._append("[CAPPY] Noise trigger OFF — normal trigger mode.")
+
+    def _save_session_settings_json(self, run_cfg: dict, run_cfg_path: Path):
+        try:
+            storage = run_cfg.get("storage", {}) or {}
+            data_dir = Path(str(storage.get("data_dir", self.var_data_dir.get()) or self.var_data_dir.get()))
+            captures_dir = data_dir / "captures"
+            if not captures_dir.exists():
+                return
+            status_path = data_dir / "status" / "cappy_status.json"
+            sid = ""
+            try:
+                if status_path.exists():
+                    st = json.loads(status_path.read_text(encoding="utf-8"))
+                    sid = str(st.get("session_id", "") or "")
+            except Exception:
+                pass
+            if not sid:
+                sid = time.strftime("%Y%m%d_%H%M%S")
+            settings_path = captures_dir / f"session_{sid}_settings.json"
+            payload = dict(run_cfg)
+            payload["_session_id"] = sid
+            payload["_saved_at"] = time.strftime('%Y-%m-%d %H:%M:%S')
+            payload["_config_source"] = str(run_cfg_path)
+            _atomic_write_text(settings_path, json.dumps(payload, indent=2, default=str))
+            self._append(f"[CAPPY] Session settings saved: {settings_path}")
+        except Exception as ex:
+            self._append(f"[CAPPY] Failed to save session settings: {ex}")
 
     def _restore_gui_state(self) -> None:
         try:
@@ -6412,6 +6446,7 @@ class LauncherGUI(tk.Tk):
         if p:
             self.var_config.set(p)
             self._load_controls_from_yaml()
+            self._update_title_from_config()
 
     def _open_yaml(self):
         p = Path(self.var_config.get()).expanduser()
@@ -6529,7 +6564,6 @@ class LauncherGUI(tk.Tk):
             run_cfg = dict(base_cfg)
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 run_cfg = self.live_panel.apply_to_cfg(run_cfg)
-            # ── Noise trigger override ────────────────────────────────
             if getattr(self, "_noise_trigger_on", False):
                 rt = run_cfg.setdefault("runtime", {}) or {}
                 rt["noise_test"] = True
@@ -6537,7 +6571,7 @@ class LauncherGUI(tk.Tk):
                 trig = run_cfg.setdefault("trigger", {}) or {}
                 trig["timeout_ms"] = max(_to_int(trig.get("timeout_ms", 0), 0), 10)
                 run_cfg["trigger"] = trig
-                self._append("[CAPPY] Noise trigger injected into run config (noise_test=true, timeout_ms≥10).")
+                self._append("[CAPPY] Noise trigger injected (noise_test=true, timeout_ms≥10).")
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
@@ -6598,6 +6632,11 @@ class LauncherGUI(tk.Tk):
 
         self.lbl.config(text="State: capturing", foreground=T_GREEN)
 
+        try:
+            self._save_session_settings_json(run_cfg, run_cfg_path)
+        except Exception:
+            pass
+
     def _stop(self, restart: bool = False):
         if self.proc is None:
             self._restart_after_stop = False
@@ -6632,6 +6671,7 @@ class LauncherGUI(tk.Tk):
         self._is_closing = True
         self._cancel_after_callback("_poll_after_id")
         self._cancel_after_callback("_close_after_id")
+        self._cancel_after_callback("_capy_after_id")
         try:
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 self._save_controls_to_yaml()
