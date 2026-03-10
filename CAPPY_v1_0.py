@@ -2763,10 +2763,13 @@ def run_capture(cfg_path: Path) -> int:
 #   • graceful cleanup in all paths
 # ---------------------------------------------------------------------------
 
-_QC_BUFFERS = 10          # quick-dispose buffer count
+_QC_BUFFERS = 48          # large scout sample for stable zero-cross statistics
 _QC_NOISE_SIGMA = 5.0     # noise floor = median ± N * MAD
 _QC_HEADROOM = 1.20       # 20 % headroom on range selection
-_QC_TAIL_PAD_FRAC = 0.15  # pad record length 15 % beyond last active sample
+_QC_TAIL_PAD_FRAC = 0.25  # pad record length 25 % beyond the mean peak location
+_QC_ZERO_GUARD_SIGMA = 3.0
+_QC_ZERO_ALIGN_PRE_FRAC = 0.20
+_QC_MIN_ANALYSIS_RECORDS = 24
 
 # Input ranges ordered by Vpp (ascending) for auto-range selection
 _INPUT_RANGE_VPP_ORDERED: List[Tuple[str, float]] = [
@@ -2775,6 +2778,57 @@ _INPUT_RANGE_VPP_ORDERED: List[Tuple[str, float]] = [
     ("PM_400_MV", 0.80), ("PM_500_MV", 1.00), ("PM_800_MV", 1.60),
     ("PM_1_V",    2.00), ("PM_2_V",    4.00), ("PM_4_V",    8.00),
 ]
+
+
+def _qc_round_spr(n: int, lo: int = 64, hi: Optional[int] = None) -> int:
+    out = max(int(lo), ((int(n) + 15) // 16) * 16)
+    if hi is not None:
+        out = min(out, int(hi))
+    return out
+
+
+def _qc_find_zero_crossings(volts: np.ndarray, baseline_v: float, sigma_v: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (indices, slope_sign) for strong zero crossings in each record.
+
+    A crossing is accepted only if the record spans both sides of 0 V and the local
+    excursion around the crossing exceeds a sigma-based guard band so noise does not
+    dominate the alignment.
+    """
+    n_recs, spr = volts.shape
+    idxs = np.full((n_recs,), -1, dtype=np.int32)
+    slopes = np.zeros((n_recs,), dtype=np.int8)
+    if spr < 2:
+        return idxs, slopes
+
+    centered = volts - float(baseline_v)
+    guard = max(float(_QC_ZERO_GUARD_SIGMA) * float(sigma_v), 1e-6)
+    for i in range(n_recs):
+        rec = centered[i]
+        if float(np.min(rec)) >= -guard or float(np.max(rec)) <= guard:
+            continue
+        s0 = rec[:-1]
+        s1 = rec[1:]
+        cand = np.flatnonzero(((s0 <= 0.0) & (s1 > 0.0)) | ((s0 >= 0.0) & (s1 < 0.0)))
+        if cand.size == 0:
+            continue
+        best_j = -1
+        best_score = -1.0
+        best_slope = 0
+        for j in cand:
+            a = float(rec[j])
+            b = float(rec[j + 1])
+            score = abs(a) + abs(b)
+            if score < 2.0 * guard:
+                continue
+            slope = 1 if (b - a) >= 0.0 else -1
+            if score > best_score:
+                best_score = score
+                best_j = int(j)
+                best_slope = int(slope)
+        if best_j >= 0:
+            idxs[i] = best_j
+            slopes[i] = best_slope
+    return idxs, slopes
 
 
 def _qc_analyse_buffers(
@@ -2787,33 +2841,16 @@ def _qc_analyse_buffers(
 ) -> dict:
     """Analyse raw uint16 ADC buffers and return optimal settings as a dict.
 
-    Parameters
-    ----------
-    bufs : list[np.ndarray]
-        Each element is an (rpb * spr * ch_count,) uint16 array straight from
-        DMA (one per completed buffer).
-    spr, rpb : int
-        Samples-per-record, records-per-buffer used during scout capture.
-    sr_hz : float
-        Sample rate in Hz.
-    vpp : float
-        Current channel A Vpp (used for initial voltage conversion).
-    ch_count : int
-        1 or 2 (number of interleaved channels in the DMA buffer).
-
-    Returns
-    -------
-    dict  with keys:
-        trigger_level_pct, samples_per_record, input_range,
-        peak_v, noise_v, active_samples, analysis_note
+    Quick Config now uses a larger scout capture and aligns records on the first
+    robust 0 V crossing. The trigger is then set to 0 %FS and the record length is
+    chosen from the mean peak position after that crossing.
     """
-    # Deinterleave channel A from every buffer → list of (rpb, spr) matrices
     records: List[np.ndarray] = []
     for raw in bufs:
         try:
             if ch_count == 2:
                 both = raw.reshape(rpb, spr, 2)
-                recs = both[:, :, 0]  # channel A
+                recs = both[:, :, 0]
             else:
                 recs = raw.reshape(rpb, spr)
             records.append(recs)
@@ -2823,87 +2860,127 @@ def _qc_analyse_buffers(
     if not records:
         return {"error": "no valid buffers captured"}
 
-    # Stack into one big (N_total_records, spr) array
-    all_recs = np.vstack(records)                       # uint16
-    n_recs   = all_recs.shape[0]
+    all_recs = np.vstack(records)
+    n_recs = int(all_recs.shape[0])
+    volts = (all_recs.astype(np.float32) - 32768.0) * (float(vpp) / 65536.0)
 
-    # Convert to volts  (same transform as _codes_to_volts_u16)
-    volts = (all_recs.astype(np.float32) - 32768.0) * (vpp / 65536.0)
-
-    # ── Noise floor from first 64 samples (pre-trigger baseline) ──────
-    pre_win = min(64, spr)
+    pre_win = min(max(32, spr // 8), spr)
     baselines = volts[:, :pre_win]
-    median_bl = float(np.median(baselines))
-    mad        = float(np.median(np.abs(baselines - median_bl)))
-    sigma_est  = 1.4826 * mad if mad > 0 else float(np.std(baselines))
+    baseline_per_rec = np.median(baselines, axis=1).astype(np.float32)
+    baseline_v = float(np.median(baseline_per_rec))
+    centered = volts - baseline_per_rec[:, None]
 
-    # ── Peak / range analysis across all records ──────────────────────
-    rec_maxes = np.max(volts, axis=1)
-    rec_mins  = np.min(volts, axis=1)
-    peak_pos  = float(np.percentile(rec_maxes, 95))     # robust P95
-    peak_neg  = float(np.percentile(rec_mins, 5))
-    peak_abs  = max(abs(peak_pos), abs(peak_neg))
+    mad = float(np.median(np.abs(centered[:, :pre_win])))
+    sigma_est = 1.4826 * mad if mad > 0 else float(np.std(centered[:, :pre_win]))
+    sigma_est = max(float(sigma_est), 1e-9)
 
-    # ── Optimal input range ───────────────────────────────────────────
+    rec_maxes = np.max(centered, axis=1)
+    rec_mins = np.min(centered, axis=1)
+    peak_pos = float(np.percentile(rec_maxes, 95))
+    peak_neg = float(np.percentile(rec_mins, 5))
+    peak_abs = max(abs(peak_pos), abs(peak_neg))
+
     needed_vpp = 2.0 * peak_abs * _QC_HEADROOM
     best_range = "PM_4_V"
-    best_vpp   = 8.0
+    best_vpp = 8.0
     for rname, rvpp in _INPUT_RANGE_VPP_ORDERED:
         if rvpp >= needed_vpp:
             best_range = rname
-            best_vpp   = rvpp
+            best_vpp = rvpp
             break
 
-    # ── Optimal trigger level ─────────────────────────────────────────
-    # Place trigger at ~3σ above the noise floor (positive slope assumed)
-    trig_v = median_bl + _QC_NOISE_SIGMA * sigma_est
-    # Clamp so trigger sits between noise and 80 % of peak
-    trig_v = max(trig_v, median_bl + 3.0 * sigma_est)
-    trig_v = min(trig_v, peak_pos * 0.8) if peak_pos > trig_v else trig_v
-    # Convert to %FS relative to the *recommended* range
-    half_range = best_vpp / 2.0
-    trig_pct   = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
-    trig_pct   = max(-95.0, min(95.0, trig_pct))
-
-    # ── Optimal samples_per_record (active waveform length) ───────────
-    # Find the last sample index above noise in the average waveform
-    avg_wave = np.mean(np.abs(volts - median_bl), axis=0)
-    noise_thr = _QC_NOISE_SIGMA * sigma_est * 0.5
-    active_mask = avg_wave > noise_thr
-    active_idxs = np.flatnonzero(active_mask)
-    if active_idxs.size > 0:
-        last_active = int(active_idxs[-1])
-        opt_spr = int(last_active * (1.0 + _QC_TAIL_PAD_FRAC))
-        # Round up to multiple of 16 (ATS alignment)
-        opt_spr = max(64, ((opt_spr + 15) // 16) * 16)
-        opt_spr = min(opt_spr, spr)  # don't exceed what we captured
-    else:
-        opt_spr = spr  # no signal detected — keep current
-
+    zc_idx, zc_slope = _qc_find_zero_crossings(volts, baseline_v, sigma_est)
+    valid = np.flatnonzero(zc_idx >= 0)
     notes: List[str] = []
-    if sigma_est < 1e-8:
-        notes.append("noise floor undetectable; signal may be DC or absent")
-    if peak_abs < sigma_est * 3:
+
+    crossing_mode = "zero-cross"
+    if valid.size >= max(8, min(_QC_MIN_ANALYSIS_RECORDS, n_recs // 4 if n_recs >= 4 else 8)):
+        pos_n = int(np.count_nonzero(zc_slope[valid] > 0))
+        neg_n = int(np.count_nonzero(zc_slope[valid] < 0))
+        dom_slope = 1 if pos_n >= neg_n else -1
+        use = valid[zc_slope[valid] == dom_slope]
+        if use.size < max(8, valid.size // 3):
+            use = valid
+            crossing_mode = "mixed zero-cross"
+        else:
+            crossing_mode = "rising zero-cross" if dom_slope > 0 else "falling zero-cross"
+
+        cross_mean = float(np.mean(zc_idx[use]))
+        cross_std = float(np.std(zc_idx[use])) if use.size > 1 else 0.0
+
+        pre_pts = max(16, int(round(spr * _QC_ZERO_ALIGN_PRE_FRAC)))
+        pre_pts = min(pre_pts, max(16, int(cross_mean) if cross_mean > 0 else 16))
+        max_post = int(max(8, spr - 1 - np.max(zc_idx[use])))
+        post_pts = max(8, max_post)
+
+        if pre_pts + post_pts < 8:
+            mean_peak_idx = float(cross_mean)
+            opt_spr = spr
+            active_samples = int(round(cross_mean))
+        else:
+            aligned = []
+            kept_cross = []
+            for ridx in use:
+                ci = int(zc_idx[ridx])
+                start = ci - pre_pts
+                stop = ci + post_pts
+                if start < 0 or stop > spr:
+                    continue
+                aligned.append(centered[int(ridx), start:stop])
+                kept_cross.append(ci)
+            if aligned:
+                mean_wave = np.mean(np.asarray(aligned, dtype=np.float32), axis=0)
+                zero_i = pre_pts
+                peak_rel = int(np.argmax(np.abs(mean_wave[zero_i:]))) if zero_i < mean_wave.size else 0
+                mean_peak_idx = float(np.mean(kept_cross)) + float(peak_rel)
+                active_samples = int(round(mean_peak_idx))
+                opt_spr = _qc_round_spr(int(np.ceil((mean_peak_idx + 1.0) * (1.0 + _QC_TAIL_PAD_FRAC))), hi=spr)
+            else:
+                mean_peak_idx = float(cross_mean)
+                active_samples = int(round(cross_mean))
+                opt_spr = _qc_round_spr(int(np.ceil((cross_mean + 1.0) * (1.0 + _QC_TAIL_PAD_FRAC))), hi=spr)
+
+        trig_pct = 0.0
+        notes.append(f"{crossing_mode}: {use.size}/{n_recs} records")
+        notes.append(f"mean crossing={cross_mean:.1f}±{cross_std:.1f} samples")
+        notes.append(f"mean peak @ {mean_peak_idx:.1f} samples")
+    else:
+        avg_wave = np.mean(np.abs(centered), axis=0)
+        noise_thr = _QC_NOISE_SIGMA * sigma_est * 0.5
+        active_mask = avg_wave > noise_thr
+        active_idxs = np.flatnonzero(active_mask)
+        if active_idxs.size > 0:
+            last_active = int(active_idxs[-1])
+            opt_spr = _qc_round_spr(int(np.ceil((last_active + 1) * (1.0 + _QC_TAIL_PAD_FRAC))), hi=spr)
+            active_samples = last_active
+        else:
+            opt_spr = spr
+            active_samples = 0
+        trig_pct = 0.0
+        notes.append(f"only {valid.size}/{n_recs} usable zero-crossing records; fell back to envelope sizing")
+
+    if peak_abs < sigma_est * 3.0:
         notes.append("signal amplitude very close to noise; results may be unreliable")
-    if n_recs < 5:
-        notes.append(f"only {n_recs} records analysed; increase buffers for better stats")
+    if valid.size == 0:
+        notes.append("no robust 0 V crossings found")
 
     return {
-        "trigger_level_pct":    round(trig_pct, 2),
-        "samples_per_record":   opt_spr,
-        "input_range":          best_range,
-        "input_range_vpp":      best_vpp,
-        "peak_v":               round(peak_abs, 6),
-        "noise_sigma_v":        round(sigma_est, 8),
-        "baseline_v":           round(median_bl, 6),
-        "active_samples":       int(active_idxs[-1]) if active_idxs.size else 0,
-        "total_records":        n_recs,
-        "analysis_note":        "; ".join(notes) if notes else "OK",
+        "trigger_level_pct": round(trig_pct, 2),
+        "samples_per_record": int(opt_spr),
+        "input_range": best_range,
+        "input_range_vpp": best_vpp,
+        "peak_v": round(peak_abs, 6),
+        "noise_sigma_v": round(sigma_est, 8),
+        "baseline_v": round(baseline_v, 6),
+        "active_samples": int(active_samples),
+        "total_records": n_recs,
+        "zero_cross_records": int(valid.size),
+        "analysis_note": "; ".join(notes) if notes else "OK",
     }
 
 
 def run_quick_config(cfg_path: Path) -> int:
-    """Run a disposable ~10-buffer scout capture and print optimal settings JSON.
+    """Run a disposable large-sample scout capture and print optimal settings JSON.
 
     Designed to be invoked as a subprocess by the GUI:
         python CAPPY_v1_0_.py quick_config --config <yaml>
@@ -5010,13 +5087,13 @@ class LiveControlPanel(ttk.Frame):
         self._flush_lbl.pack(anchor="w", pady=(2, 0))
 
         # ── Quick Config  ─────────────────────────────────────────────
-        # Scout-capture ~10 buffers, analyse waveform, auto-set optimal
+        # Scout-capture a large sample, align on 0 V crossings, auto-set optimal
         # trigger level, samples/record, and input range.
         qc = ttk.LabelFrame(self._controls_root, text="  ⚡ Quick Config", padding=8, style='Trigger.TLabelframe')
         qc.grid(row=5, column=0, sticky="ew", pady=(0, 8))
         qc.columnconfigure(1, weight=1)
 
-        self._qc_status_var = tk.StringVar(value="Scout ~10 buffers → auto-tune trigger, range & record length")
+        self._qc_status_var = tk.StringVar(value="Large scout capture → zero-cross trigger + mean-peak record sizing")
         self._qc_running    = False
         self._qc_proc       = None
 
@@ -5170,7 +5247,7 @@ class LiveControlPanel(ttk.Frame):
             return "break"
 
     # ── Quick Config methods ──────────────────────────────────────────
-    # Launches a subprocess that captures ~10 disposable buffers, analyses
+    # Launches a subprocess that captures a large disposable scout sample, analyses
     # the waveform characteristics, and returns optimal settings as JSON.
     # GUI polls the subprocess and applies results when ready.
 
