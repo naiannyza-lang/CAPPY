@@ -79,7 +79,7 @@ def _lazy_mpl():
 
 
 # ── Theme palette ─────────────────────────────────────────────────────────
-# Deep-space dark theme with color-coded functional zones.
+# color-coded functional zones.
 #   Channel A : Cyan        Channel B : Gold/Amber
 #   Trigger   : Magenta     Integration : Teal
 #   Surfaces  : Navy/slate  Accents     : bright on dark
@@ -298,7 +298,7 @@ clock:
 channels:
   A:
     coupling: DC
-    range: PM_1_V          # maps to INPUT_RANGE_PM_1_V (old-script style)
+    range: PM_1_V          # maps to INPUT_RANGE_PM_1_V
     impedance: 50_OHM
   B:
     coupling: DC
@@ -2262,6 +2262,7 @@ def run_capture(cfg_path: Path) -> int:
     )
     sid = archive.start(tag=str(storage.get("session_tag", "")).strip(), channels_mask=ch_expr)
     notifier = StatusNotifier(cfg, Path(str(storage.get('data_dir', 'dataFile'))))
+    rt = cfg.get("runtime", {}) or {}
     # Live waveform ring (writes one downsampled waveform per buffer)
     live_cfg = (cfg.get('live', {}) or {})
     ring_nslots = int(live_cfg.get('ring_slots', 4096))
@@ -2285,6 +2286,7 @@ def run_capture(cfg_path: Path) -> int:
         records_per_buffer=rpb,
         vpp_A=vppA,
         vpp_B=vppB,
+        runtime_noise_test=_to_bool(rt.get("noise_test", False), False),
         trigger_source=str(trig.get("sourceJ", "TRIG_EXTERNAL")),
         trigger_timeout_ms=int(trig.get("timeout_ms", 0)),
         trigger_level_code=int(trig.get("levelJ", 128)),
@@ -4160,8 +4162,10 @@ class LiveDashboard(ttk.Frame):
     def _is_scope_mode(self, snap: dict) -> bool:
         """
         Use trigger-locked scope display for hardware-triggered runs.
-        Keep scrolling stream mode for auto-trigger/noise-test captures.
+        In Noise mode, use scope mode even with auto-trigger timeout.
         """
+        if _to_bool(snap.get("runtime_noise_test", False), False):
+            return True
         timeout_ms = _to_int(snap.get("trigger_timeout_ms", 0), 0)
         if timeout_ms > 0:
             return False
@@ -4797,6 +4801,7 @@ class LiveControlPanel(ttk.Frame):
         self.var_rearm_s = tk.IntVar(value=300)
         self.var_rearm_cooldown_s = tk.IntVar(value=30)
         self.var_rearm_per_hour = tk.IntVar(value=12)
+        self.var_noise_mode = tk.BooleanVar(value=False)
         self.var_runtime_profile = tk.StringVar(value="Balanced")
 
         self.var_flush_records = tk.IntVar(value=20000)
@@ -4966,9 +4971,12 @@ class LiveControlPanel(ttk.Frame):
         self._add_spinbox(live, 11, "Live window seconds", self.var_stream_s, from_=0.25, to=120.0, increment=0.1, width=10)
         self._add_spinbox(live, 12, "Max waveforms/tick", self.var_max_wf_tick, from_=1, to=2000, increment=1)
         self._add_spinbox(live, 13, "Save waveform every N", self.var_wf_every_n, from_=1, to=10_000_000, increment=1)
-        ttk.Label(live, text="Live waveform every N buffers").grid(row=14, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(live, text="Noise mode", variable=self.var_noise_mode).grid(
+            row=14, column=0, columnspan=2, sticky="w", pady=(4, 2)
+        )
+        ttk.Label(live, text="Live waveform every N buffers").grid(row=15, column=0, sticky="w", pady=2)
         wf_slider = ttk.Frame(live)
-        wf_slider.grid(row=14, column=1, sticky="ew", padx=(8, 0), pady=2)
+        wf_slider.grid(row=15, column=1, sticky="ew", padx=(8, 0), pady=2)
         wf_slider.columnconfigure(0, weight=1)
         tk.Scale(
             wf_slider,
@@ -4986,12 +4994,12 @@ class LiveControlPanel(ttk.Frame):
             activebackground=T_CYAN,
         ).grid(row=0, column=0, sticky="ew")
         ttk.Label(wf_slider, textvariable=self.var_live_waveform_every_n, width=6).grid(row=0, column=1, padx=(6, 0))
-        self._add_spinbox(live, 15, "Saved waveforms/sec cap", self.var_wf_max_per_sec, from_=1, to=50_000, increment=1)
+        self._add_spinbox(live, 16, "Saved waveforms/sec cap", self.var_wf_max_per_sec, from_=1, to=50_000, increment=1)
         ttk.Checkbutton(live, text="Show Channel B live waveform", variable=self.var_show_channel_b_live).grid(
-            row=16, column=0, columnspan=2, sticky="w", pady=(4, 2)
+            row=17, column=0, columnspan=2, sticky="w", pady=(4, 2)
         )
-        self._add_combobox(live, 17, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
-        ttk.Label(live, textvariable=self._math_var).grid(row=18, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._add_combobox(live, 18, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
+        ttk.Label(live, textvariable=self._math_var).grid(row=19, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         disk = ttk.LabelFrame(self._controls_root, text="  ▸ Disk write status", padding=8, style='Disk.TLabelframe')
         disk.grid(row=4, column=0, sticky="ew", pady=(0, 8))
@@ -5682,6 +5690,7 @@ class LiveControlPanel(ttk.Frame):
             self.var_rearm_s.set(_to_int(rt.get("rearm_if_no_trigger_s", 300), 300))
             self.var_rearm_cooldown_s.set(_to_int(rt.get("rearm_cooldown_s", 30), 30))
             self.var_rearm_per_hour.set(_to_int(rt.get("max_rearms_per_hour", 12), 12))
+            self.var_noise_mode.set(_to_bool(rt.get("noise_test", False), False))
             rt_profile = str(rt.get("profile", "") or "").strip()
             rt_profile_norm = {name.lower(): name for name in RUNTIME_PROFILE_PRESETS}.get(rt_profile.lower(), "")
             if rt_profile_norm:
@@ -5793,6 +5802,7 @@ class LiveControlPanel(ttk.Frame):
         runtime["rearm_if_no_trigger_s"] = self._safe_int(self.var_rearm_s, 300)
         runtime["rearm_cooldown_s"] = self._safe_int(self.var_rearm_cooldown_s, 30)
         runtime["max_rearms_per_hour"] = self._safe_int(self.var_rearm_per_hour, 12)
+        runtime["noise_test"] = bool(self.var_noise_mode.get())
         runtime["profile"] = self._var_text(self.var_runtime_profile, "Custom") or "Custom"
 
         storage["data_dir"] = str(self.launcher.var_data_dir.get() or "dataFile")
@@ -5954,8 +5964,8 @@ class LauncherGUI(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="State: idle", foreground=T_TEXT_DIM, font=('Consolas', 10))
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
-        # Noise trigger toggle — always visible (dummy mode feature)
-        self._noise_btn_var = tk.StringVar(value="Noise Trigger: OFF")
+        # Noise mode toggle — always visible (legacy capture override)
+        self._noise_btn_var = tk.StringVar(value="Noise mode: OFF")
         self._noise_btn = ttk.Button(ctrl, textvariable=self._noise_btn_var,
                                      command=self._toggle_noise_trigger)
         self._noise_btn.pack(side=tk.LEFT, padx=(20, 0))
@@ -6121,22 +6131,26 @@ class LauncherGUI(tk.Tk):
     def _toggle_noise_trigger(self):
         self._noise_trigger_on = not self._noise_trigger_on
         if self._noise_trigger_on:
-            self._noise_btn_var.set("Noise Trigger: ON")
+            self._noise_btn_var.set("Noise mode: ON")
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
+                    if hasattr(self.live_panel, "var_noise_mode"):
+                        self.live_panel.var_noise_mode.set(True)
                     self.live_panel.var_trig_timeout_ms.set(
                         max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10))
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger ON — auto-trigger on ambient noise.")
+            self._append("[CAPPY] Noise mode ON — auto-trigger on ambient noise.")
         else:
-            self._noise_btn_var.set("Noise Trigger: OFF")
+            self._noise_btn_var.set("Noise mode: OFF")
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
+                    if hasattr(self.live_panel, "var_noise_mode"):
+                        self.live_panel.var_noise_mode.set(False)
                     self.live_panel.var_trig_timeout_ms.set(0)
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger OFF — normal trigger mode.")
+            self._append("[CAPPY] Noise mode OFF — normal trigger mode.")
 
     # ── Session settings JSON save ───────────────────────────────────
     def _save_session_settings_json(self, run_cfg: dict, run_cfg_path: Path):
@@ -6459,9 +6473,16 @@ class LauncherGUI(tk.Tk):
         try:
             run_cfg = dict(base_cfg)
             if hasattr(self, "live_panel") and self.live_panel is not None:
-                run_cfg = self.live_panel.apply_to_cfg(run_cfg)
-            # ── Noise trigger override ────────────────────────────────
-            if getattr(self, "_noise_trigger_on", False):
+            run_cfg = self.live_panel.apply_to_cfg(run_cfg)
+            # ── Noise mode override ────────────────────────────────
+            noise_mode_requested = bool(getattr(self, "_noise_trigger_on", False))
+            try:
+                if hasattr(self, "live_panel") and self.live_panel is not None:
+                    noise_mode_requested = noise_mode_requested or bool(self.live_panel.var_noise_mode.get())
+            except Exception:
+                pass
+
+            if noise_mode_requested:
                 rt = run_cfg.setdefault("runtime", {}) or {}
                 rt["noise_test"] = True
                 rt["autotrigger_timeout_ms"] = 100
@@ -6477,7 +6498,14 @@ class LauncherGUI(tk.Tk):
                 trig["allow_autotrigger_with_external"] = True
                 trig["external_startcapture"] = False
                 run_cfg["trigger"] = trig
-                self._append("[CAPPY] Noise trigger: source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
+                try:
+                    if hasattr(self, "live_panel") and self.live_panel is not None and hasattr(self.live_panel, "var_noise_mode"):
+                        self.live_panel.var_noise_mode.set(True)
+                    self._noise_trigger_on = True
+                    self._noise_btn_var.set("Noise mode: ON")
+                except Exception:
+                    pass
+                self._append("[CAPPY] Noise mode: source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
