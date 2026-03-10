@@ -6009,7 +6009,7 @@ class LauncherGUI(tk.Tk):
 
     # ── Capybara mascot ──────────────────────────────────────────────
     def _init_capybara(self):
-        """Load the animated capybara GIF and place it in the top-right corner."""
+        """Load the animated capybara GIF and place it small in the top-right corner."""
         try:
             gif_path = self.script_path.parent / "capybara_blue_tinted_brighter.gif"
             if not gif_path.exists():
@@ -6019,12 +6019,16 @@ class LauncherGUI(tk.Tk):
             while True:
                 try:
                     frame = tk.PhotoImage(file=str(gif_path), format=f"gif -index {idx}")
+                    # Scale down: 320px / 7 ≈ 46px — small mascot size
+                    frame = frame.subsample(7, 7)
                     self._capy_frames.append(frame)
                     idx += 1
                 except tk.TclError:
                     break
             if not self._capy_frames:
-                self._capy_frames = [tk.PhotoImage(file=str(gif_path))]
+                frame = tk.PhotoImage(file=str(gif_path))
+                frame = frame.subsample(7, 7)
+                self._capy_frames = [frame]
             self._capy_label = tk.Label(self, image=self._capy_frames[0],
                                         bg=T_BG, cursor="hand2")
             self._capy_label.place(relx=1.0, y=4, anchor="ne", x=-8)
