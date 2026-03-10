@@ -2994,7 +2994,7 @@ def run_quick_config(cfg_path: Path) -> int:
     captured: List[np.ndarray] = []
     wt_ms = int(acq.get("wait_timeout_ms", 5000))
     # Use a generous timeout for the scout capture
-    wt_ms = max(wt_ms, 5000)
+    wt_ms = max(wt_ms, 10000)
 
     print(f"[QC] capturing {_QC_BUFFERS} buffers (spr={spr} rpb={rpb} ch={ch_count})…", flush=True)
     board.startCapture()
@@ -5181,9 +5181,11 @@ class LiveControlPanel(ttk.Frame):
             trig = run_cfg.setdefault("trigger", {})
             runtime = run_cfg.setdefault("runtime", {})
             acq["buffers_per_acquisition"] = _QC_BUFFERS
-            # Scout captures should not hang on a missing external trigger or a
-            # stale threshold. Use a short auto-trigger fallback and do not
-            # require external start-capture for this disposable run.
+            # Scout captures MUST auto-trigger — force noise_test mode so the
+            # board triggers on its own even without an external signal.
+            runtime["noise_test"] = True
+            runtime["autotrigger_timeout_ms"] = max(
+                _to_int(runtime.get("autotrigger_timeout_ms", 10), 10), 10)
             trig["timeout_ms"] = max(
                 _to_int(trig.get("timeout_ms", 0), 0),
                 _to_int(runtime.get("autotrigger_timeout_ms", 10), 10),
@@ -5929,6 +5931,7 @@ class LauncherGUI(tk.Tk):
         # ── Control bar — always visible ──────────────────────────────
         ctrl = ttk.Frame(self, padding=8)
         ctrl.pack(fill=tk.X)
+        self._ctrl_bar = ctrl
 
         self.btn = ttk.Button(ctrl, text="Start Capture", command=self._toggle, style='Primary.TButton')
         self.btn.pack(side=tk.LEFT)
@@ -6009,7 +6012,7 @@ class LauncherGUI(tk.Tk):
 
     # ── Capybara mascot ──────────────────────────────────────────────
     def _init_capybara(self):
-        """Load the animated capybara GIF and place it small in the top-right corner."""
+        """Load the animated capybara GIF and place it in the control bar blank space."""
         try:
             gif_path = self.script_path.parent / "capybara_blue_tinted_brighter.gif"
             if not gif_path.exists():
@@ -6019,7 +6022,6 @@ class LauncherGUI(tk.Tk):
             while True:
                 try:
                     frame = tk.PhotoImage(file=str(gif_path), format=f"gif -index {idx}")
-                    # Scale down: 320px / 7 ≈ 46px — small mascot size
                     frame = frame.subsample(7, 7)
                     self._capy_frames.append(frame)
                     idx += 1
@@ -6029,9 +6031,10 @@ class LauncherGUI(tk.Tk):
                 frame = tk.PhotoImage(file=str(gif_path))
                 frame = frame.subsample(7, 7)
                 self._capy_frames = [frame]
-            self._capy_label = tk.Label(self, image=self._capy_frames[0],
+            # Place in the control bar — packed right, just before the Unlock button
+            self._capy_label = tk.Label(self._ctrl_bar, image=self._capy_frames[0],
                                         bg=T_BG, cursor="hand2")
-            self._capy_label.place(relx=1.0, y=4, anchor="ne", x=-8)
+            self._capy_label.pack(side=tk.RIGHT, padx=(0, 6))
             self._capy_label.bind("<Button-1>", lambda _e: self._append("[CAPPY] Capybara says hello!"))
             self._capy_idx = 0
             if len(self._capy_frames) > 1:
