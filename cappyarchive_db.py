@@ -1430,11 +1430,11 @@ class ArchiveDB(ttk.Frame):
             on_sel=self._on_session, height=5,
         )
 
-        # Small button to export YAML settings for the selected session to JSON
-        sess_btn_row = tk.Frame(parent, bg=C_BG)
-        sess_btn_row.pack(fill=tk.X, padx=4, pady=(1, 2))
-        ttk.Button(sess_btn_row, text="Save Session YAML → JSON",
-                   command=self._export_session_yaml_to_json,
+        # small "Save session YAML → JSON" button
+        _sess_btn_row = tk.Frame(parent, bg=C_BG)
+        _sess_btn_row.pack(fill=tk.X, padx=4, pady=(0, 2))
+        ttk.Button(_sess_btn_row, text="Save Session YAML → .json",
+                   command=self._export_session_yaml_json,
                    style="TButton").pack(side=tk.LEFT)
 
         self._sh(parent, "DAY")
@@ -1600,8 +1600,9 @@ class ArchiveDB(ttk.Frame):
 
         self._status(f"{len(rows)} sessions  ·  {total_snips:,} snips total")
 
-    def _export_session_yaml_to_json(self) -> None:
-        """Export the YAML settings associated with the selected session to a .json file."""
+    # ── Export session YAML settings to JSON ─────────────────────────────
+    def _export_session_yaml_json(self) -> None:
+        """Find the YAML run-config for the selected session and save it as .json."""
         sel = self._t_sess.selection()
         if not sel:
             messagebox.showinfo("Export", "Select a session first.")
@@ -1611,39 +1612,37 @@ class ArchiveDB(ttk.Frame):
             return
         sid = str(vals[1]).strip()
         if not sid or sid not in self._db_map:
-            messagebox.showinfo("Export", "Session not found in map.")
+            messagebox.showinfo("Export", "Session not found.")
             return
 
         db_path, day_dir = self._db_map[sid]
+        yaml_cfg: dict = {}
+        source_label = "reconstructed from DB"
 
-        # Try to find the YAML config used for this session.
-        # Sessions typically store a run config alongside the data.
-        yaml_settings = {}
-        found_yaml = False
-
-        # Search for run.yaml or config yaml in the day directory
+        # 1) Look for a .run.yaml or .yaml sitting next to the DB
         if day_dir:
-            day_p = Path(str(day_dir))
-            for yaml_pattern in ["*.run.yaml", "*.yaml", "*.yml"]:
-                for yf in sorted(day_p.glob(yaml_pattern)):
+            dd = Path(str(day_dir))
+            for pattern in ("*.run.yaml", "*.yaml", "*.yml"):
+                for yf in sorted(dd.glob(pattern)):
                     try:
                         import yaml as _yaml
                         raw = yf.read_text(encoding="utf-8")
                         parsed = _yaml.safe_load(raw)
                         if isinstance(parsed, dict):
-                            yaml_settings = parsed
-                            found_yaml = True
+                            yaml_cfg = parsed
+                            source_label = str(yf.name)
                             break
                     except Exception:
                         continue
-                if found_yaml:
+                if yaml_cfg:
                     break
 
-        # If no YAML found on disk, try to reconstruct basic settings from the DB
-        if not yaml_settings:
+        # 2) Fallback: pull basic settings from the DB itself
+        if not yaml_cfg:
             try:
                 import sqlite3 as _sq
-                conn = _sq.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+                conn = _sq.connect(f"file:{db_path}?mode=ro", uri=True,
+                                   check_same_thread=False)
                 conn.row_factory = _sq.Row
                 row = conn.execute(
                     "SELECT sample_rate_hz, n_samples, channels_mask "
@@ -1651,24 +1650,21 @@ class ArchiveDB(ttk.Frame):
                     (sid,),
                 ).fetchone()
                 if row:
-                    yaml_settings = {
+                    yaml_cfg = {
                         "session_id": sid,
                         "sample_rate_hz": float(row["sample_rate_hz"] or 0),
                         "n_samples": int(row["n_samples"] or 0),
-                        "channels_mask": str(row["channels_mask"] or "CHANNEL_A"),
-                        "_note": "Reconstructed from DB — no YAML config file found for this session.",
+                        "channels_mask": str(row["channels_mask"] or ""),
+                        "_note": "Reconstructed from DB — no YAML config file found.",
                     }
                 conn.close()
             except Exception:
-                yaml_settings = {
-                    "session_id": sid,
-                    "_note": "No YAML config found and DB query failed.",
-                }
+                yaml_cfg = {"session_id": sid, "_note": "No YAML found, DB read failed."}
 
-        yaml_settings["_exported_session_id"] = sid
-        yaml_settings["_exported_at"] = datetime.now().isoformat()
+        yaml_cfg["_session_id"] = sid
+        yaml_cfg["_source"] = source_label
+        yaml_cfg["_exported_at"] = datetime.now().isoformat()
 
-        # Ask user where to save
         import json as _json
         save_path = filedialog.asksaveasfilename(
             title="Save Session YAML as JSON",
@@ -1680,10 +1676,10 @@ class ArchiveDB(ttk.Frame):
             return
         try:
             with open(save_path, "w", encoding="utf-8") as fh:
-                _json.dump(yaml_settings, fh, indent=2, default=str)
-            self._status(f"Exported session {sid} settings to {save_path}")
+                _json.dump(yaml_cfg, fh, indent=2, default=str)
+            self._status(f"Saved → {save_path}")
         except Exception as ex:
-            messagebox.showerror("Export", f"Failed to save JSON:\n{ex}")
+            messagebox.showerror("Export", f"Failed to write JSON:\n{ex}")
 
     def _on_session(self, _=None) -> None:
         sel = self._t_sess.selection()
