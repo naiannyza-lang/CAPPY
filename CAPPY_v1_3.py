@@ -2973,15 +2973,20 @@ def run_quick_config(cfg_path: Path) -> int:
         return 2
 
     # ── FORCE auto-trigger for scout capture ──────────────────────────
-    # configure_board may have set timeout_ms=0 if trigger source is external.
-    # For quick-config we MUST auto-trigger so we always get data.
-    # setTriggerTimeOut(N) with N>0 tells the board to auto-trigger after N
-    # clock ticks if no real trigger arrives.  10 = ~10 ticks ≈ instant.
+    # Override the trigger to Channel A at midscale + generous auto-timeout.
+    # This guarantees we capture data regardless of external trigger state.
     try:
-        board.setTriggerTimeOut(10)
-        print("[QC] forced board auto-trigger timeout=10 for scout capture", flush=True)
+        board.setTriggerOperation(
+            ats.TRIG_ENGINE_OP_J,
+            ats.TRIG_ENGINE_J, ats.TRIG_CHAN_A,
+            ats.TRIGGER_SLOPE_POSITIVE, 128,
+            ats.TRIG_ENGINE_K, ats.TRIG_DISABLE,
+            ats.TRIGGER_SLOPE_POSITIVE, 128,
+        )
+        board.setTriggerTimeOut(100)  # 100 × 10µs = 1ms auto-trigger fallback
+        print("[QC] forced trigger: source=CHAN_A level=128 timeout=100 (1ms auto-trigger)", flush=True)
     except Exception as ex:
-        print(f"[QC] warning: setTriggerTimeOut failed: {ex}", flush=True)
+        print(f"[QC] warning: trigger override failed: {ex}", flush=True)
 
     ch_mask  = channels_from_mask_expr(ch_expr)
     ch_count = infer_channel_count_from_mask(ch_mask)
@@ -6459,11 +6464,14 @@ class LauncherGUI(tk.Tk):
             if getattr(self, "_noise_trigger_on", False):
                 rt = run_cfg.setdefault("runtime", {}) or {}
                 rt["noise_test"] = True
+                rt["autotrigger_timeout_ms"] = 100
                 run_cfg["runtime"] = rt
                 trig = run_cfg.setdefault("trigger", {}) or {}
-                trig["timeout_ms"] = max(_to_int(trig.get("timeout_ms", 0), 0), 10)
+                trig["timeout_ms"] = 100
+                trig["allow_autotrigger_with_external"] = True
+                trig["external_startcapture"] = False
                 run_cfg["trigger"] = trig
-                self._append("[CAPPY] Noise trigger injected (noise_test=true, timeout_ms≥10).")
+                self._append("[CAPPY] Noise trigger injected (noise_test=true, timeout_ms=100, allow_autotrigger=true).")
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
