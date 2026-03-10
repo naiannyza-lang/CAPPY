@@ -2972,6 +2972,17 @@ def run_quick_config(cfg_path: Path) -> int:
         print(json.dumps({"error": f"configure_board failed: {ex}"}))
         return 2
 
+    # ── FORCE auto-trigger for scout capture ──────────────────────────
+    # configure_board may have set timeout_ms=0 if trigger source is external.
+    # For quick-config we MUST auto-trigger so we always get data.
+    # setTriggerTimeOut(N) with N>0 tells the board to auto-trigger after N
+    # clock ticks if no real trigger arrives.  10 = ~10 ticks ≈ instant.
+    try:
+        board.setTriggerTimeOut(10)
+        print("[QC] forced board auto-trigger timeout=10 for scout capture", flush=True)
+    except Exception as ex:
+        print(f"[QC] warning: setTriggerTimeOut failed: {ex}", flush=True)
+
     ch_mask  = channels_from_mask_expr(ch_expr)
     ch_count = infer_channel_count_from_mask(ch_mask)
     _, bps   = board.getChannelInfo()
@@ -2984,8 +2995,7 @@ def run_quick_config(cfg_path: Path) -> int:
 
     recs_per_acq = rpb * _QC_BUFFERS  # finite acquisition
     adma_flags   = ats.ADMA_TRADITIONAL_MODE
-    if bool(trig.get("external_startcapture", False)):
-        adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
+    # Never use external start-capture for scout — we need data immediately
 
     board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recs_per_acq, adma_flags)
     for b in buffers:
