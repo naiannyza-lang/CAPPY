@@ -3204,9 +3204,9 @@ def run_quick_config(cfg_path: Path) -> int:
             ats.TRIG_ENGINE_K, ats.TRIG_DISABLE,
             ats.TRIGGER_SLOPE_POSITIVE, 128,
         )
-        board.setTriggerTimeOut(100)
+        board.setTriggerTimeOut(1000)  # 1000 × 10µs = 10ms auto-trigger fallback
         print(
-            f"[QC] forced trigger: source={qc_source} level={qc_level} slope={qc_slope} timeout=100",
+            f"[QC] forced trigger: source={qc_source} level={qc_level} slope={qc_slope} timeout=1000",
             flush=True,
         )
     except Exception as ex:
@@ -3222,7 +3222,10 @@ def run_quick_config(cfg_path: Path) -> int:
     buffers = [ats.DMABuffer(board.handle, stype, bpBuf) for _ in range(bufN)]
     board.setRecordSize(0, spr)
 
-    recs_per_acq = rpb * scout_buffers
+    # ATS-9462: NPT mode requires unlimited record count (0x7FFFFFFF).
+    # Passing a finite recs_per_acq causes ApiBufferOverflow on this board.
+    # We stop after scout_buffers completions in the loop below instead.
+    recs_per_acq = 0x7FFFFFFF
     adma_flags = getattr(ats, "ADMA_NPT", None)
     if adma_flags is None:
         adma_flags = getattr(ats, "ADMA_NPT_MODE", ats.ADMA_TRADITIONAL_MODE)
