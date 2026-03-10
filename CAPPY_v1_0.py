@@ -2331,6 +2331,7 @@ def run_capture(cfg_path: Path) -> int:
         trigger_slope=str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE")),
         trigger_level_code=int(trig.get("levelJ", 128)),
         trigger_timeout_ms=int(trig.get("timeout_ms", 0)),
+        runtime_noise_test=_to_bool((cfg.get("runtime") or {}).get("noise_test", False), False),
         pre_trigger_samples=int(pre),
         live_ring_path=str(ring_path),
         live=dict(
@@ -4132,8 +4133,10 @@ class LiveDashboard(ttk.Frame):
     def _is_scope_mode(self, snap: dict) -> bool:
         """
         Use trigger-locked scope display for hardware-triggered runs.
-        Keep scrolling stream mode for auto-trigger/noise-test captures.
+        Keep scrolling stream mode for non-triggered captures.
         """
+        if _to_bool(snap.get("runtime_noise_test", False), False):
+            return True
         timeout_ms = _to_int(snap.get("trigger_timeout_ms", 0), 0)
         if timeout_ms > 0:
             return False
@@ -6036,7 +6039,7 @@ class LauncherGUI(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="State: idle", foreground=T_TEXT_DIM, font=('Consolas', 10))
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
-        self._noise_btn_var = tk.StringVar(value="Noise Trigger: OFF")
+        self._noise_btn_var = tk.StringVar(value="Noise mode: OFF")
         self._noise_btn = ttk.Button(ctrl, textvariable=self._noise_btn_var,
                                      command=self._toggle_noise_trigger)
         self._noise_btn.pack(side=tk.LEFT, padx=(20, 0))
@@ -6185,22 +6188,22 @@ class LauncherGUI(tk.Tk):
     def _toggle_noise_trigger(self):
         self._noise_trigger_on = not self._noise_trigger_on
         if self._noise_trigger_on:
-            self._noise_btn_var.set("Noise Trigger: ON")
+            self._noise_btn_var.set("Noise mode: ON")
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
                     self.live_panel.var_trig_timeout_ms.set(
                         max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10))
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger ON — auto-trigger on ambient noise.")
+            self._append("[CAPPY] Noise mode ON — auto-trigger on ambient noise.")
         else:
-            self._noise_btn_var.set("Noise Trigger: OFF")
+            self._noise_btn_var.set("Noise mode: OFF")
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
                     self.live_panel.var_trig_timeout_ms.set(0)
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger OFF — normal trigger mode.")
+            self._append("[CAPPY] Noise mode OFF — normal trigger mode.")
 
     def _save_session_settings_json(self, run_cfg: dict, run_cfg_path: Path):
         try:
@@ -6404,6 +6407,11 @@ class LauncherGUI(tk.Tk):
             cfg = load_config(cfg_path)
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 self.live_panel.load_from_cfg(cfg)
+            rt = cfg.get("runtime", {}) if isinstance(cfg, dict) else {}
+            if not isinstance(rt, dict):
+                rt = {}
+            self._noise_trigger_on = bool(rt.get("noise_test", False))
+            self._noise_btn_var.set("Noise mode: ON" if self._noise_trigger_on else "Noise mode: OFF")
             storage = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
             if isinstance(storage, dict) and storage.get("data_dir"):
                 self.var_data_dir.set(str(storage.get("data_dir")))
@@ -6584,7 +6592,7 @@ class LauncherGUI(tk.Tk):
                 trig["allow_autotrigger_with_external"] = True
                 trig["external_startcapture"] = False
                 run_cfg["trigger"] = trig
-                self._append("[CAPPY] Noise trigger: source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
+                self._append("[CAPPY] Noise mode: source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
