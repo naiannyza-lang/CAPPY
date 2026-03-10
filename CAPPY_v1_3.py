@@ -6467,11 +6467,17 @@ class LauncherGUI(tk.Tk):
                 rt["autotrigger_timeout_ms"] = 100
                 run_cfg["runtime"] = rt
                 trig = run_cfg.setdefault("trigger", {}) or {}
+                # Switch trigger source from External to Channel A at midscale
+                # so the board triggers on any signal crossing — this is what
+                # makes noise mode actually capture data on ATS9870.
+                trig["sourceJ"] = "TRIG_CHAN_A"
+                trig["slopeJ"] = "TRIGGER_SLOPE_POSITIVE"
+                trig["levelJ"] = 128  # midscale = 0V crossing
                 trig["timeout_ms"] = 100
                 trig["allow_autotrigger_with_external"] = True
                 trig["external_startcapture"] = False
                 run_cfg["trigger"] = trig
-                self._append("[CAPPY] Noise trigger injected (noise_test=true, timeout_ms=100, allow_autotrigger=true).")
+                self._append("[CAPPY] Noise trigger: source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
