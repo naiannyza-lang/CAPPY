@@ -32,7 +32,7 @@ cappy_batch_decode is used to decompress a minute's waveforms in one C call
 (fallback to Python zlib if not available).
 """
 from __future__ import annotations
-import os, queue, sqlite3, struct, threading, zlib
+import os, json, queue, sqlite3, struct, threading, zlib
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -1430,11 +1430,14 @@ class ArchiveDB(ttk.Frame):
             on_sel=self._on_session, height=5,
         )
 
-        # small "Save session YAML → JSON" button
-        _sess_btn_row = tk.Frame(parent, bg=C_BG)
-        _sess_btn_row.pack(fill=tk.X, padx=4, pady=(0, 2))
-        ttk.Button(_sess_btn_row, text="Save Session YAML → .json",
+        # Session tools row
+        _sess_tools = tk.Frame(parent, bg=C_BG)
+        _sess_tools.pack(fill=tk.X, padx=4, pady=(0, 2))
+        ttk.Button(_sess_tools, text="Save YAML → .json",
                    command=self._export_session_yaml_json,
+                   style="TButton").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(_sess_tools, text="View Settings",
+                   command=self._view_session_settings,
                    style="TButton").pack(side=tk.LEFT)
 
         self._sh(parent, "DAY")
@@ -1600,33 +1603,66 @@ class ArchiveDB(ttk.Frame):
 
         self._status(f"{len(rows)} sessions  ·  {total_snips:,} snips total")
 
-    # ── Export session YAML settings to JSON ─────────────────────────────
-    def _export_session_yaml_json(self) -> None:
-        """Find the YAML run-config for the selected session and save it as .json."""
+    # ── Session settings export / view ──────────────────────────────────
+    def _get_selected_session(self) -> Optional[str]:
         sel = self._t_sess.selection()
         if not sel:
-            messagebox.showinfo("Export", "Select a session first.")
-            return
+            return None
         vals = self._t_sess.item(sel[0], "values")
         if not vals or len(vals) < 2:
-            return
+            return None
         sid = str(vals[1]).strip()
-        if not sid or sid not in self._db_map:
-            messagebox.showinfo("Export", "Session not found.")
-            return
+        return sid if sid and sid in self._db_map else None
 
+    def _find_session_settings_json(self, sid: str) -> Optional[Path]:
+        """Look for session_<sid>_settings.json in known locations."""
+        db_path, day_dir = self._db_map.get(sid, (None, None))
+        search_dirs = []
+        if day_dir:
+            dd = Path(str(day_dir))
+            search_dirs.append(dd / "index")
+            search_dirs.append(dd)
+        # Also check captures root
+        if self.captures.exists():
+            search_dirs.append(self.captures)
+        for d in search_dirs:
+            candidate = d / f"session_{sid}_settings.json"
+            if candidate.exists():
+                return candidate
+        # Glob fallback
+        for d in search_dirs:
+            if d.exists():
+                for f in d.glob(f"*{sid}*settings*.json"):
+                    return f
+        return None
+
+    def _export_session_yaml_json(self) -> None:
+        """Export the YAML/config for the selected session to a .json file."""
+        sid = self._get_selected_session()
+        if not sid:
+            messagebox.showinfo("Export", "Select a session first.")
+            return
         db_path, day_dir = self._db_map[sid]
         yaml_cfg: dict = {}
         source_label = "reconstructed from DB"
 
-        # 1) Look for a .run.yaml or .yaml sitting next to the DB
-        if day_dir:
+        # 1) Check for existing session settings JSON (saved at capture start)
+        existing = self._find_session_settings_json(sid)
+        if existing:
+            try:
+                yaml_cfg = json.loads(existing.read_text(encoding="utf-8"))
+                source_label = str(existing.name)
+            except Exception:
+                pass
+
+        # 2) Look for .run.yaml or .yaml in the day directory
+        if not yaml_cfg and day_dir:
             dd = Path(str(day_dir))
             for pattern in ("*.run.yaml", "*.yaml", "*.yml"):
                 for yf in sorted(dd.glob(pattern)):
                     try:
-                        import yaml as _yaml
                         raw = yf.read_text(encoding="utf-8")
+                        import yaml as _yaml
                         parsed = _yaml.safe_load(raw)
                         if isinstance(parsed, dict):
                             yaml_cfg = parsed
@@ -1637,17 +1673,15 @@ class ArchiveDB(ttk.Frame):
                 if yaml_cfg:
                     break
 
-        # 2) Fallback: pull basic settings from the DB itself
+        # 3) Fallback: reconstruct from DB
         if not yaml_cfg:
             try:
-                import sqlite3 as _sq
-                conn = _sq.connect(f"file:{db_path}?mode=ro", uri=True,
-                                   check_same_thread=False)
-                conn.row_factory = _sq.Row
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                                       check_same_thread=False)
+                conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT sample_rate_hz, n_samples, channels_mask "
-                    "FROM snips WHERE session_id = ? LIMIT 1",
-                    (sid,),
+                    "FROM snips WHERE session_id = ? LIMIT 1", (sid,),
                 ).fetchone()
                 if row:
                     yaml_cfg = {
@@ -1655,19 +1689,18 @@ class ArchiveDB(ttk.Frame):
                         "sample_rate_hz": float(row["sample_rate_hz"] or 0),
                         "n_samples": int(row["n_samples"] or 0),
                         "channels_mask": str(row["channels_mask"] or ""),
-                        "_note": "Reconstructed from DB — no YAML config file found.",
+                        "_note": "Reconstructed from DB — no config file found.",
                     }
                 conn.close()
             except Exception:
-                yaml_cfg = {"session_id": sid, "_note": "No YAML found, DB read failed."}
+                yaml_cfg = {"session_id": sid, "_note": "No config found, DB read failed."}
 
         yaml_cfg["_session_id"] = sid
         yaml_cfg["_source"] = source_label
         yaml_cfg["_exported_at"] = datetime.now().isoformat()
 
-        import json as _json
         save_path = filedialog.asksaveasfilename(
-            title="Save Session YAML as JSON",
+            title="Save Session Settings as JSON",
             defaultextension=".json",
             filetypes=[("JSON", "*.json"), ("All", "*.*")],
             initialfile=f"session_{sid}_settings.json",
@@ -1676,10 +1709,43 @@ class ArchiveDB(ttk.Frame):
             return
         try:
             with open(save_path, "w", encoding="utf-8") as fh:
-                _json.dump(yaml_cfg, fh, indent=2, default=str)
+                json.dump(yaml_cfg, fh, indent=2, default=str)
             self._status(f"Saved → {save_path}")
         except Exception as ex:
             messagebox.showerror("Export", f"Failed to write JSON:\n{ex}")
+
+    def _view_session_settings(self) -> None:
+        """Load and display the session settings JSON in the metadata panel."""
+        sid = self._get_selected_session()
+        if not sid:
+            messagebox.showinfo("Settings", "Select a session first.")
+            return
+        existing = self._find_session_settings_json(sid)
+        if existing is None:
+            self._set_meta(f"No settings file found for session {sid}.\n"
+                           f"(Settings are saved automatically since the latest CAPPY version.)")
+            return
+        try:
+            payload = json.loads(existing.read_text(encoding="utf-8"))
+            # Build a readable summary
+            lines = [f"Session Settings: {existing.name}", ""]
+            for k, v in payload.items():
+                if k.startswith("_"):
+                    continue
+                if isinstance(v, dict):
+                    lines.append(f"  [{k}]")
+                    for k2, v2 in v.items():
+                        lines.append(f"    {k2}: {v2}")
+                else:
+                    lines.append(f"  {k}: {v}")
+            # Add metadata
+            lines.append("")
+            for k in ("_session_id", "_saved_at", "_config_source"):
+                if k in payload:
+                    lines.append(f"  {k}: {payload[k]}")
+            self._set_meta("\n".join(lines))
+        except Exception as ex:
+            self._set_meta(f"Error reading settings:\n{ex}")
 
     def _on_session(self, _=None) -> None:
         sel = self._t_sess.selection()
