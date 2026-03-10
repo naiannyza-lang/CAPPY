@@ -1479,7 +1479,7 @@ class CappyArchive:
             waveform_zlib_level=self.waveform_zlib_level,
         )
 
-        _atomic_write_text(idx_dir / f"session_{sid}.txt", f"CAPPY v1.3 session {sid}\nchannels={channels_mask}\n")
+        _atomic_write_text(idx_dir / f"session_{sid}.txt", f"CAPPY v1.0 session {sid}\nchannels={channels_mask}\n")
         print(f"[CAPPY] Started session {sid} in {self.day_dir}")
         return sid
 
@@ -5043,6 +5043,7 @@ class LiveControlPanel(ttk.Frame):
         self.var_max_wf_tick = tk.IntVar(value=20)
         self.var_show_channel_b_live = tk.BooleanVar(value=False)
         self.var_preview_mode = tk.StringVar(value="archive_match")
+        self.var_noise_mode = tk.BooleanVar(value=False)
         self._math_var = tk.StringVar(value="")
         self._harmonizing = False
         self._spin_flush_records = None
@@ -5229,8 +5230,11 @@ class LiveControlPanel(ttk.Frame):
             row=16, column=0, columnspan=2, sticky="w", pady=(4, 2)
         )
         self._add_combobox(live, 17, "Preview mode", self.var_preview_mode, ["archive_match", "record0"], width=16)
+        ttk.Checkbutton(live, text="Noise mode (auto-trigger, NPT)", variable=self.var_noise_mode).grid(
+            row=18, column=0, columnspan=2, sticky="w", pady=(4, 2)
+        )
         self._math_lbl = ttk.Label(live, textvariable=self._math_var, wraplength=700, justify=tk.LEFT)
-        self._math_lbl.grid(row=18, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._math_lbl.grid(row=19, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         disk = ttk.LabelFrame(self._controls_root, text="  ▸ Disk write status", padding=8, style='Disk.TLabelframe')
         disk.grid(row=4, column=0, sticky="ew", pady=(0, 8))
@@ -5955,6 +5959,7 @@ class LiveControlPanel(ttk.Frame):
             self.var_rearm_s.set(_to_int(rt.get("rearm_if_no_trigger_s", 300), 300))
             self.var_rearm_cooldown_s.set(_to_int(rt.get("rearm_cooldown_s", 30), 30))
             self.var_rearm_per_hour.set(_to_int(rt.get("max_rearms_per_hour", 12), 12))
+            self.var_noise_mode.set(_to_bool(rt.get("noise_test", False), False))
             rt_profile = str(rt.get("profile", "") or "").strip()
             rt_profile_norm = {name.lower(): name for name in RUNTIME_PROFILE_PRESETS}.get(rt_profile.lower(), "")
             if rt_profile_norm:
@@ -6078,6 +6083,7 @@ class LiveControlPanel(ttk.Frame):
         runtime["rearm_cooldown_s"] = self._safe_int(self.var_rearm_cooldown_s, 30)
         runtime["max_rearms_per_hour"] = self._safe_int(self.var_rearm_per_hour, 12)
         runtime["profile"] = self._var_text(self.var_runtime_profile, "Custom") or "Custom"
+        runtime["noise_test"] = bool(self.var_noise_mode.get())
 
         storage["data_dir"] = str(self.launcher.var_data_dir.get() or "dataFile")
         storage["flush_every_records"] = self._safe_int(self.var_flush_records, 20000)
@@ -6399,6 +6405,7 @@ class LauncherGUI(tk.Tk):
                 try:
                     self.live_panel.var_trig_timeout_ms.set(
                         max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10))
+                    self.live_panel.var_noise_mode.set(True)
                 except Exception:
                     pass
             self._append("[CAPPY] Noise mode ON — auto-trigger on ambient noise.")
@@ -6407,6 +6414,7 @@ class LauncherGUI(tk.Tk):
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
                     self.live_panel.var_trig_timeout_ms.set(0)
+                    self.live_panel.var_noise_mode.set(False)
                 except Exception:
                     pass
             self._append("[CAPPY] Noise mode OFF — normal trigger mode.")
@@ -6618,6 +6626,12 @@ class LauncherGUI(tk.Tk):
                 rt = {}
             self._noise_trigger_on = bool(rt.get("noise_test", False))
             self._noise_btn_var.set("Noise mode: ON" if self._noise_trigger_on else "Noise mode: OFF")
+            # keep panel checkbox in sync
+            if hasattr(self, "live_panel") and self.live_panel is not None:
+                try:
+                    self.live_panel.var_noise_mode.set(self._noise_trigger_on)
+                except Exception:
+                    pass
             storage = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
             if isinstance(storage, dict) and storage.get("data_dir"):
                 self.var_data_dir.set(str(storage.get("data_dir")))
