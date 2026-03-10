@@ -199,12 +199,13 @@ RUNTIME_PROFILE_PRESETS = {
     },
 }
 RUNTIME_PROFILE_OPTIONS = list(RUNTIME_PROFILE_PRESETS.keys()) + ["Custom"]
-ADMIN_PASSWORD = "FermiAdmin1234"
-
 LIVE_UI_FPS_MAX = 15.0
 LIVE_MAX_CATCHUP_WAVEFORMS_PER_TICK = 12
 WAVEFORM_EVERY_N_MAX = 3000
 WAVE_ARCHIVE_CODEC_OPTIONS = {"none", "f32_zlib", "delta_i16_zlib"}
+
+# ── Dummy / Admin mode ────────────────────────────────────────────────────
+ADMIN_PASSWORD = "FermiAdmin1234"
 
 
 def _to_int(v: Any, default: int) -> int:
@@ -5787,10 +5788,10 @@ class LauncherGUI(tk.Tk):
         self._disk_scan_interval_s = 10.0
         self._last_disk_scan_unix = 0.0
         self._last_disk_size_bytes = 0
+        self._admin_unlocked = False
+        self._noise_trigger_on = False
 
         self._restore_gui_state()
-        self._admin_mode = False
-        self._noise_trigger_active = False
 
         # Auto-create default config so you never need to run `init` in a terminal.
         cfgp = Path(self.var_config.get())
@@ -5800,21 +5801,21 @@ class LauncherGUI(tk.Tk):
             except Exception as ex:
                 messagebox.showerror('CAPPY', f'Failed to create default config {cfgp}: {ex}')
 
-        # ── Top bar (admin-only: config path, data dir, browse) ──
-        self._top = ttk.Frame(self, padding=8)
-        self._top.pack(fill=tk.X)
+        # ── Top bar — admin-only (config YAML / data dir / browse) ────
+        self._top_bar = ttk.Frame(self, padding=8)
+        # NOT packed yet — hidden until admin unlock
 
-        ttk.Label(self._top, text="Config YAML:").pack(side=tk.LEFT)
-        ttk.Entry(self._top, textvariable=self.var_config, width=52).pack(side=tk.LEFT, padx=(6,8))
-        ttk.Button(self._top, text="Browse…", command=self._pick_yaml).pack(side=tk.LEFT)
+        ttk.Label(self._top_bar, text="Config YAML:").pack(side=tk.LEFT)
+        ttk.Entry(self._top_bar, textvariable=self.var_config, width=52).pack(side=tk.LEFT, padx=(6,8))
+        ttk.Button(self._top_bar, text="Browse…", command=self._pick_yaml).pack(side=tk.LEFT)
 
-        ttk.Label(self._top, text="Data dir:").pack(side=tk.LEFT, padx=(16,4))
-        ttk.Entry(self._top, textvariable=self.var_data_dir, width=24).pack(side=tk.LEFT)
+        ttk.Label(self._top_bar, text="Data dir:").pack(side=tk.LEFT, padx=(16,4))
+        ttk.Entry(self._top_bar, textvariable=self.var_data_dir, width=24).pack(side=tk.LEFT)
 
-        ttk.Button(self._top, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
-        ttk.Button(self._top, text="Browse Archive", command=self._browse).pack(side=tk.LEFT)
+        ttk.Button(self._top_bar, text="Open YAML", command=self._open_yaml).pack(side=tk.LEFT, padx=(16,6))
+        ttk.Button(self._top_bar, text="Browse Archive", command=self._browse).pack(side=tk.LEFT)
 
-        # ── Control bar (always visible) ──
+        # ── Control bar — always visible ──────────────────────────────
         ctrl = ttk.Frame(self, padding=8)
         ctrl.pack(fill=tk.X)
 
@@ -5824,172 +5825,129 @@ class LauncherGUI(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="State: idle", foreground=T_TEXT_DIM, font=('Consolas', 10))
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
-        # Noise trigger toggle (dummy mode feature)
-        self._noise_btn = ttk.Button(ctrl, text="Noise Trigger: OFF", command=self._toggle_noise_trigger)
-        self._noise_btn.pack(side=tk.LEFT, padx=(16, 0))
+        # ── Noise trigger toggle ──────────────────────────────────────
+        self._noise_btn_var = tk.StringVar(value="Noise Trigger: OFF")
+        self._noise_btn = ttk.Button(ctrl, textvariable=self._noise_btn_var,
+                                     command=self._toggle_noise_trigger)
+        self._noise_btn.pack(side=tk.LEFT, padx=(20, 0))
 
-        # Admin mode toggle (rightmost)
-        ttk.Button(ctrl, text="Admin Mode", command=self._prompt_admin_password).pack(side=tk.RIGHT)
+        # ── Admin lock button (far right) ─────────────────────────────
+        self._lock_btn_var = tk.StringVar(value="Unlock Admin")
+        ttk.Button(ctrl, textvariable=self._lock_btn_var,
+                   command=self._admin_gate).pack(side=tk.RIGHT)
 
-        # ── Quick Config panel (dummy mode — always visible) ──
-        self._dummy_frame = ttk.LabelFrame(self, text="  ⚡ Quick Config", padding=12, style='Trigger.TLabelframe')
-        self._dummy_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
-        self._dummy_frame.columnconfigure(1, weight=1)
-        self._dummy_qc_status = tk.StringVar(value="Scout ~10 buffers → auto-tune trigger, range & record length")
-        self._dummy_qc_btn = ttk.Button(self._dummy_frame, text="⚡ Run Quick Config", command=self._dummy_quick_config, style='Primary.TButton')
-        self._dummy_qc_btn.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        tk.Label(self._dummy_frame, textvariable=self._dummy_qc_status,
-                 font=("Consolas", 9), fg=T_TEAL, bg=T_BG,
-                 anchor="w", wraplength=500, justify=tk.LEFT).grid(row=0, column=1, sticky="ew")
+        # ── Main content area ─────────────────────────────────────────
+        self._content = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self._content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        left = ttk.Frame(self._content)
+        self._right_frame = ttk.Frame(self._content)
+        self._content.add(left, weight=3)
+        self._content.add(self._right_frame, weight=2)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        self._right_frame.columnconfigure(0, weight=1)
+        self._right_frame.rowconfigure(0, weight=1)
 
-        # ── Dummy mode log (simple) ──
-        self._dummy_log_frame = ttk.LabelFrame(self, text="  Log", padding=6)
-        self._dummy_log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-        self.log = tk.Text(self._dummy_log_frame, wrap="word", state=tk.DISABLED, bg=T_SURFACE, fg=T_GREEN, insertbackground=T_CYAN, font=('Consolas', 9), relief=tk.FLAT, bd=0, padx=6, pady=4)
+        tabs = ttk.Notebook(left)
+        tabs.grid(row=0, column=0, sticky="nsew")
+
+        self.dashboard = LiveDashboard(tabs, self.var_data_dir, on_status=self._on_status_snapshot)
+        tabs.add(self.dashboard, text="Overview")
+
+        logbox = ttk.Frame(tabs, padding=6)
+        tabs.add(logbox, text="Log")
+        self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg=T_SURFACE, fg=T_GREEN, insertbackground=T_CYAN, font=('Consolas', 9), relief=tk.FLAT, bd=0, padx=6, pady=4)
         self.log.pack(fill=tk.BOTH, expand=True)
 
-        # ── Admin content (hidden by default) ──
-        self._admin_content = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        # NOT packed yet — only shown after admin login
-
-        self._admin_left = ttk.Frame(self._admin_content)
-        self._admin_right = ttk.Frame(self._admin_content)
-        self._admin_content.add(self._admin_left, weight=3)
-        self._admin_content.add(self._admin_right, weight=2)
-        self._admin_left.columnconfigure(0, weight=1)
-        self._admin_left.rowconfigure(0, weight=1)
-        self._admin_right.columnconfigure(0, weight=1)
-        self._admin_right.rowconfigure(0, weight=1)
-
-        self._admin_tabs = ttk.Notebook(self._admin_left)
-        self._admin_tabs.grid(row=0, column=0, sticky="nsew")
-
-        self.dashboard = LiveDashboard(self._admin_tabs, self.var_data_dir, on_status=self._on_status_snapshot)
-        self._admin_tabs.add(self.dashboard, text="Overview")
-
-        # Admin log tab shares the same log widget — we move it on mode switch
-        self._admin_logbox = ttk.Frame(self._admin_tabs, padding=6)
-        self._admin_tabs.add(self._admin_logbox, text="Log")
-
-        self.live_panel = LiveControlPanel(self._admin_right, self)
+        self.live_panel = LiveControlPanel(self._right_frame, self)
         self.live_panel.grid(row=0, column=0, sticky="nsew")
 
         self._load_controls_from_yaml()
 
-        # Start in dummy mode — hide admin panels
-        self._top.pack_forget()
+        # ── Start in DUMMY mode — hide admin surfaces ─────────────────
+        self._hide_admin_panels()
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_poll()
 
-    def _prompt_admin_password(self):
-        """Prompt for admin password to unlock full controls."""
-        if self._admin_mode:
-            self._switch_to_dummy_mode()
+    # ── Dummy / Admin mode ──────────────────────────────────────────────
+    def _admin_gate(self):
+        """Toggle between dummy and admin mode.  Requires password to unlock."""
+        if self._admin_unlocked:
+            # Lock back to dummy
+            self._admin_unlocked = False
+            self._hide_admin_panels()
+            self._lock_btn_var.set("Unlock Admin")
+            self._append("[CAPPY] Admin controls locked.")
             return
-        pwd_win = tk.Toplevel(self)
-        pwd_win.title("Admin Login")
-        pwd_win.geometry("320x120")
-        pwd_win.configure(bg=T_BG)
-        pwd_win.transient(self)
-        pwd_win.grab_set()
-        tk.Label(pwd_win, text="Enter admin password:", fg=T_TEXT, bg=T_BG,
-                 font=('Consolas', 10)).pack(pady=(16, 4))
-        pwd_var = tk.StringVar()
-        ent = tk.Entry(pwd_win, textvariable=pwd_var, show="*", width=24,
-                       bg=T_SURFACE, fg=T_TEXT, insertbackground=T_CYAN, font=('Consolas', 10))
-        ent.pack(pady=4)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Admin Unlock")
+        dlg.geometry("310x120")
+        dlg.configure(bg=T_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        tk.Label(dlg, text="Enter admin password:", bg=T_BG, fg=T_TEXT,
+                 font=('Consolas', 10)).pack(pady=(16, 6))
+        pw = tk.StringVar()
+        ent = tk.Entry(dlg, textvariable=pw, show="*", width=22,
+                       bg=T_SURFACE, fg=T_TEXT, insertbackground=T_CYAN,
+                       font=('Consolas', 10))
+        ent.pack()
         ent.focus_set()
-        def _check(_evt=None):
-            if pwd_var.get() == ADMIN_PASSWORD:
-                pwd_win.destroy()
-                self._switch_to_admin_mode()
+        def _try(_e=None):
+            if pw.get() == ADMIN_PASSWORD:
+                dlg.destroy()
+                self._admin_unlocked = True
+                self._show_admin_panels()
+                self._lock_btn_var.set("Lock Admin")
+                self._append("[CAPPY] Admin controls unlocked.")
             else:
-                messagebox.showerror("Access Denied", "Incorrect password.", parent=pwd_win)
-        ent.bind("<Return>", _check)
-        ttk.Button(pwd_win, text="OK", command=_check).pack(pady=4)
+                messagebox.showerror("CAPPY", "Wrong password.", parent=dlg)
+        ent.bind("<Return>", _try)
+        ttk.Button(dlg, text="OK", command=_try).pack(pady=8)
 
-    def _switch_to_admin_mode(self):
-        """Show full admin controls, hide dummy panels."""
-        self._admin_mode = True
-        # Move log widget to admin tab
-        self.log.pack_forget()
-        self._dummy_log_frame.pack_forget()
-        self._dummy_frame.pack_forget()
-        self.log.master = self._admin_logbox
-        self.log.pack(in_=self._admin_logbox, fill=tk.BOTH, expand=True)
-        # Show admin panels
-        self._top.pack(fill=tk.X, before=self.btn.master)
-        self._admin_content.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._append("[CAPPY] Admin mode activated.")
-
-    def _switch_to_dummy_mode(self):
-        """Hide admin controls, show dummy panels."""
-        self._admin_mode = False
-        # Move log widget back to dummy frame
-        self.log.pack_forget()
-        self._admin_content.pack_forget()
-        self._top.pack_forget()
-        self._dummy_frame.pack(fill=tk.X, padx=8, pady=(0, 4), after=self.btn.master)
-        self._dummy_log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8), after=self._dummy_frame)
-        self.log.master = self._dummy_log_frame
-        self.log.pack(in_=self._dummy_log_frame, fill=tk.BOTH, expand=True)
-        self._append("[CAPPY] Switched to simple mode.")
-
-    def _toggle_noise_trigger(self):
-        """Toggle noise-trigger mode. When active, sets trigger to auto-timeout for noise capture."""
-        self._noise_trigger_active = not self._noise_trigger_active
-        if self._noise_trigger_active:
-            self._noise_btn.config(text="Noise Trigger: ON")
-            # Apply noise trigger settings: use auto-timeout trigger
-            cfg_path = Path(self.var_config.get()).expanduser()
-            try:
-                cfg = load_config(cfg_path) if cfg_path.exists() else yaml.safe_load(DEFAULT_YAML)
-                cfg.setdefault("runtime", {})["noise_test"] = True
-                cfg.setdefault("trigger", {})["timeout_ms"] = max(
-                    _to_int(cfg.get("trigger", {}).get("timeout_ms", 0), 0), 10)
-                if hasattr(self, "live_panel") and self.live_panel is not None:
-                    try:
-                        self.live_panel.var_trig_timeout_ms.set(
-                            max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10))
-                    except Exception:
-                        pass
-                self._append("[CAPPY] Noise trigger mode ENABLED — auto-timeout trigger active.")
-            except Exception as ex:
-                self._append(f"[CAPPY] Noise trigger setup error: {ex}")
-        else:
-            self._noise_btn.config(text="Noise Trigger: OFF")
-            try:
-                if hasattr(self, "live_panel") and self.live_panel is not None:
-                    self.live_panel.var_trig_timeout_ms.set(0)
-            except Exception:
-                pass
-            self._append("[CAPPY] Noise trigger mode DISABLED.")
-
-    def _dummy_quick_config(self):
-        """Quick config from dummy mode — delegates to the LiveControlPanel if available."""
-        if hasattr(self, "live_panel") and self.live_panel is not None:
-            try:
-                self.live_panel._quick_config()
-                self._dummy_qc_status.set("Running quick config…")
-                self.after(500, self._poll_dummy_qc)
-            except Exception as ex:
-                self._dummy_qc_status.set(f"Error: {ex}")
-        else:
-            self._dummy_qc_status.set("Quick config unavailable — live panel not loaded.")
-
-    def _poll_dummy_qc(self):
-        """Poll quick config status from live panel and mirror to dummy panel."""
-        if not hasattr(self, "live_panel") or self.live_panel is None:
-            return
+    def _hide_admin_panels(self):
+        """Hide admin-only surfaces (config bar + right-side controls panel)."""
+        self._top_bar.pack_forget()
         try:
-            status = self.live_panel._qc_status_var.get()
-            self._dummy_qc_status.set(status)
-            if self.live_panel._qc_running:
-                self.after(300, self._poll_dummy_qc)
+            self._content.forget(self._right_frame)
         except Exception:
             pass
+
+    def _show_admin_panels(self):
+        """Reveal admin surfaces."""
+        # Re-pack top bar just above the content pane
+        self._top_bar.pack(fill=tk.X, before=self._content)
+        try:
+            self._content.add(self._right_frame, weight=2)
+        except Exception:
+            pass
+
+    def _toggle_noise_trigger(self):
+        """Toggle noise-trigger mode — sets runtime.noise_test + auto-timeout."""
+        self._noise_trigger_on = not self._noise_trigger_on
+        if self._noise_trigger_on:
+            self._noise_btn_var.set("Noise Trigger: ON")
+            # Push noise-trigger settings into the live panel so _start picks them up
+            if hasattr(self, "live_panel") and self.live_panel is not None:
+                try:
+                    self.live_panel.var_trig_timeout_ms.set(
+                        max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10)
+                    )
+                except Exception:
+                    pass
+            self._append("[CAPPY] Noise trigger ON — board will auto-trigger on ambient noise.")
+        else:
+            self._noise_btn_var.set("Noise Trigger: OFF")
+            if hasattr(self, "live_panel") and self.live_panel is not None:
+                try:
+                    self.live_panel.var_trig_timeout_ms.set(0)
+                except Exception:
+                    pass
+            self._append("[CAPPY] Noise trigger OFF — reverting to normal trigger mode.")
 
     def _restore_gui_state(self) -> None:
         try:
@@ -6281,12 +6239,15 @@ class LauncherGUI(tk.Tk):
             run_cfg = dict(base_cfg)
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 run_cfg = self.live_panel.apply_to_cfg(run_cfg)
-            # Inject noise trigger mode if active
-            if getattr(self, "_noise_trigger_active", False):
-                run_cfg.setdefault("runtime", {})["noise_test"] = True
-                trig_cfg = run_cfg.setdefault("trigger", {})
-                trig_cfg["timeout_ms"] = max(_to_int(trig_cfg.get("timeout_ms", 0), 0), 10)
-                self._append("[CAPPY] Noise trigger mode injected into run config.")
+            # ── Noise trigger override ────────────────────────────────
+            if getattr(self, "_noise_trigger_on", False):
+                rt = run_cfg.setdefault("runtime", {}) or {}
+                rt["noise_test"] = True
+                run_cfg["runtime"] = rt
+                trig = run_cfg.setdefault("trigger", {}) or {}
+                trig["timeout_ms"] = max(_to_int(trig.get("timeout_ms", 0), 0), 10)
+                run_cfg["trigger"] = trig
+                self._append("[CAPPY] Noise trigger injected into run config (noise_test=true, timeout_ms≥10).")
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
