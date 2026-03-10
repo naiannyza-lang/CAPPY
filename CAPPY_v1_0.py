@@ -2224,6 +2224,8 @@ def run_capture(cfg_path: Path) -> int:
     pre = int(acq.get("pre_trigger_samples", 0))
     post = int(acq.get("post_trigger_samples", 256))
     spr = pre + post
+    rt0 = cfg.get("runtime", {}) or {}
+    use_npt_mode = bool(rt0.get("noise_test", False))
     rpb = int(acq.get("records_per_buffer", 128))
     bufN = int(acq.get("buffers_allocated", 16))
     bpa = int(acq.get("buffers_per_acquisition", 0))
@@ -2280,7 +2282,9 @@ def run_capture(cfg_path: Path) -> int:
     bytesPerBuffer = bytesPerSample * spr * rpb * ch_count
 
     buffers = [ats.DMABuffer(board.handle, sample_type, bytesPerBuffer) for _ in range(bufN)]
-    board.setRecordSize(pre, post)
+    record_pre = 0 if use_npt_mode else pre
+    record_post = spr if use_npt_mode else post
+    board.setRecordSize(record_pre, record_post)
 
     if bpa <= 0:
         recordsPerAcq = 0
@@ -2331,7 +2335,8 @@ def run_capture(cfg_path: Path) -> int:
         trigger_slope=str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE")),
         trigger_level_code=int(trig.get("levelJ", 128)),
         trigger_timeout_ms=int(trig.get("timeout_ms", 0)),
-        pre_trigger_samples=int(pre),
+        runtime_noise_test=_to_bool((cfg.get("runtime") or {}).get("noise_test", False), False),
+        pre_trigger_samples=int(record_pre),
         live_ring_path=str(ring_path),
         live=dict(
             ring_slots=int(live_cfg.get('ring_slots', ring_nslots)),
@@ -2348,9 +2353,7 @@ def run_capture(cfg_path: Path) -> int:
     notifier.maybe_emit()
 
     # ATS-9462: Use NPT mode for no-signal/noise testing (pretrigger offset must be 0)
-    rt0 = cfg.get("runtime", {}) or {}
-    use_npt_mode = bool(rt0.get("noise_test", False))
-    async_pretrig = 0 if use_npt_mode else -pre
+    async_pretrig = -record_pre
     if use_npt_mode:
         print("[CAPPY] noise_test enabled -> using NPT mode (No Pre-Trigger) for ATS-9462")
         adma_flags = getattr(ats, "ADMA_NPT", None)
@@ -2762,11 +2765,18 @@ def run_capture(cfg_path: Path) -> int:
 #   • graceful cleanup in all paths
 # ---------------------------------------------------------------------------
 
-_QC_BUFFERS = 48          # larger scout for reliable zero-crossing stats
+_QC_BUFFERS = 64          # minimum scout buffers; extend if 100 ms needs more
+_QC_DMA_BUFFERS = 16      # keep scout DMA allocation bounded
+_QC_NOISE_WINDOW_MS = 100 # first 100 ms defines the scout noise reference
 _QC_NOISE_SIGMA = 5.0     # noise floor = median ± N * MAD
-_QC_HEADROOM = 1.20       # 20 % headroom on range selection
-_QC_TAIL_PAD_FRAC = 0.25  # pad record length 25 % beyond mean peak
+_QC_HEADROOM = 1.25       # 25 % headroom on range selection
+_QC_TAIL_PAD_FRAC = 0.30  # pad record length 30 % beyond peak
 _QC_TRIG_FRAC = 0.50      # trigger at 50 % of mean peak on leading edge
+_QC_MIN_ALIGNMENT_RECORDS = 18
+_QC_ZC_SIGMA = 4.0
+_QC_MIN_SIGNAL_SNR = 3.5
+_QC_MIN_PRE_SAMPLES = 4
+_QC_MIN_POST_SAMPLES = 16
 
 # Input ranges ordered by Vpp (ascending) for auto-range selection
 _INPUT_RANGE_VPP_ORDERED: List[Tuple[str, float]] = [
@@ -2782,146 +2792,300 @@ def _qc_analyse_buffers(
     spr: int,
     rpb: int,
     sr_hz: float,
-    vpp: float,
+    vpp: Tuple[float, float],
     ch_count: int,
+    noise_mode: bool = False,
+    noise_window_ms: int = _QC_NOISE_WINDOW_MS,
 ) -> dict:
-    """Zero-crossing aligned analysis — see v1.3 for full docstring."""
-    records: List[np.ndarray] = []
+    need = spr * rpb * max(1, ch_count)
+    a_records: List[np.ndarray] = []
+    b_records: List[np.ndarray] = []
     for raw in bufs:
         try:
-            if ch_count == 2:
-                both = raw.reshape(rpb, spr, 2)
-                recs = both[:, :, 0]
-            else:
-                recs = raw.reshape(rpb, spr)
-            records.append(recs)
+            arr = np.asarray(raw)
         except Exception:
             continue
-    if not records:
+        if arr.size < need:
+            continue
+        try:
+            if ch_count == 2:
+                both = arr.reshape(rpb, spr, 2)
+                a_records.append(both[:, :, 0])
+                b_records.append(both[:, :, 1])
+            else:
+                a_records.append(arr.reshape(rpb, spr))
+        except Exception:
+            continue
+
+    if not a_records:
         return {"error": "no valid buffers captured"}
 
-    all_recs = np.vstack(records)
-    n_recs   = all_recs.shape[0]
-    volts = (all_recs.astype(np.float32) - 32768.0) * (vpp / 65536.0)
+    a_chan = np.vstack(a_records).astype(np.float64)
+    b_chan = np.vstack(b_records).astype(np.float64) if b_records else None
+    noise_window_ms = _clamp_int(noise_window_ms, 10, 5000, _QC_NOISE_WINDOW_MS)
+    ref_samples_target = max(32, int(round(float(sr_hz) * (noise_window_ms / 1000.0))))
 
-    pre_win    = min(64, spr)
-    baselines  = volts[:, :pre_win]
-    median_bl  = float(np.median(baselines))
-    mad        = float(np.median(np.abs(baselines - median_bl)))
-    sigma_est  = 1.4826 * mad if mad > 0 else float(np.std(baselines))
+    def _robust_sigma(samples: np.ndarray) -> float:
+        arr = np.asarray(samples, dtype=np.float64).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return 0.0
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med)))
+        sigma = 1.4826 * mad if mad > 0 else float(np.std(arr))
+        return float(sigma) if np.isfinite(sigma) else 0.0
 
-    rec_maxes  = np.max(volts, axis=1)
-    rec_mins   = np.min(volts, axis=1)
-    peak_pos   = float(np.percentile(rec_maxes, 95))
-    peak_neg   = float(np.percentile(rec_mins, 5))
-    peak_abs   = max(abs(peak_pos - median_bl), abs(peak_neg - median_bl))
+    def _analyse_channel(chan_data: np.ndarray, chan_vpp: float, chan_name: str) -> Optional[dict]:
+        if chan_data.size == 0:
+            return None
+        if chan_data.ndim != 2 or chan_data.shape[1] != spr:
+            return None
 
-    neg_excursion = abs(peak_neg - median_bl)
-    pos_excursion = abs(peak_pos - median_bl)
-    polarity = "negative" if neg_excursion > pos_excursion else "positive"
+        volts = (chan_data - 32768.0) * (float(chan_vpp) / 65536.0)
+        flat = volts.reshape(-1)
+        ref_count = min(flat.size, ref_samples_target)
+        if ref_count <= 0:
+            return None
+        noise_ref = flat[:ref_count]
+        baseline_v = float(np.median(noise_ref))
+        noise = _robust_sigma(noise_ref - baseline_v)
+        if not np.isfinite(noise) or noise <= 0.0:
+            noise = _robust_sigma(flat - baseline_v)
+        if not np.isfinite(noise) or noise <= 0.0:
+            noise = 1e-9
 
-    needed_vpp = 2.0 * peak_abs * _QC_HEADROOM
+        det = volts - baseline_v
+        noise_gate_v = max(float(noise) * _QC_NOISE_SIGMA, 1e-12)
+        if not noise_mode:
+            det = np.where(np.abs(det) >= noise_gate_v, det, 0.0)
+
+        peak_pos = float(np.percentile(np.max(det, axis=1), 95))
+        peak_neg = float(np.percentile(np.min(det, axis=1), 5))
+        pos_exc = abs(peak_pos)
+        neg_exc = abs(peak_neg)
+        polarity = "negative" if neg_exc > pos_exc else "positive"
+        sign = -1.0 if polarity == "negative" else 1.0
+
+        thr = max(_QC_ZC_SIGMA * noise, 2.5 * noise)
+        clip_ratio = np.mean((chan_data <= 16.0) | (chan_data >= 65519.0), axis=1)
+        usable_records: List[np.ndarray] = []
+        usable_cross: List[int] = []
+        usable_peaks: List[int] = []
+        usable_peaks_v: List[float] = []
+        for i in range(det.shape[0]):
+            if float(clip_ratio[i]) > 0.02:
+                continue
+            rec = det[i] * sign
+            if not np.isfinite(rec).all():
+                continue
+            pk = float(np.max(rec))
+            if pk < (_QC_MIN_SIGNAL_SNR * noise):
+                continue
+            nz = np.flatnonzero(rec > thr)
+            if nz.size == 0:
+                continue
+            cx = int(nz[0])
+            if cx < _QC_MIN_PRE_SAMPLES or cx > spr - _QC_MIN_POST_SAMPLES:
+                continue
+            tail = rec[cx:]
+            if np.sum(tail[:3] > thr) < 2:
+                continue
+            peak_rel = int(np.argmax(tail))
+            if peak_rel <= 1:
+                continue
+            usable_records.append(rec)
+            usable_cross.append(cx)
+            usable_peaks.append(peak_rel)
+            usable_peaks_v.append(float(rec[cx + peak_rel]))
+
+        n_usable = len(usable_records)
+        notes: List[str] = []
+        n_recs = det.shape[0]
+        median_baseline = baseline_v if np.isfinite(baseline_v) else 0.0
+
+        if n_usable >= _QC_MIN_ALIGNMENT_RECORDS:
+            mean_cross = int(np.median(np.asarray(usable_cross, dtype=np.int32)))
+            peak_rel_arr = np.asarray(usable_peaks, dtype=np.int32)
+            aligned: List[np.ndarray] = []
+            for rec, cx in zip(usable_records, usable_cross):
+                shift = int(cx - mean_cross)
+                if abs(shift) > spr // 3:
+                    continue
+                n_copy = spr - abs(shift)
+                if n_copy < 16:
+                    continue
+                row = np.full(spr, np.nan, dtype=np.float64)
+                if shift >= 0:
+                    row[:n_copy] = rec[shift:]
+                else:
+                    row[-shift:-shift + n_copy] = rec[:n_copy]
+                aligned.append(row)
+            if len(aligned) >= max(10, _QC_MIN_ALIGNMENT_RECORDS // 2):
+                mean_wave = np.nanmedian(np.asarray(aligned, dtype=np.float64), axis=0)
+                if np.isfinite(np.sum(mean_wave)):
+                    search_start = mean_cross
+                    search_end = int(np.clip(mean_cross + np.percentile(peak_rel_arr, 90), search_start + 4, spr))
+                    if search_end <= search_start + 2:
+                        search_end = spr
+                    wave_seg = mean_wave[search_start:search_end]
+                    wave_seg_f = wave_seg[np.isfinite(wave_seg)]
+                    if wave_seg_f.size:
+                        idx_candidates = np.arange(search_start, search_end)[np.isfinite(wave_seg)]
+                        if idx_candidates.size:
+                            rel_off = int(np.argmax(np.abs(wave_seg_f)))
+                            peak_idx = int(idx_candidates[rel_off])
+                        else:
+                            peak_idx = mean_cross + int(np.percentile(peak_rel_arr, 90))
+                    else:
+                        peak_idx = mean_cross + int(np.percentile(peak_rel_arr, 90))
+                    peak_dev = float(mean_wave[peak_idx]) if np.isfinite(mean_wave[peak_idx]) else float(np.percentile(wave_seg_f, 95))
+                    target_dev = peak_dev * _QC_TRIG_FRAC
+                    lead = mean_wave[search_start:peak_idx + 1]
+                    if lead.size > 0 and np.any(lead >= target_dev):
+                        lead_idx = int(np.flatnonzero(lead >= target_dev)[0])
+                        trig_dev = float(lead[lead_idx])
+                    else:
+                        trig_dev = float(target_dev)
+                    trig_v = median_baseline + sign * trig_dev
+                    peak_dev_med = float(np.median(usable_peaks_v)) if usable_peaks_v else float(np.max(np.abs(det)))
+                    needed_vpp = 2.0 * (abs(median_baseline) + abs(peak_dev_med)) * _QC_HEADROOM
+                    inp_range, inp_vpp = _qc_range_for_peak(needed_vpp)
+                    half_range = inp_vpp / 2.0
+                    trig_pct = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
+                    trig_pct = max(-95.0, min(95.0, trig_pct))
+                    trig_slope = "negative" if polarity == "negative" else "positive"
+                    peak_rel_tail = int(np.percentile(peak_rel_arr, 90))
+                    opt_spr = mean_cross + int((peak_rel_tail + 1) * (1.0 + _QC_TAIL_PAD_FRAC))
+                    opt_spr = max(64, ((opt_spr + 15) // 16) * 16)
+                    opt_spr = max(mean_cross + 16, min(opt_spr, spr))
+                    mean_peak_v = median_baseline + sign * peak_dev
+                    quality = min(1.0, (n_usable / max(_QC_MIN_ALIGNMENT_RECORDS, 1)) * 0.75)
+                    snr = float(np.median(usable_peaks_v) / max(noise, 1e-12))
+                    quality = min(1.0, quality * 0.7 + min(1.0, snr / 10.0) * 0.3)
+                    notes.append(
+                        f"{n_usable} aligned zero-cross records (ch {chan_name}); "
+                        f"mean crossing={mean_cross}; peak_idx={peak_idx}"
+                    )
+                    notes.append(
+                        f"noise {'preserved' if noise_mode else 'cancelled'} from first {noise_window_ms} ms "
+                        f"(gate={noise_gate_v:.4g} V)"
+                    )
+                    return {
+                        "trigger_level_pct": round(trig_pct, 2),
+                        "trigger_slope": trig_slope,
+                        "samples_per_record": opt_spr,
+                        "input_range": inp_range,
+                        "input_range_vpp": inp_vpp,
+                        "peak_v": round(abs(peak_dev_med), 6),
+                        "mean_peak_v": round(abs(mean_peak_v), 6),
+                        "noise_sigma_v": round(noise, 8),
+                        "baseline_v": round(median_baseline, 6),
+                        "active_samples": int(peak_idx),
+                        "total_records": int(n_recs),
+                        "usable_records": n_usable,
+                        "mean_crossing_idx": mean_cross,
+                        "polarity": polarity,
+                        "analysis_channel": chan_name,
+                        "quality_score": round(quality, 3),
+                        "noise_mode_used": bool(noise_mode),
+                        "noise_reference_ms": int(noise_window_ms),
+                        "noise_gate_v": round(noise_gate_v, 8),
+                        "method": "aligned-zc",
+                        "analysis_note": "; ".join(notes) if notes else "OK",
+                    }
+
+        notes.append(f"only {n_usable}/{n_recs} usable records; using envelope fallback")
+        abs_wave = np.median(np.abs(det), axis=0)
+        noise_thr = _QC_NOISE_SIGMA * noise * 0.5
+        active = np.flatnonzero(abs_wave > noise_thr)
+        if active.size > 0:
+            last_active = int(active[-1])
+            opt_spr = int(last_active * (1.0 + _QC_TAIL_PAD_FRAC))
+            opt_spr = max(64, ((opt_spr + 15) // 16) * 16)
+            opt_spr = min(opt_spr, spr)
+        else:
+            opt_spr = spr
+
+        if n_usable >= 1:
+            peak_dev_med = float(np.percentile([float(np.max(det[i] * sign)) for i in range(det.shape[0])], 95))
+        else:
+            peak_dev_med = float(np.percentile(np.max(det * sign, axis=1), 95))
+        trig_v = median_baseline + sign * peak_dev_med * _QC_TRIG_FRAC
+        needed_vpp = max(2.0 * abs(peak_dev_med) * _QC_HEADROOM, 0.04)
+        inp_range, inp_vpp = _qc_range_for_peak(needed_vpp)
+        half_range = inp_vpp / 2.0
+        trig_pct = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
+        trig_pct = max(-95.0, min(95.0, trig_pct))
+        trig_slope = "negative" if polarity == "negative" else "positive"
+        quality = min(0.45, (n_usable / max(_QC_MIN_ALIGNMENT_RECORDS, 1)) * 0.45)
+        if noise < 1e-8:
+            notes.append("noise floor undetectable; signal may be DC or absent")
+        notes.append(
+            f"noise {'preserved' if noise_mode else 'cancelled'} from first {noise_window_ms} ms "
+            f"(gate={noise_gate_v:.4g} V)"
+        )
+
+        return {
+            "trigger_level_pct": round(trig_pct, 2),
+            "trigger_slope": trig_slope,
+            "samples_per_record": opt_spr,
+            "input_range": inp_range,
+            "input_range_vpp": inp_vpp,
+            "peak_v": round(abs(peak_dev_med), 6),
+            "noise_sigma_v": round(noise, 8),
+            "baseline_v": round(median_baseline, 6),
+            "active_samples": int(active[-1]) if active.size else 0,
+            "total_records": int(n_recs),
+            "usable_records": n_usable,
+            "mean_crossing_idx": 0,
+            "polarity": polarity,
+            "analysis_channel": chan_name,
+            "quality_score": round(quality, 3),
+            "noise_mode_used": bool(noise_mode),
+            "noise_reference_ms": int(noise_window_ms),
+            "noise_gate_v": round(noise_gate_v, 8),
+            "method": "envelope-fallback",
+            "analysis_note": "; ".join(notes) if notes else "OK",
+        }
+
+    candidate_a = _analyse_channel(a_chan, float(vpp[0]), chan_name="A")
+    candidates: List[dict] = [c for c in [candidate_a] if c is not None]
+    if b_chan is not None and b_chan.size > 0:
+        candidate_b = _analyse_channel(b_chan, float(vpp[1]), chan_name="B")
+        if candidate_b is not None:
+            candidates.append(candidate_b)
+
+    if not candidates:
+        return {"error": "no valid waveform records detected"}
+    if len(candidates) == 1:
+        result = candidates[0]
+    else:
+        def _score(it: dict) -> float:
+            q = float(it.get("quality_score", 0.0))
+            u = float(it.get("usable_records", 0))
+            t = float(it.get("total_records", 1))
+            p = float(it.get("peak_v", 0.0))
+            return q * 0.7 + 0.3 * min(1.0, u / max(t, 1.0)) + 0.0002 * p
+        result = max(candidates, key=_score)
+        result["candidate_channels"] = [str(c.get("analysis_channel", "A")) for c in candidates]
+        result["analysis_note"] = "; ".join([
+            str(result.get("analysis_note", "OK")),
+            f"multiple channels considered, selected {result.get('analysis_channel', 'A')}"
+        ])
+    result["sample_rate_hz"] = float(sr_hz)
+    result["spr_input"] = int(spr)
+    return result
+
+
+def _qc_range_for_peak(vpp_needed: float) -> Tuple[str, float]:
     best_range = "PM_4_V"
-    best_vpp   = 8.0
+    best_vpp = 8.0
     for rname, rvpp in _INPUT_RANGE_VPP_ORDERED:
-        if rvpp >= needed_vpp:
+        if rvpp >= float(vpp_needed):
             best_range = rname
-            best_vpp   = rvpp
+            best_vpp = rvpp
             break
-
-    threshold = 3.0 * sigma_est
-    crossing_indices: List[int] = []
-    usable_records: List[np.ndarray] = []
-    for i in range(n_recs):
-        rec = volts[i]
-        deviation = np.abs(rec - median_bl)
-        crossings = np.flatnonzero(deviation > threshold)
-        if crossings.size > 0:
-            cx = int(crossings[0])
-            if 4 < cx < spr - 16:
-                crossing_indices.append(cx)
-                usable_records.append(rec)
-
-    n_usable = len(usable_records)
-    notes: List[str] = []
-    method = "zero-cross"
-
-    if n_usable >= 20:
-        mean_cx = int(np.median(crossing_indices))
-        aligned: List[np.ndarray] = []
-        for rec, cx in zip(usable_records, crossing_indices):
-            shift = cx - mean_cx
-            if shift >= 0 and shift + spr - mean_cx <= spr:
-                aligned.append(rec)
-        if len(aligned) >= 10:
-            mean_wave = np.mean(np.array(aligned), axis=0)
-            search_region = mean_wave[mean_cx:]
-            if polarity == "negative":
-                peak_idx_rel = int(np.argmin(search_region))
-                mean_peak_v  = float(search_region[peak_idx_rel])
-            else:
-                peak_idx_rel = int(np.argmax(search_region))
-                mean_peak_v  = float(search_region[peak_idx_rel])
-            peak_idx_abs = mean_cx + peak_idx_rel
-            excursion   = mean_peak_v - median_bl
-            trig_v      = median_bl + excursion * _QC_TRIG_FRAC
-            half_range  = best_vpp / 2.0
-            trig_pct    = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
-            trig_pct    = max(-95.0, min(95.0, trig_pct))
-            trig_slope = "negative" if polarity == "negative" else "positive"
-            cx_to_peak   = peak_idx_rel
-            opt_spr_post = int(cx_to_peak * (1.0 + _QC_TAIL_PAD_FRAC))
-            opt_spr      = mean_cx + opt_spr_post
-            opt_spr      = max(64, ((opt_spr + 15) // 16) * 16)
-            opt_spr      = min(opt_spr, spr)
-            notes.append(f"{n_usable} zero-crossing records; mean crossing={mean_cx}; mean peak @ {peak_idx_abs}")
-            return {
-                "trigger_level_pct": round(trig_pct, 2), "trigger_slope": trig_slope,
-                "samples_per_record": opt_spr, "input_range": best_range,
-                "input_range_vpp": best_vpp, "peak_v": round(peak_abs, 6),
-                "mean_peak_v": round(abs(mean_peak_v), 6),
-                "noise_sigma_v": round(sigma_est, 8), "baseline_v": round(median_bl, 6),
-                "active_samples": peak_idx_abs, "total_records": n_recs,
-                "usable_records": n_usable, "mean_crossing_idx": mean_cx,
-                "polarity": polarity, "method": method,
-                "analysis_note": "; ".join(notes) if notes else "OK",
-            }
-
-    method = "envelope-fallback"
-    notes.append(f"only {n_usable}/{n_recs} zero-crossing records; using envelope fallback")
-    if polarity == "negative":
-        trig_v = median_bl + (peak_neg - median_bl) * _QC_TRIG_FRAC
-    else:
-        trig_v = median_bl + (peak_pos - median_bl) * _QC_TRIG_FRAC
-    half_range = best_vpp / 2.0
-    trig_pct   = (trig_v / half_range) * 100.0 if half_range > 0 else 0.0
-    trig_pct   = max(-95.0, min(95.0, trig_pct))
-    trig_slope = "negative" if polarity == "negative" else "positive"
-    avg_wave = np.mean(np.abs(volts - median_bl), axis=0)
-    noise_thr = _QC_NOISE_SIGMA * sigma_est * 0.5
-    active_mask = avg_wave > noise_thr
-    active_idxs = np.flatnonzero(active_mask)
-    if active_idxs.size > 0:
-        last_active = int(active_idxs[-1])
-        opt_spr = int(last_active * (1.0 + _QC_TAIL_PAD_FRAC))
-        opt_spr = max(64, ((opt_spr + 15) // 16) * 16)
-        opt_spr = min(opt_spr, spr)
-    else:
-        opt_spr = spr
-    if sigma_est < 1e-8:
-        notes.append("noise floor undetectable")
-    if peak_abs < sigma_est * 3:
-        notes.append("signal amplitude very close to noise")
-    return {
-        "trigger_level_pct": round(trig_pct, 2), "trigger_slope": trig_slope,
-        "samples_per_record": opt_spr, "input_range": best_range,
-        "input_range_vpp": best_vpp, "peak_v": round(peak_abs, 6),
-        "noise_sigma_v": round(sigma_est, 8), "baseline_v": round(median_bl, 6),
-        "active_samples": int(active_idxs[-1]) if active_idxs.size else 0,
-        "total_records": n_recs, "usable_records": n_usable,
-        "polarity": polarity, "method": method,
-        "analysis_note": "; ".join(notes) if notes else "OK",
-    }
+    return best_range, best_vpp
 
 
 def run_quick_config(cfg_path: Path) -> int:
@@ -2944,13 +3108,18 @@ def run_quick_config(cfg_path: Path) -> int:
 
     acq  = cfg.get("acquisition", {})
     trig = cfg.get("trigger", {})
+    rt   = cfg.get("runtime", {}) or {}
 
     pre  = int(acq.get("pre_trigger_samples", 0))
     post = int(acq.get("post_trigger_samples", 256))
     spr  = pre + post
     rpb  = int(acq.get("records_per_buffer", 128))
-    bufN = max(4, _QC_BUFFERS + 2)  # allocate a few spare DMA buffers
     ch_expr = str(acq.get("channels_mask", "CHANNEL_A"))
+    qc_noise_mode = bool(rt.get("noise_test", False))
+    qc_noise_window_ms = _clamp_int(
+        rt.get("quick_config_noise_window_ms", _QC_NOISE_WINDOW_MS),
+        10, 5000, _QC_NOISE_WINDOW_MS,
+    )
 
     binfo = cfg.get("board", {}) if isinstance(cfg, dict) else {}
     systemId = int(binfo.get("system_id", 2))
@@ -2971,16 +3140,31 @@ def run_quick_config(cfg_path: Path) -> int:
         print(json.dumps({"error": f"configure_board failed: {ex}"}))
         return 2
 
+    samples_per_buffer = max(1, spr * rpb)
+    scout_samples_target = max(samples_per_buffer, int(round(float(sr_hz) * (qc_noise_window_ms / 1000.0))))
+    scout_buffers = max(_QC_BUFFERS, int(np.ceil(float(scout_samples_target) / float(samples_per_buffer))))
+    bufN = max(4, min(_QC_DMA_BUFFERS, scout_buffers + 2))
+
     try:
+        qc_source = str(trig.get("sourceJ", "TRIG_CHAN_A"))
+        if qc_source not in {"TRIG_CHAN_A", "TRIG_CHAN_B", "TRIG_EXTERNAL"}:
+            qc_source = "TRIG_CHAN_A"
+        qc_level = _clamp_int(trig.get("levelJ", 128), 0, 255, 128)
+        qc_slope = str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE"))
+        if qc_slope not in {"TRIGGER_SLOPE_POSITIVE", "TRIGGER_SLOPE_NEGATIVE"}:
+            qc_slope = "TRIGGER_SLOPE_POSITIVE"
         board.setTriggerOperation(
             ats.TRIG_ENGINE_OP_J,
-            ats.TRIG_ENGINE_J, ats.TRIG_CHAN_A,
-            ats.TRIGGER_SLOPE_POSITIVE, 128,
+            ats.TRIG_ENGINE_J, getattr(ats, qc_source, ats.TRIG_CHAN_A),
+            getattr(ats, qc_slope, ats.TRIGGER_SLOPE_POSITIVE), qc_level,
             ats.TRIG_ENGINE_K, ats.TRIG_DISABLE,
             ats.TRIGGER_SLOPE_POSITIVE, 128,
         )
         board.setTriggerTimeOut(100)
-        print("[QC] forced trigger: source=CHAN_A level=128 timeout=100 (1ms auto-trigger)", flush=True)
+        print(
+            f"[QC] forced trigger: source={qc_source} level={qc_level} slope={qc_slope} timeout=100",
+            flush=True,
+        )
     except Exception as ex:
         print(f"[QC] warning: trigger override failed: {ex}", flush=True)
 
@@ -2992,12 +3176,13 @@ def run_quick_config(cfg_path: Path) -> int:
     bpBuf    = bpS * spr * rpb * ch_count
 
     buffers = [ats.DMABuffer(board.handle, stype, bpBuf) for _ in range(bufN)]
-    board.setRecordSize(pre, post)
+    board.setRecordSize(0, spr)
 
-    recs_per_acq = rpb * _QC_BUFFERS  # finite acquisition
-    adma_flags   = ats.ADMA_TRADITIONAL_MODE
-
-    board.beforeAsyncRead(ch_mask, -pre, spr, rpb, recs_per_acq, adma_flags)
+    recs_per_acq = rpb * scout_buffers
+    adma_flags = getattr(ats, "ADMA_NPT", None)
+    if adma_flags is None:
+        adma_flags = getattr(ats, "ADMA_NPT_MODE", ats.ADMA_TRADITIONAL_MODE)
+    board.beforeAsyncRead(ch_mask, 0, spr, rpb, recs_per_acq, adma_flags)
     for b in buffers:
         board.postAsyncBuffer(b.addr, b.size_bytes)
 
@@ -3006,11 +3191,15 @@ def run_quick_config(cfg_path: Path) -> int:
     # Use a generous timeout for the scout capture
     wt_ms = max(wt_ms, 10000)
 
-    print(f"[QC] capturing {_QC_BUFFERS} buffers (spr={spr} rpb={rpb} ch={ch_count})…", flush=True)
+    print(
+        f"[QC] capturing {scout_buffers} NPT scout buffers (spr={spr} rpb={rpb} ch={ch_count} "
+        f"noise_mode={'on' if qc_noise_mode else 'off'} ref={qc_noise_window_ms}ms)…",
+        flush=True,
+    )
     board.startCapture()
 
     try:
-        for bi in range(_QC_BUFFERS):
+        for bi in range(scout_buffers):
             buf = buffers[bi % bufN]
             try:
                 board.waitAsyncBufferComplete(buf.addr, timeout_ms=wt_ms)
@@ -3023,7 +3212,7 @@ def run_quick_config(cfg_path: Path) -> int:
             raw = np.array(buf.buffer, copy=True)
             captured.append(raw)
             board.postAsyncBuffer(buf.addr, buf.size_bytes)
-            print(f"[QC] buffer {bi+1}/{_QC_BUFFERS} OK", flush=True)
+            print(f"[QC] buffer {bi+1}/{scout_buffers} OK", flush=True)
     finally:
         try:
             board.abortAsyncRead()
@@ -3034,8 +3223,16 @@ def run_quick_config(cfg_path: Path) -> int:
         print(json.dumps({"error": "no buffers captured — check trigger or signal"}))
         return 1
 
-    result = _qc_analyse_buffers(captured, spr, rpb, sr_hz, vppA, ch_count)
+    result = _qc_analyse_buffers(
+        captured, spr, rpb, sr_hz, (vppA, vppB), ch_count,
+        noise_mode=qc_noise_mode,
+        noise_window_ms=qc_noise_window_ms,
+    )
     result["scout_buffers"] = len(captured)
+    result["scout_buffers_target"] = scout_buffers
+    result["scout_mode"] = "NPT"
+    result["noise_mode"] = qc_noise_mode
+    result["noise_reference_ms"] = qc_noise_window_ms
     result["sample_rate_hz"] = sr_hz
     result["current_vpp"] = vppA
 
@@ -4132,8 +4329,10 @@ class LiveDashboard(ttk.Frame):
     def _is_scope_mode(self, snap: dict) -> bool:
         """
         Use trigger-locked scope display for hardware-triggered runs.
-        Keep scrolling stream mode for auto-trigger/noise-test captures.
+        Keep scrolling stream mode for non-triggered captures.
         """
+        if _to_bool(snap.get("runtime_noise_test", False), False):
+            return True
         timeout_ms = _to_int(snap.get("trigger_timeout_ms", 0), 0)
         if timeout_ms > 0:
             return False
@@ -5049,7 +5248,7 @@ class LiveControlPanel(ttk.Frame):
         qc.grid(row=5, column=0, sticky="ew", pady=(0, 8))
         qc.columnconfigure(1, weight=1)
 
-        self._qc_status_var = tk.StringVar(value="Scout ~10 buffers → auto-tune trigger, range & record length")
+        self._qc_status_var = tk.StringVar(value="NPT scout (>=100 ms) → auto-tune trigger, range & record length")
         self._qc_running    = False
         self._qc_proc       = None
 
@@ -5233,12 +5432,14 @@ class LiveControlPanel(ttk.Frame):
         try:
             base_cfg = load_config(cfg_path)
             run_cfg  = self.apply_to_cfg(dict(base_cfg))
+            noise_mode = bool(self.var_noise_mode.get())
             # Force a finite, quick acquisition
             acq = run_cfg.setdefault("acquisition", {})
             trig = run_cfg.setdefault("trigger", {})
             runtime = run_cfg.setdefault("runtime", {})
             acq["buffers_per_acquisition"] = _QC_BUFFERS
-            runtime["noise_test"] = True
+            runtime["noise_test"] = noise_mode
+            runtime["quick_config_noise_window_ms"] = _QC_NOISE_WINDOW_MS
             runtime["autotrigger_timeout_ms"] = max(
                 _to_int(runtime.get("autotrigger_timeout_ms", 10), 10), 10)
             trig["timeout_ms"] = max(
@@ -5278,7 +5479,7 @@ class LiveControlPanel(ttk.Frame):
 
         self._qc_running = True
         self._qc_btn.configure(state=tk.DISABLED)
-        self._qc_status_var.set("⏳ Capturing scout buffers…")
+        self._qc_status_var.set("⏳ Capturing NPT scout buffers…")
         self._qc_detail_var.set("")
         self._qc_lines: List[str] = []
         self.after(150, self._qc_poll)
@@ -5356,6 +5557,8 @@ class LiveControlPanel(ttk.Frame):
         trig_pct   = float(result.get("trigger_level_pct", 0.0))
         opt_spr    = int(result.get("samples_per_record", 256))
         opt_range  = str(result.get("input_range", "PM_1_V"))
+        qc_chan    = str(result.get("analysis_channel", "A")).upper()
+        qc_score   = float(result.get("quality_score", 0.0))
         peak_v     = float(result.get("peak_v", 0.0))
         noise_v    = float(result.get("noise_sigma_v", 0.0))
         note       = str(result.get("analysis_note", ""))
@@ -5370,7 +5573,11 @@ class LiveControlPanel(ttk.Frame):
 
         self.var_trig_level_pct.set(round(trig_pct, 1))
         self.var_samples_per_record.set(opt_spr)
-        self.var_range_a.set(opt_range)
+        ch_mask = channels_from_mask_expr(self._var_text(self.var_channels_mask, "CHANNEL_A"))
+        if qc_chan == "B" and (ch_mask & 0x2):
+            self.var_range_b.set(opt_range)
+        else:
+            self.var_range_a.set(opt_range)
         if trig_slope == "negative":
             self.var_trig_slope.set("Negative")
         elif trig_slope == "positive":
@@ -5381,6 +5588,8 @@ class LiveControlPanel(ttk.Frame):
         self._qc_status_var.set(
             f"✓ Applied: trigger={trig_pct:+.1f}%  spr={opt_spr}  range={opt_range}"
             f"  slope={'neg' if trig_slope == 'negative' else 'pos'}"
+            f"  channel={qc_chan}"
+            f"  conf={qc_score:.2f}"
         )
         self._qc_detail_var.set(
             f"peak={peak_v:.4g} V  noise σ={noise_v:.2g} V  "
@@ -6036,7 +6245,7 @@ class LauncherGUI(tk.Tk):
         self.lbl = ttk.Label(ctrl, text="State: idle", foreground=T_TEXT_DIM, font=('Consolas', 10))
         self.lbl.pack(side=tk.LEFT, padx=(16,0))
 
-        self._noise_btn_var = tk.StringVar(value="Noise Trigger: OFF")
+        self._noise_btn_var = tk.StringVar(value="Noise mode: OFF")
         self._noise_btn = ttk.Button(ctrl, textvariable=self._noise_btn_var,
                                      command=self._toggle_noise_trigger)
         self._noise_btn.pack(side=tk.LEFT, padx=(20, 0))
@@ -6185,22 +6394,22 @@ class LauncherGUI(tk.Tk):
     def _toggle_noise_trigger(self):
         self._noise_trigger_on = not self._noise_trigger_on
         if self._noise_trigger_on:
-            self._noise_btn_var.set("Noise Trigger: ON")
+            self._noise_btn_var.set("Noise mode: ON")
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
                     self.live_panel.var_trig_timeout_ms.set(
                         max(self.live_panel._safe_int(self.live_panel.var_trig_timeout_ms, 0), 10))
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger ON — auto-trigger on ambient noise.")
+            self._append("[CAPPY] Noise mode ON — auto-trigger on ambient noise.")
         else:
-            self._noise_btn_var.set("Noise Trigger: OFF")
+            self._noise_btn_var.set("Noise mode: OFF")
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 try:
                     self.live_panel.var_trig_timeout_ms.set(0)
                 except Exception:
                     pass
-            self._append("[CAPPY] Noise trigger OFF — normal trigger mode.")
+            self._append("[CAPPY] Noise mode OFF — normal trigger mode.")
 
     def _save_session_settings_json(self, run_cfg: dict, run_cfg_path: Path):
         try:
@@ -6404,6 +6613,11 @@ class LauncherGUI(tk.Tk):
             cfg = load_config(cfg_path)
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 self.live_panel.load_from_cfg(cfg)
+            rt = cfg.get("runtime", {}) if isinstance(cfg, dict) else {}
+            if not isinstance(rt, dict):
+                rt = {}
+            self._noise_trigger_on = bool(rt.get("noise_test", False))
+            self._noise_btn_var.set("Noise mode: ON" if self._noise_trigger_on else "Noise mode: OFF")
             storage = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
             if isinstance(storage, dict) and storage.get("data_dir"):
                 self.var_data_dir.set(str(storage.get("data_dir")))
@@ -6584,7 +6798,7 @@ class LauncherGUI(tk.Tk):
                 trig["allow_autotrigger_with_external"] = True
                 trig["external_startcapture"] = False
                 run_cfg["trigger"] = trig
-                self._append("[CAPPY] Noise trigger: source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
+                self._append("[CAPPY] Noise mode: source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
