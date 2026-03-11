@@ -2202,6 +2202,80 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
 
     return sr_hz, float(vpp_A), float(vpp_B)
 
+
+def _resolve_npt_trigger_settings(
+    trig: Optional[dict],
+    runtime: Optional[dict] = None,
+    *,
+    fallback_source: str = "TRIG_CHAN_A",
+    force_analog_source: bool = False,
+) -> Tuple[str, str, int, int]:
+    t = trig or {}
+    rt = runtime or {}
+
+    source = str(t.get("sourceJ", fallback_source) or fallback_source).strip()
+    if source not in {"TRIG_CHAN_A", "TRIG_CHAN_B", "TRIG_EXTERNAL"}:
+        source = fallback_source
+    if force_analog_source and source == "TRIG_EXTERNAL":
+        source = fallback_source
+
+    slope = str(t.get("slopeJ", "TRIGGER_SLOPE_POSITIVE") or "TRIGGER_SLOPE_POSITIVE").strip()
+    if slope not in {"TRIGGER_SLOPE_POSITIVE", "TRIGGER_SLOPE_NEGATIVE"}:
+        slope = "TRIGGER_SLOPE_POSITIVE"
+
+    level = _clamp_int(t.get("levelJ", 128), 0, 255, 128)
+    if source == "TRIG_EXTERNAL":
+        if slope == "TRIGGER_SLOPE_POSITIVE" and level < 128:
+            level = 128
+        elif slope == "TRIGGER_SLOPE_NEGATIVE" and level > 128:
+            level = 128
+
+    timeout_ticks = max(
+        _to_int(t.get("timeout_ms", 0), 0),
+        _to_int(rt.get("autotrigger_timeout_ms", 0), 0),
+        10,
+    )
+    return source, slope, level, timeout_ticks
+
+
+def _apply_npt_trigger_override(
+    board: Any,
+    trig: Optional[dict],
+    runtime: Optional[dict] = None,
+    *,
+    log_prefix: str = "[CAPPY]",
+    fallback_source: str = "TRIG_CHAN_A",
+    force_analog_source: bool = False,
+) -> Dict[str, int]:
+    source, slope, level, timeout_ticks = _resolve_npt_trigger_settings(
+        trig,
+        runtime,
+        fallback_source=fallback_source,
+        force_analog_source=force_analog_source,
+    )
+    board.setTriggerOperation(
+        ats.TRIG_ENGINE_OP_J,
+        ats.TRIG_ENGINE_J,
+        getattr(ats, source, ats.TRIG_CHAN_A),
+        getattr(ats, slope, ats.TRIGGER_SLOPE_POSITIVE),
+        level,
+        ats.TRIG_ENGINE_K,
+        ats.TRIG_DISABLE,
+        ats.TRIGGER_SLOPE_POSITIVE,
+        128,
+    )
+    board.setTriggerTimeOut(timeout_ticks)
+    print(
+        f"{log_prefix} forced trigger: source={source} level={level} slope={slope} timeout={timeout_ticks}",
+        flush=True,
+    )
+    return {
+        "sourceJ": source,
+        "slopeJ": slope,
+        "levelJ": level,
+        "timeout_ticks": timeout_ticks,
+    }
+
 def _should_stop() -> bool:
     if STOP_REQUESTED:
         return True
@@ -2366,6 +2440,30 @@ def run_capture(cfg_path: Path) -> int:
     ring_path = Path(str(storage.get('data_dir', 'dataFile'))) / 'status' / 'live_waveforms.ring'
     ring = LiveRingWriter(ring_path, nslots=ring_nslots, npts=ring_npts)
 
+    use_npt_mode = bool(rt.get("noise_test", False))
+    async_pretrig = -record_pre
+    trigger_source_live = str(trig.get("sourceJ", "TRIG_EXTERNAL"))
+    trigger_slope_live = str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE"))
+    trigger_level_live = int(trig.get("levelJ", 128))
+    trigger_timeout_live = int(trig.get("timeout_ms", 0))
+    if use_npt_mode:
+        print("[CAPPY] noise_test enabled -> using NPT mode (No Pre-Trigger)")
+        try:
+            forced = _apply_npt_trigger_override(board, trig, rt, log_prefix="[CAPPY]")
+            trigger_source_live = str(forced.get("sourceJ", trigger_source_live))
+            trigger_slope_live = str(forced.get("slopeJ", trigger_slope_live))
+            trigger_level_live = int(forced.get("levelJ", trigger_level_live))
+            trigger_timeout_live = int(forced.get("timeout_ticks", trigger_timeout_live))
+        except Exception as e:
+            print(f"[CAPPY] Warning: NPT trigger override failed: {e}")
+        adma_flags = getattr(ats, "ADMA_NPT", None)
+        if adma_flags is None:
+            adma_flags = getattr(ats, "ADMA_NPT_MODE", ats.ADMA_TRADITIONAL_MODE)
+    else:
+        adma_flags = ats.ADMA_TRADITIONAL_MODE
+    if bool(trig.get("external_startcapture", False)):
+        adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
+
     notifier.update(
         session_id=sid,
         state='running',
@@ -2378,12 +2476,14 @@ def run_capture(cfg_path: Path) -> int:
         records_per_buffer=rpb,
         vpp_A=vppA,
         vpp_B=vppB,
-        trigger_source=str(trig.get("sourceJ", "TRIG_EXTERNAL")),
-        trigger_slope=str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE")),
-        trigger_level_code=int(trig.get("levelJ", 128)),
-        trigger_timeout_ms=int(trig.get("timeout_ms", 0)),
+        trigger_source=trigger_source_live,
+        trigger_slope=trigger_slope_live,
+        trigger_level_code=trigger_level_live,
+        trigger_timeout_ms=trigger_timeout_live,
         runtime_noise_test=_to_bool(rt.get("noise_test", False), False),
         pre_trigger_samples=int(record_pre),
+        baseline_window_samples=[int(b0), int(b1)],
+        integral_window_samples=[int(g0), int(g1)],
         live_ring_path=str(ring_path),
         live=dict(
             ring_slots=int(live_cfg.get('ring_slots', ring_nslots)),
@@ -2398,18 +2498,6 @@ def run_capture(cfg_path: Path) -> int:
         ),
     )
     notifier.maybe_emit()
-
-    use_npt_mode = bool(rt.get("noise_test", False))
-    async_pretrig = -record_pre
-    if use_npt_mode:
-        print("[CAPPY] noise_test enabled -> using NPT mode (No Pre-Trigger)")
-        adma_flags = getattr(ats, "ADMA_NPT", None)
-        if adma_flags is None:
-            adma_flags = getattr(ats, "ADMA_NPT_MODE", ats.ADMA_TRADITIONAL_MODE)
-    else:
-        adma_flags = ats.ADMA_TRADITIONAL_MODE
-    if bool(trig.get("external_startcapture", False)):
-        adma_flags |= ats.ADMA_EXTERNAL_STARTCAPTURE
     board.beforeAsyncRead(ch_mask, async_pretrig, spr, rpb, recordsPerAcq, adma_flags)
 
     for b in buffers:
@@ -3184,31 +3272,23 @@ def run_quick_config(cfg_path: Path) -> int:
         print(json.dumps({"error": f"configure_board failed: {ex}"}))
         return 2
 
-    samples_per_buffer = max(1, spr * rpb)
-    scout_samples_target = max(samples_per_buffer, int(round(float(sr_hz) * (qc_noise_window_ms / 1000.0))))
-    scout_buffers = max(_QC_BUFFERS, int(np.ceil(float(scout_samples_target) / float(samples_per_buffer))))
-    bufN = max(4, min(_QC_DMA_BUFFERS, scout_buffers + 2))
+    # Compute how many buffers needed to cover the noise window.
+    # Cap at _QC_BUFFERS_MAX to bound memory and loop time regardless of sample rate.
+    _QC_BUFFERS_MAX = 256
+    samples_per_buffer_per_ch = max(1, spr * rpb)
+    scout_samples_target = max(samples_per_buffer_per_ch,
+                               int(round(float(sr_hz) * (qc_noise_window_ms / 1000.0))))
+    scout_buffers = max(_QC_BUFFERS,
+                        min(_QC_BUFFERS_MAX,
+                            int(np.ceil(float(scout_samples_target)
+                                        / float(samples_per_buffer_per_ch)))))
+    # ATS-9462 NPT: NEVER post all scout_buffers upfront — the board fills them
+    # instantly and overflows before Python reaches waitAsyncBufferComplete.
+    # Use a small fixed DMA ring and recycle each buffer immediately after draining it.
+    bufN = 8
 
     try:
-        qc_source = str(trig.get("sourceJ", "TRIG_CHAN_A"))
-        if qc_source not in {"TRIG_CHAN_A", "TRIG_CHAN_B", "TRIG_EXTERNAL"}:
-            qc_source = "TRIG_CHAN_A"
-        qc_level = _clamp_int(trig.get("levelJ", 128), 0, 255, 128)
-        qc_slope = str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE"))
-        if qc_slope not in {"TRIGGER_SLOPE_POSITIVE", "TRIGGER_SLOPE_NEGATIVE"}:
-            qc_slope = "TRIGGER_SLOPE_POSITIVE"
-        board.setTriggerOperation(
-            ats.TRIG_ENGINE_OP_J,
-            ats.TRIG_ENGINE_J, getattr(ats, qc_source, ats.TRIG_CHAN_A),
-            getattr(ats, qc_slope, ats.TRIGGER_SLOPE_POSITIVE), qc_level,
-            ats.TRIG_ENGINE_K, ats.TRIG_DISABLE,
-            ats.TRIGGER_SLOPE_POSITIVE, 128,
-        )
-        board.setTriggerTimeOut(1000)  # 1000 × 10µs = 10ms auto-trigger fallback
-        print(
-            f"[QC] forced trigger: source={qc_source} level={qc_level} slope={qc_slope} timeout=1000",
-            flush=True,
-        )
+        _apply_npt_trigger_override(board, trig, rt, log_prefix="[QC]")
     except Exception as ex:
         print(f"[QC] warning: trigger override failed: {ex}", flush=True)
 
@@ -3220,6 +3300,7 @@ def run_quick_config(cfg_path: Path) -> int:
     bpBuf    = bpS * spr * rpb * ch_count
 
     buffers = [ats.DMABuffer(board.handle, stype, bpBuf) for _ in range(bufN)]
+    print(f"[QC] DMA ring: {bufN} buffers allocated for {scout_buffers} scout buffers", flush=True)
     board.setRecordSize(0, spr)
 
     # ATS-9462: NPT mode requires unlimited record count (0x7FFFFFFF).
@@ -3233,9 +3314,13 @@ def run_quick_config(cfg_path: Path) -> int:
     for b in buffers:
         board.postAsyncBuffer(b.addr, b.size_bytes)
 
-    captured: List[np.ndarray] = []
+    # Pre-allocate output array — avoids per-buffer list.append + copy overhead
+    # which causes latency spikes that overflow the DMA ring at high sample rates.
+    samples_per_buf = spr * rpb * ch_count
+    captured_arr = np.empty((scout_buffers, samples_per_buf), dtype=np.uint16)
+    n_captured = 0
+
     wt_ms = int(acq.get("wait_timeout_ms", 5000))
-    # Use a generous timeout for the scout capture
     wt_ms = max(wt_ms, 10000)
 
     print(
@@ -3256,15 +3341,20 @@ def run_quick_config(cfg_path: Path) -> int:
                 print(f"[QC] timeout/error on buffer {bi}: {ex}", flush=True)
                 break
 
-            raw = np.array(buf.buffer, copy=True)
-            captured.append(raw)
+            # Copy directly into pre-allocated row — no list append, no extra alloc
+            np.copyto(captured_arr[n_captured], np.frombuffer(buf.buffer, dtype=np.uint16)[:samples_per_buf])
+            n_captured += 1
             board.postAsyncBuffer(buf.addr, buf.size_bytes)
-            print(f"[QC] buffer {bi+1}/{scout_buffers} OK", flush=True)
+            if bi == 0 or (bi + 1) % 64 == 0 or (bi + 1) == scout_buffers:
+                print(f"[QC] buffer {bi+1}/{scout_buffers} OK", flush=True)
     finally:
         try:
             board.abortAsyncRead()
         except Exception:
             pass
+
+    # Convert back to list-of-arrays format expected by _qc_analyse_buffers
+    captured = [captured_arr[i] for i in range(n_captured)]
 
     if not captured:
         print(json.dumps({"error": "no buffers captured — check trigger or signal"}))
@@ -4197,6 +4287,7 @@ class LiveDashboard(ttk.Frame):
         self._ring_play_seq = 0
         self._ring_nslots = 0
         self._ring_session_id: str = ""
+        self._status_session_id: str = ""
 
         # rolling history (x in seconds since capture start, to-scale)
         self.t: list[float] = []
@@ -4273,8 +4364,8 @@ class LiveDashboard(ttk.Frame):
         # Create persistent line artists (no ax.clear() needed)
         (self._lineA,) = self.ax_wfA.plot([], [], color=T_CYAN, linewidth=0.9, antialiased=False)
         (self._lineB,) = self.ax_wfB.plot([], [], color=T_GOLD, linewidth=0.9, antialiased=False)
-        (self._lineIA,) = self.ax_int.plot([], [], color=T_GREEN, linewidth=1.2, antialiased=False, label="Mean integral A (V·s)")
-        (self._lineIB,) = self.ax_int.plot([], [], color=T_GOLD, linewidth=1.2, linestyle="--", antialiased=False, label="Mean integral B (V·s)")
+        (self._lineIA,) = self.ax_int.plot([], [], color=T_GREEN, linewidth=1.2, antialiased=False, label="Live integral A (V·s)")
+        (self._lineIB,) = self.ax_int.plot([], [], color=T_GOLD, linewidth=1.2, linestyle="--", antialiased=False, label="Live integral B (V·s)")
 
         # Style axes once (not on every redraw)
         for ax, ylabel, ycolor in [
@@ -4408,7 +4499,94 @@ class LiveDashboard(ttk.Frame):
         src = str(snap.get("trigger_source", "") or "").strip().upper()
         return src in {"TRIG_EXTERNAL", "TRIG_CHAN_A", "TRIG_CHAN_B"}
 
+    def _reset_status_history(self, session_id: str = "", started_unix: Optional[float] = None) -> None:
+        self.t.clear()
+        self.areaA.clear()
+        self.areaB.clear()
+        self._rate_history.clear()
+        self._last_seen_seq = 0
+        self._status_session_id = str(session_id or "")
+        self._started_unix = float(started_unix) if started_unix is not None else None
+
+    def _compute_live_area(self, wf: Optional[np.ndarray], snap: dict) -> float:
+        if wf is None:
+            return 0.0
+        vals = np.asarray(wf, dtype=np.float64)
+        n = int(vals.size)
+        if n <= 0 or not np.isfinite(vals).any():
+            return 0.0
+
+        sr_hz = _to_float(snap.get("sample_rate_hz", 0.0), 0.0)
+        spr = max(1, _to_int(snap.get("samples_per_record", n), n))
+        if sr_hz <= 0:
+            return 0.0
+
+        bwin = snap.get("baseline_window_samples", [0, min(64, spr)])
+        iwin = snap.get("integral_window_samples", [min(64, spr), min(128, spr)])
+        try:
+            b0, b1 = [int(x) for x in list(bwin)[:2]]
+        except Exception:
+            b0, b1 = 0, min(64, spr)
+        try:
+            g0, g1 = [int(x) for x in list(iwin)[:2]]
+        except Exception:
+            g0, g1 = min(64, spr), min(128, spr)
+
+        def _scaled_window(start: int, stop: int) -> Tuple[int, int]:
+            s = int(round(float(start) * float(n) / float(max(1, spr))))
+            e = int(round(float(stop) * float(n) / float(max(1, spr))))
+            s = max(0, min(s, max(0, n - 1)))
+            e = max(s + 1, min(e, n))
+            return s, e
+
+        rb0, rb1 = _scaled_window(b0, b1)
+        rg0, rg1 = _scaled_window(g0, g1)
+        baseline = float(np.mean(vals[rb0:rb1], dtype=np.float64))
+        dt = (float(spr) / float(sr_hz)) / float(max(1, n))
+        return float(np.sum(vals[rg0:rg1] - baseline, dtype=np.float64) * dt)
+
+    def _append_live_area_point(
+        self,
+        snap: dict,
+        wf_t_unix: Optional[float],
+        wfA: Optional[np.ndarray],
+        wfB: Optional[np.ndarray],
+    ) -> bool:
+        if wf_t_unix is None or self._started_unix is None:
+            return False
+        t = float(wf_t_unix) - float(self._started_unix)
+        if self.t and t < (self.t[-1] - 1e-9):
+            return False
+
+        self.t.append(t)
+        self.areaA.append(self._compute_live_area(wfA, snap))
+        self.areaB.append(self._compute_live_area(wfB, snap))
+
+        while self.t and (self.t[-1] - self.t[0]) > 600.0:
+            self.t.pop(0)
+            self.areaA.pop(0)
+            self.areaB.pop(0)
+        return True
+
     def _append_point(self, snap: dict) -> bool:
+        sid = str(snap.get("session_id", "") or "")
+        su = snap.get("started_unix", None)
+        started_now: Optional[float] = None
+        if su is not None:
+            try:
+                started_now = float(su)
+            except Exception:
+                started_now = None
+
+        if sid and sid != self._status_session_id:
+            self._reset_status_history(session_id=sid, started_unix=started_now)
+        elif (
+            started_now is not None
+            and self._started_unix is not None
+            and abs(float(started_now) - float(self._started_unix)) > 1e-6
+        ):
+            self._reset_status_history(session_id=sid, started_unix=started_now)
+
         seq = snap.get("status_seq", None)
         if seq is None:
             return False
@@ -4420,11 +4598,10 @@ class LiveDashboard(ttk.Frame):
             return False
         self._last_seen_seq = seq
 
-        su = snap.get("started_unix", None)
         tu = snap.get("status_unix", None)
-        if su is not None:
+        if started_now is not None:
             try:
-                self._started_unix = float(su)
+                self._started_unix = float(started_now)
             except Exception:
                 pass
         if self._started_unix is None and tu is not None:
@@ -4434,14 +4611,6 @@ class LiveDashboard(ttk.Frame):
                 pass
         if self._started_unix is None or tu is None:
             return False
-
-        t = float(tu) - float(self._started_unix)
-        self.t.append(t)
-        self.areaA.append(float(snap.get("buffer_mean_area_A", 0.0)))
-        self.areaB.append(float(snap.get("buffer_mean_area_B", 0.0)))
-
-        while self.t and (self.t[-1] - self.t[0]) > 600.0:
-            self.t.pop(0); self.areaA.pop(0); self.areaB.pop(0)
         return True
 
 
@@ -4877,6 +5046,15 @@ class LiveDashboard(ttk.Frame):
                     saw_ring_record = True
                     if wf_t_unix is not None:
                         self._latest_ring_unix = float(wf_t_unix)
+                    try:
+                        self._append_live_area_point(
+                            snap,
+                            wf_t_unix,
+                            wfA,
+                            wfB if status_has_b else None,
+                        )
+                    except Exception:
+                        pass
                     if wfA is not None:
                         try:
                             _append_stream(wfA, is_b=False)
@@ -6262,6 +6440,11 @@ class LauncherGUI(tk.Tk):
         self._capy_frames = []
         self._capy_idx = 0
         self._capy_after_id = None
+        self._deferred_boot_after_id = None
+        self.dashboard = None
+        self.live_panel = None
+        self._tabs = None
+        self._overview_placeholder = None
 
         self._restore_gui_state()
         try:
@@ -6327,24 +6510,26 @@ class LauncherGUI(tk.Tk):
 
         tabs = ttk.Notebook(left)
         tabs.grid(row=0, column=0, sticky="nsew")
+        self._tabs = tabs
 
-        self.dashboard = LiveDashboard(tabs, self.var_data_dir, on_status=self._on_status_snapshot)
-        tabs.add(self.dashboard, text="Overview")
+        self._overview_placeholder = ttk.Frame(tabs, padding=6)
+        ttk.Label(
+            self._overview_placeholder,
+            text="Loading live dashboard…",
+            foreground=T_TEXT_DIM,
+        ).pack(expand=True, fill=tk.BOTH, pady=24)
+        tabs.add(self._overview_placeholder, text="Overview")
 
         logbox = ttk.Frame(tabs, padding=6)
         tabs.add(logbox, text="Log")
         self.log = tk.Text(logbox, wrap="word", state=tk.DISABLED, bg=T_BG, fg=T_GREEN, insertbackground=T_CYAN, font=('Consolas', 9))
         self.log.pack(fill=tk.BOTH, expand=True)
 
-        self.live_panel = LiveControlPanel(self._right_frame, self)
-        self.live_panel.grid(row=0, column=0, sticky="nsew")
-
-        self._load_controls_from_yaml()
-        self._init_capybara()
         self._hide_admin_panels()
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.bind("<Destroy>", self._on_destroy, add="+")
+        self._deferred_boot_after_id = self.after(25, self._finish_deferred_gui_boot)
         self._schedule_poll()
 
     def _update_title_from_config(self):
@@ -6361,6 +6546,48 @@ class LauncherGUI(tk.Tk):
         except Exception:
             pass
         self.title("CAPPY ATS-9462 Launcher")
+
+    def _finish_deferred_gui_boot(self):
+        self._deferred_boot_after_id = None
+        if self._is_closing:
+            return
+        try:
+            self._load_controls_from_yaml()
+        except Exception:
+            pass
+        self._ensure_dashboard()
+        self._init_capybara()
+
+    def _ensure_dashboard(self):
+        if self.dashboard is not None or self._tabs is None:
+            return
+        try:
+            dashboard = LiveDashboard(self._tabs, self.var_data_dir, on_status=self._on_status_snapshot)
+            self._tabs.insert(0, dashboard, text="Overview")
+            if self._overview_placeholder is not None:
+                try:
+                    self._tabs.forget(self._overview_placeholder)
+                except Exception:
+                    pass
+                try:
+                    self._overview_placeholder.destroy()
+                except Exception:
+                    pass
+                self._overview_placeholder = None
+            self.dashboard = dashboard
+        except Exception as ex:
+            self._append(f"[CAPPY] Dashboard init failed: {ex}")
+
+    def _ensure_live_panel(self):
+        if self.live_panel is not None:
+            return self.live_panel
+        self.live_panel = LiveControlPanel(self._right_frame, self)
+        self.live_panel.grid(row=0, column=0, sticky="nsew")
+        try:
+            self._load_controls_from_yaml()
+        except Exception:
+            pass
+        return self.live_panel
 
     def _init_capybara(self):
         try:
@@ -6442,6 +6669,7 @@ class LauncherGUI(tk.Tk):
             pass
 
     def _show_admin_panels(self):
+        self._ensure_live_panel()
         self._top_bar.pack(fill=tk.X, before=self._content)
         try:
             self._content.add(self._right_frame, weight=2)
@@ -6849,17 +7077,19 @@ class LauncherGUI(tk.Tk):
 
             if noise_mode_requested:
                 rt = run_cfg.setdefault("runtime", {}) or {}
-                rt["noise_test"] = True
-                rt["autotrigger_timeout_ms"] = 100
-                run_cfg["runtime"] = rt
                 trig = run_cfg.setdefault("trigger", {}) or {}
-                # Switch trigger source from External to Channel A at midscale
-                # so the board triggers on any signal crossing — this is what
-                # makes noise mode actually capture data on ATS9462.
-                trig["sourceJ"] = "TRIG_CHAN_A"
-                trig["slopeJ"] = "TRIGGER_SLOPE_POSITIVE"
-                trig["levelJ"] = 128  # midscale = 0V crossing
-                trig["timeout_ms"] = 100
+                source_j, slope_j, level_j, timeout_ticks = _resolve_npt_trigger_settings(
+                    trig,
+                    rt,
+                    force_analog_source=True,
+                )
+                rt["noise_test"] = True
+                rt["autotrigger_timeout_ms"] = timeout_ticks
+                run_cfg["runtime"] = rt
+                trig["sourceJ"] = source_j
+                trig["slopeJ"] = slope_j
+                trig["levelJ"] = level_j
+                trig["timeout_ms"] = timeout_ticks
                 trig["allow_autotrigger_with_external"] = True
                 trig["external_startcapture"] = False
                 run_cfg["trigger"] = trig
@@ -6870,7 +7100,10 @@ class LauncherGUI(tk.Tk):
                     self._noise_btn_var.set("Noise mode: ON")
                 except Exception:
                     pass
-                self._append("[CAPPY] Noise mode: NPT + source→CHAN_A, level=128(0V), timeout=100, auto-trigger enabled.")
+                self._append(
+                    f"[CAPPY] Noise mode: NPT + source={source_j}, level={level_j}, "
+                    f"slope={slope_j}, timeout={timeout_ticks}, auto-trigger enabled."
+                )
             try:
                 st = run_cfg.setdefault("storage", {}) or {}
                 dd = str(st.get("data_dir", "") or "").strip()
@@ -6973,6 +7206,7 @@ class LauncherGUI(tk.Tk):
         self._cancel_after_callback("_poll_after_id")
         self._cancel_after_callback("_close_after_id")
         self._cancel_after_callback("_capy_after_id")
+        self._cancel_after_callback("_deferred_boot_after_id")
         try:
             if hasattr(self, "live_panel") and self.live_panel is not None:
                 self._save_controls_to_yaml()
