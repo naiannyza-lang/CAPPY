@@ -2113,6 +2113,80 @@ def configure_board(board: Any, cfg: Dict[str, Any]) -> Tuple[float, float, floa
 
     return sr_hz, float(vpp_A), float(vpp_B)
 
+
+def _resolve_npt_trigger_settings(
+    trig: Optional[dict],
+    runtime: Optional[dict] = None,
+    *,
+    fallback_source: str = "TRIG_CHAN_A",
+    force_analog_source: bool = False,
+) -> Tuple[str, str, int, int]:
+    t = trig or {}
+    rt = runtime or {}
+
+    source = str(t.get("sourceJ", fallback_source) or fallback_source).strip()
+    if source not in {"TRIG_CHAN_A", "TRIG_CHAN_B", "TRIG_EXTERNAL"}:
+        source = fallback_source
+    if force_analog_source and source == "TRIG_EXTERNAL":
+        source = fallback_source
+
+    slope = str(t.get("slopeJ", "TRIGGER_SLOPE_POSITIVE") or "TRIGGER_SLOPE_POSITIVE").strip()
+    if slope not in {"TRIGGER_SLOPE_POSITIVE", "TRIGGER_SLOPE_NEGATIVE"}:
+        slope = "TRIGGER_SLOPE_POSITIVE"
+
+    level = _clamp_int(t.get("levelJ", 128), 0, 255, 128)
+    if source == "TRIG_EXTERNAL":
+        if slope == "TRIGGER_SLOPE_POSITIVE" and level < 128:
+            level = 128
+        elif slope == "TRIGGER_SLOPE_NEGATIVE" and level > 128:
+            level = 128
+
+    timeout_ticks = max(
+        _to_int(t.get("timeout_ms", 0), 0),
+        _to_int(rt.get("autotrigger_timeout_ms", 0), 0),
+        10,
+    )
+    return source, slope, level, timeout_ticks
+
+
+def _apply_npt_trigger_override(
+    board: Any,
+    trig: Optional[dict],
+    runtime: Optional[dict] = None,
+    *,
+    log_prefix: str = "[CAPPY]",
+    fallback_source: str = "TRIG_CHAN_A",
+    force_analog_source: bool = False,
+) -> Dict[str, int]:
+    source, slope, level, timeout_ticks = _resolve_npt_trigger_settings(
+        trig,
+        runtime,
+        fallback_source=fallback_source,
+        force_analog_source=force_analog_source,
+    )
+    board.setTriggerOperation(
+        ats.TRIG_ENGINE_OP_J,
+        ats.TRIG_ENGINE_J,
+        getattr(ats, source, ats.TRIG_CHAN_A),
+        getattr(ats, slope, ats.TRIGGER_SLOPE_POSITIVE),
+        level,
+        ats.TRIG_ENGINE_K,
+        ats.TRIG_DISABLE,
+        ats.TRIGGER_SLOPE_POSITIVE,
+        128,
+    )
+    board.setTriggerTimeOut(timeout_ticks)
+    print(
+        f"{log_prefix} forced trigger: source={source} level={level} slope={slope} timeout={timeout_ticks}",
+        flush=True,
+    )
+    return {
+        "sourceJ": source,
+        "slopeJ": slope,
+        "levelJ": level,
+        "timeout_ms": timeout_ticks,
+    }
+
 def _should_stop() -> bool:
     if STOP_REQUESTED:
         return True
@@ -3082,31 +3156,26 @@ def run_quick_config(cfg_path: Path) -> int:
         print(json.dumps({"error": f"configure_board failed: {ex}"}))
         return 2
 
-    samples_per_buffer = max(1, spr * rpb)
-    scout_samples_target = max(samples_per_buffer, int(round(float(sr_hz) * (qc_noise_window_ms / 1000.0))))
-    scout_buffers = max(_QC_BUFFERS, int(np.ceil(float(scout_samples_target) / float(samples_per_buffer))))
-    bufN = max(4, min(_QC_DMA_BUFFERS, scout_buffers + 2))
+    # Bound the scout window and keep the DMA queue small.
+    # ATS-9352 is noticeably more stable when Quick Config recycles a compact
+    # NPT ring instead of posting one DMA buffer per requested scout capture.
+    _QC_BUFFERS_MAX = 256
+    samples_per_buffer_per_ch = max(1, spr * rpb)
+    scout_samples_target = max(
+        samples_per_buffer_per_ch,
+        int(round(float(sr_hz) * (qc_noise_window_ms / 1000.0))),
+    )
+    scout_buffers = max(
+        _QC_BUFFERS,
+        min(
+            _QC_BUFFERS_MAX,
+            int(np.ceil(float(scout_samples_target) / float(samples_per_buffer_per_ch))),
+        ),
+    )
+    bufN = 8
 
     try:
-        qc_source = str(trig.get("sourceJ", "TRIG_CHAN_A"))
-        if qc_source not in {"TRIG_CHAN_A", "TRIG_CHAN_B", "TRIG_EXTERNAL"}:
-            qc_source = "TRIG_CHAN_A"
-        qc_level = _clamp_int(trig.get("levelJ", 128), 0, 255, 128)
-        qc_slope = str(trig.get("slopeJ", "TRIGGER_SLOPE_POSITIVE"))
-        if qc_slope not in {"TRIGGER_SLOPE_POSITIVE", "TRIGGER_SLOPE_NEGATIVE"}:
-            qc_slope = "TRIGGER_SLOPE_POSITIVE"
-        board.setTriggerOperation(
-            ats.TRIG_ENGINE_OP_J,
-            ats.TRIG_ENGINE_J, getattr(ats, qc_source, ats.TRIG_CHAN_A),
-            getattr(ats, qc_slope, ats.TRIGGER_SLOPE_POSITIVE), qc_level,
-            ats.TRIG_ENGINE_K, ats.TRIG_DISABLE,
-            ats.TRIGGER_SLOPE_POSITIVE, 128,
-        )
-        board.setTriggerTimeOut(100)  # 100 × 10µs = 1ms auto-trigger fallback
-        print(
-            f"[QC] forced trigger: source={qc_source} level={qc_level} slope={qc_slope} timeout=100",
-            flush=True,
-        )
+        _apply_npt_trigger_override(board, trig, rt, log_prefix="[QC]")
     except Exception as ex:
         print(f"[QC] warning: trigger override failed: {ex}", flush=True)
 
@@ -3118,9 +3187,13 @@ def run_quick_config(cfg_path: Path) -> int:
     bpBuf    = bpS * spr * rpb * ch_count
 
     buffers = [ats.DMABuffer(board.handle, stype, bpBuf) for _ in range(bufN)]
+    print(f"[QC] DMA ring: {bufN} buffers allocated for {scout_buffers} scout buffers", flush=True)
     board.setRecordSize(0, spr)
 
-    recs_per_acq = rpb * scout_buffers
+    # Keep the board running and stop from Python after scout_buffers
+    # completions. Finite NPT acquisitions have been a common source of
+    # overflows and hard crashes during Quick Config.
+    recs_per_acq = 0x7FFFFFFF
     adma_flags = getattr(ats, "ADMA_NPT", None)
     if adma_flags is None:
         adma_flags = getattr(ats, "ADMA_NPT_MODE", ats.ADMA_TRADITIONAL_MODE)
@@ -3128,7 +3201,9 @@ def run_quick_config(cfg_path: Path) -> int:
     for b in buffers:
         board.postAsyncBuffer(b.addr, b.size_bytes)
 
-    captured: List[np.ndarray] = []
+    samples_per_buf = spr * rpb * ch_count
+    captured_arr = np.empty((scout_buffers, samples_per_buf), dtype=np.uint16)
+    n_captured = 0
     wt_ms = int(acq.get("wait_timeout_ms", 5000))
     # Use a generous timeout for the scout capture
     wt_ms = max(wt_ms, 10000)
@@ -3151,15 +3226,21 @@ def run_quick_config(cfg_path: Path) -> int:
                 print(f"[QC] timeout/error on buffer {bi}: {ex}", flush=True)
                 break
 
-            raw = np.array(buf.buffer, copy=True)
-            captured.append(raw)
+            np.copyto(
+                captured_arr[n_captured],
+                np.frombuffer(buf.buffer, dtype=np.uint16)[:samples_per_buf],
+            )
+            n_captured += 1
             board.postAsyncBuffer(buf.addr, buf.size_bytes)
-            print(f"[QC] buffer {bi+1}/{scout_buffers} OK", flush=True)
+            if bi == 0 or (bi + 1) % 64 == 0 or (bi + 1) == scout_buffers:
+                print(f"[QC] buffer {bi+1}/{scout_buffers} OK", flush=True)
     finally:
         try:
             board.abortAsyncRead()
         except Exception:
             pass
+
+    captured = [captured_arr[i] for i in range(n_captured)]
 
     if not captured:
         print(json.dumps({"error": "no buffers captured — check trigger or signal"}))
@@ -5405,6 +5486,9 @@ class LiveControlPanel(ttk.Frame):
         # Save current settings so we can undo later
         self._qc_prev_settings = {
             "trigger_level_pct":    self._safe_float(self.var_trig_level_pct, 0.0),
+            "trigger_source":       self._var_text(self.var_trig_source, "External"),
+            "trigger_slope":        self._var_text(self.var_trig_slope, "Positive"),
+            "pre_trigger_samples":  self._safe_int(self.var_pre, 0),
             "samples_per_record":   self._safe_int(self.var_samples_per_record, 256),
             "range_a":              self._var_text(self.var_range_a, "PM_1_V"),
             "range_b":              self._var_text(self.var_range_b, "PM_1_V"),
@@ -5559,10 +5643,23 @@ class LiveControlPanel(ttk.Frame):
         trig_slope = str(result.get("trigger_slope", ""))
         mean_cx    = int(result.get("mean_crossing_idx", 0))
 
+        ch_mask = channels_from_mask_expr(self._var_text(self.var_channels_mask, "CHANNEL_A"))
+        qc_source_label = "Channel B" if (qc_chan == "B" and (ch_mask & 0x2)) else "Channel A"
+        pre_now = self._safe_int(self.var_pre, 0)
+        pre_target = pre_now
+        if mean_cx > 0:
+            pre_target = self._round_nearest_step(
+                _clamp_int(mean_cx, 0, max(0, opt_spr - 16), pre_now),
+                16,
+                0,
+            )
+            pre_target = min(pre_target, max(0, opt_spr - 16))
+
         # Apply to controls
         self.var_trig_level_pct.set(round(trig_pct, 1))
+        self.var_trig_source.set(qc_source_label)
         self.var_samples_per_record.set(opt_spr)
-        ch_mask = channels_from_mask_expr(self._var_text(self.var_channels_mask, "CHANNEL_A"))
+        self.var_pre.set(pre_target)
         if qc_chan == "B" and (ch_mask & 0x2):
             self.var_range_b.set(opt_range)
         else:
@@ -5580,7 +5677,8 @@ class LiveControlPanel(ttk.Frame):
 
         # Status feedback
         self._qc_status_var.set(
-            f"✓ Applied: trigger={trig_pct:+.1f}%  spr={opt_spr}  range={opt_range}"
+            f"✓ Applied: source={qc_source_label}  trigger={trig_pct:+.1f}%"
+            f"  pre={pre_target}  spr={opt_spr}  range={opt_range}"
             f"  slope={'neg' if trig_slope == 'negative' else 'pos'}"
             f"  channel={qc_chan}"
             f"  conf={qc_score:.2f}"
@@ -5601,6 +5699,9 @@ class LiveControlPanel(ttk.Frame):
         if prev is None:
             return
         self.var_trig_level_pct.set(float(prev.get("trigger_level_pct", 0.0)))
+        self.var_trig_source.set(str(prev.get("trigger_source", "External")))
+        self.var_trig_slope.set(str(prev.get("trigger_slope", "Positive")))
+        self.var_pre.set(int(prev.get("pre_trigger_samples", 0)))
         self.var_samples_per_record.set(int(prev.get("samples_per_record", 256)))
         self.var_range_a.set(str(prev.get("range_a", "PM_1_V")))
         self.var_range_b.set(str(prev.get("range_b", "PM_1_V")))
